@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+import ast
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _probe(seed: str) -> dict[str, object]:
+    env = os.environ.copy()
+    env["PYTHONHASHSEED"] = seed
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "tests" / "hashseed_probe.py")],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def test_compiled_workflow_is_identical_across_hash_seeds() -> None:
+    assert _probe("1") == _probe("777")
+
+
+def test_public_import_does_not_load_runtime_heavy_dependencies() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, sys; import ascend_maze; "
+                "print(json.dumps(sorted(name for name in sys.modules "
+                "if name.split('.')[0] in {'ray','torch_npu','vllm'})))"
+            ),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == []
+
+
+def test_common_modules_do_not_import_runtime_heavy_dependencies() -> None:
+    forbidden = {"ray", "torch_npu", "vllm"}
+    violations: list[tuple[str, str]] = []
+    for path in (ROOT / "src" / "ascend_maze").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name.split(".")[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = [node.module.split(".")[0]]
+            else:
+                continue
+            for name in names:
+                if name in forbidden:
+                    violations.append((str(path.relative_to(ROOT)), name))
+    assert violations == []
