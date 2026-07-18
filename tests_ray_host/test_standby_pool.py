@@ -22,6 +22,7 @@ from ascend_maze.lifecycle import RunStatus
 from ascend_maze.placement import NodeCapacity
 from tests_ray_host.standby_task_fixtures import (
     leak_file_descriptor,
+    leak_child_process,
     slow_cpu_task,
 )
 
@@ -350,6 +351,79 @@ def test_standby_timeout_kills_actor_releases_task_and_replenishes(
             assert controller.worker_broker.active_count() == 0
             assert controller.placement.active_lease_count(outcome.run_id) == 0
             assert controller.placement.active_lease_count() == 1
+            await controller.destroy_run(outcome.run_id)
+        finally:
+            if agent is not None:
+                await agent.close(grace_seconds=0)
+            await controller.close()
+
+    asyncio.run(scenario())
+
+
+def test_child_process_leak_is_killed_before_worker_replacement(
+    ray_namespace: str,
+) -> None:
+    async def scenario() -> None:
+        controller = RayHostController(
+            cluster_id="cluster_standby_child_cleanup",
+            authorization_token=b"test-token",
+            ray_namespace=ray_namespace,
+            config_fingerprint=CONFIG,
+            environment_fingerprint=ENVIRONMENT,
+            build_revision="test_build",
+            node_capacities=(_node(),),
+            worker_pool_config=_pool_config(),
+        )
+        agent: NodeAgent | None = None
+        try:
+            await controller.start()
+            identity = NodeAgentIdentity(
+                cluster_id="cluster_standby_child_cleanup",
+                node_id="node_a",
+                boot_id="boot_1",
+                ray_node_id=ray.get_runtime_context().get_node_id(),
+                agent_generation="agent_1",
+                environment_fingerprint=ENVIRONMENT,
+                producer_id="node_agent:node_a:agent_1",
+            )
+            agent = NodeAgent(
+                identity=identity,
+                authorization_token=b"test-token",
+                heartbeat_interval_ms=50,
+            )
+            await agent.start(controller_endpoint=controller.node_rpc_endpoint)
+            for _ in range(400):
+                if any(
+                    worker.state is StandbyWorkerState.IDLE
+                    for worker in controller.worker_broker.snapshot().workers
+                ):
+                    break
+                await asyncio.sleep(0.025)
+            workflow = Workflow("ray-standby-child-cleanup")
+            node = workflow.add_task(leak_child_process, inputs={})
+            outcome = await InMemoryRuntimeClient(controller).submit(
+                workflow,
+                inputs={},
+                submission_id="submission_ray_standby_child_cleanup",
+            )
+            assert outcome.run_id is not None
+            terminal = await controller.wait_run(outcome.run_id, timeout_seconds=30)
+            assert terminal.status is RunStatus.SUCCEEDED
+            child_pid = controller.result(outcome.run_id, node.task_id)["child_pid"]
+            assert isinstance(child_pid, int)
+            attempt = terminal.task(node.task_id).attempts[0]
+            worker = controller.ray_runtime.worker_outcome(attempt.dispatch_id)
+            assert worker is not None
+            assert worker.cleanup_reason == "child_process_leaked"
+            for _ in range(400):
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                await asyncio.sleep(0.025)
+            else:
+                raise AssertionError("leaked child process is still alive")
+            assert controller.worker_broker.snapshot().sanitize_failures == 1
             await controller.destroy_run(outcome.run_id)
         finally:
             if agent is not None:

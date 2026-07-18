@@ -6,8 +6,10 @@ from dataclasses import dataclass
 import importlib
 import os
 from pathlib import Path
+import signal
 import sys
 import threading
+import time
 from typing import Any
 
 import ray
@@ -101,6 +103,29 @@ def _open_file_descriptors() -> frozenset[int]:
         return frozenset(critical)
     except OSError:
         return frozenset()
+
+
+def _terminate_child_processes(process_ids: frozenset[int]) -> None:
+    for process_id in process_ids:
+        try:
+            os.kill(process_id, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 0.2
+    remaining = set(process_ids)
+    while remaining and time.monotonic() < deadline:
+        remaining = {
+            process_id
+            for process_id in remaining
+            if Path(f"/proc/{process_id}").exists()
+        }
+        if remaining:
+            time.sleep(0.01)
+    for process_id in remaining:
+        try:
+            os.kill(process_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 class _RayStandbyWorker:
@@ -234,7 +259,9 @@ class _RayStandbyWorker:
         )
         if threads - self._baseline_threads:
             return "background_thread_leaked"
-        if _child_process_ids() - self._baseline_children:
+        leaked_children = _child_process_ids() - self._baseline_children
+        if leaked_children:
+            _terminate_child_processes(leaked_children)
             return "child_process_leaked"
         if _open_file_descriptors() - self._baseline_fds:
             return "file_descriptor_leaked"
