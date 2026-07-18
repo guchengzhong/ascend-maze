@@ -768,6 +768,108 @@ class PlacementManager:
                 None if standby is None else standby.lease_id,
             )
 
+    def reserve_model_instance(
+        self,
+        *,
+        instance_id: str,
+        generation: int,
+        resources: ReservationVector,
+        allow_colocation: bool,
+        now_ms: int,
+        startup_deadline_ms: int,
+        preferred_node_id: str | None = None,
+    ) -> PlacementResult:
+        """Atomically reserve global model capacity without a Run affinity record."""
+
+        if not instance_id:
+            raise ContractValidationError("instance_id is required")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            raise ContractValidationError("instance generation must be positive")
+        if not isinstance(resources, ReservationVector):
+            raise ContractValidationError("model resources must be ReservationVector")
+        if resources.npu_hbm_mb < 1 or resources.npu_slots < 1:
+            raise ContractValidationError(
+                "model instance requires positive NPU HBM and slots"
+            )
+        if not isinstance(allow_colocation, bool):
+            raise ContractValidationError("allow_colocation must be a boolean")
+        with self._lock:
+            snapshot_version = self._snapshot_version
+            if self._permanently_unsatisfiable(resources):
+                return PlacementResult(
+                    False,
+                    None,
+                    "resource_request_unsatisfiable",
+                    snapshot_version,
+                    False,
+                )
+            candidates: list[
+                tuple[tuple[float, str, str], _NodeRecord, str, bool]
+            ] = []
+            rejection_counts: dict[str, int] = {}
+            for record in self._nodes.values():
+                if record.status is not NodeStatus.HEALTHY:
+                    continue
+                device_id, reason = self._fit(
+                    record,
+                    resources,
+                    allow_npu_colocation=allow_colocation,
+                )
+                if reason is not None:
+                    rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                    continue
+                assert device_id is not None
+                affinity_hit = preferred_node_id == record.capacity.node_id
+                pressure = self._pressure_score(record, resources, device_id)
+                candidates.append(
+                    (
+                        (
+                            0.0 if affinity_hit else 1.0 + pressure,
+                            record.capacity.node_id,
+                            device_id,
+                        ),
+                        record,
+                        device_id,
+                        affinity_hit,
+                    )
+                )
+            if not candidates:
+                reason = self._dominant_rejection(rejection_counts)
+                if not rejection_counts:
+                    reason = "no_healthy_node"
+                return PlacementResult(False, None, reason, snapshot_version, False)
+            _, selected, device_id, affinity_hit = min(
+                candidates, key=lambda item: item[0]
+            )
+            lease = PlacementLease(
+                lease_id=new_id("lease"),
+                reservation_kind="model_instance",
+                run_id=None,
+                task_id=None,
+                attempt=None,
+                node_id=selected.capacity.node_id,
+                boot_id=selected.capacity.boot_id,
+                npu_device_id=device_id,
+                resources=resources,
+                snapshot_version=snapshot_version,
+                created_at_ms=now_ms,
+                dispatch_deadline_ms=startup_deadline_ms,
+                allow_npu_colocation=allow_colocation,
+                model_instance_id=instance_id,
+            )
+            self._leases[lease.lease_id] = _LeaseRecord(
+                lease=lease,
+                status=LeaseStatus.RESERVED,
+            )
+            self._snapshot_version += 1
+            return PlacementResult(
+                True,
+                lease,
+                None,
+                snapshot_version,
+                affinity_hit,
+            )
+
     def bind_lease(self, lease_id: str, *, now_ms: int) -> bool:
         with self._lock:
             record = self._require_lease(lease_id)
@@ -1009,6 +1111,7 @@ class PlacementManager:
         vector: ReservationVector,
         *,
         credit_lease_id: str | None = None,
+        allow_npu_colocation: bool = True,
     ) -> tuple[str | None, str | None]:
         capacity = node.capacity
         credit = self._credit_vector(credit_lease_id)
@@ -1038,6 +1141,7 @@ class PlacementManager:
         fitting: list[tuple[int, str]] = []
         any_healthy = False
         any_hbm = False
+        any_colocation = False
         for npu in capacity.npus:
             if not npu.healthy:
                 continue
@@ -1047,6 +1151,17 @@ class PlacementManager:
                 npu.device_id,
                 exclude_lease_id=credit_lease_id,
             )
+            existing_allows_colocation = self._npu_leases_allow_colocation(
+                capacity.node_id,
+                npu.device_id,
+                exclude_lease_id=credit_lease_id,
+            )
+            if (
+                (reserved_hbm > 0 or reserved_slots > 0)
+                and (not allow_npu_colocation or not existing_allows_colocation)
+            ):
+                continue
+            any_colocation = True
             ledger_hbm = (
                 npu.total_hbm_mb
                 - npu.system_reserved_hbm_mb
@@ -1066,9 +1181,27 @@ class PlacementManager:
             return min(fitting)[1], None
         if not any_healthy:
             return None, "no_healthy_npu"
+        if not any_colocation:
+            return None, "npu_colocation_forbidden"
         if not any_hbm:
             return None, "insufficient_npu_hbm"
         return None, "npu_task_slots_full"
+
+    def _npu_leases_allow_colocation(
+        self,
+        node_id: str,
+        device_id: str,
+        *,
+        exclude_lease_id: str | None = None,
+    ) -> bool:
+        return all(
+            record.lease.allow_npu_colocation
+            for record in self._leases.values()
+            if record.status in ACTIVE_LEASE_STATUSES
+            and record.lease.lease_id != exclude_lease_id
+            and record.lease.node_id == node_id
+            and record.lease.npu_device_id == device_id
+        )
 
     def _permanently_unsatisfiable(self, vector: ReservationVector) -> bool:
         if vector.npu_hbm_mb == 0 and vector.npu_slots == 0:
@@ -1199,6 +1332,7 @@ class PlacementManager:
             "no_healthy_npu",
             "insufficient_npu_hbm",
             "npu_task_slots_full",
+            "npu_colocation_forbidden",
         )
         for reason in priority:
             if counts.get(reason):

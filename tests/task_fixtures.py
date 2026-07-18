@@ -39,6 +39,45 @@ def service_task(prompt: str):
     return {"answer": prompt}
 
 
+@task(task_kind="npu", resources={"cpu_num": 1, "mem": 64})
+def inference_twice_task(prompt: str):
+    from ascend_maze.inference import chat
+
+    first = chat([{"role": "user", "content": prompt}], max_tokens=8)
+    second = chat([{"role": "user", "content": first.text}], max_tokens=8)
+    return {"answer": f"{first.text}|{second.text}"}
+
+
+@task(task_kind="npu", resources={"cpu_num": 1, "mem": 64})
+def inference_zero_call_task(prompt: str):
+    return {"answer": prompt}
+
+
+@task(
+    task_kind="npu",
+    resources={"cpu_num": 1, "mem": 64},
+    max_retries=1,
+    retry_on=["worker_start_failed"],
+)
+def inference_retry_task(prompt: str):
+    from ascend_maze.inference import chat
+
+    response = chat([{"role": "user", "content": prompt}], max_tokens=8)
+    return {"answer": response.text}
+
+
+@task(
+    task_kind="npu",
+    resources={"cpu_num": 1, "mem": 64},
+    timeout_seconds=0.02,
+)
+def inference_timeout_task(prompt: str):
+    from ascend_maze.inference import chat
+
+    response = chat([{"role": "user", "content": prompt}], max_tokens=8)
+    return {"answer": response.text}
+
+
 @task(task_kind="npu", resources={"npu_mem": 1024})
 def local_npu_task(value: str):
     return {"value": value}

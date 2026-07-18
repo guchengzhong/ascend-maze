@@ -22,6 +22,7 @@ from ascend_maze.core.identifiers import new_id
 from ascend_maze.data import InMemoryDataStore, RunDataIndexRegistry
 from ascend_maze.lifecycle import DeadlineManager, RunStateManager
 from ascend_maze.lifecycle import RunSnapshot
+from ascend_maze.inference import InferenceCoordinator
 from ascend_maze.placement import NodeCapacity, PlacementManager
 from ascend_maze.recording import InMemoryRecorder
 from ascend_maze.resources import DeclaredOnlyAnchorProvider, ResourceAnchorProvider
@@ -88,6 +89,7 @@ class InMemoryController:
         placement_lookahead: int = 8,
         max_bypass_count: int = 8,
         dispatch_timeout_ms: int = 5_000,
+        inference: InferenceCoordinator | None = None,
     ) -> None:
         self.config_fingerprint = config_fingerprint
         self.environment_fingerprint = environment_fingerprint
@@ -108,6 +110,25 @@ class InMemoryController:
         for capacity in node_capacities:
             self.placement.register_node(capacity)
         self.recorder: ExecutionRecorder = recorder or InMemoryRecorder()
+        self.inference = inference
+        if (
+            inference is not None
+            and inference.instances.placement is not self.placement
+        ):
+            raise ValueError(
+                "InferenceCoordinator and Controller must share PlacementManager"
+            )
+        if inference is not None:
+            mismatched_models = tuple(
+                spec.model_id
+                for spec in inference.catalog.specs
+                if spec.environment_fingerprint != environment_fingerprint
+            )
+            if mismatched_models:
+                raise ValueError(
+                    "model environment fingerprint does not match Controller: "
+                    + ", ".join(mismatched_models)
+                )
         if runtime is None:
             if not isinstance(self.data_store, InMemoryDataStore):
                 raise TypeError("default FakeRuntime requires InMemoryDataStore")
@@ -115,6 +136,7 @@ class InMemoryController:
                 data_store=self.data_store,
                 owner_generation=self.controller_generation,
                 environment_fingerprint=environment_fingerprint,
+                inference=inference,
             )
         self.runtime: SchedulerRuntimeBackend = runtime
         self.core = SchedulerCore(
@@ -131,6 +153,7 @@ class InMemoryController:
             placement_lookahead=placement_lookahead,
             max_bypass_count=max_bypass_count,
             dispatch_timeout_ms=dispatch_timeout_ms,
+            inference=inference,
         )
         self._submissions: dict[str, _SubmissionRecord] = {}
         self._submit_lock = asyncio.Lock()
@@ -310,6 +333,8 @@ class InMemoryController:
     def _validate_request(self, request: SubmitRequest) -> None:
         compiled = request.compiled
         contract = request.contract
+        if self.inference is not None:
+            self.inference.validate_workflow(compiled)
         if (
             hashlib.sha256(compiled.canonical_ir_bytes).hexdigest()
             != compiled.workflow_fingerprint

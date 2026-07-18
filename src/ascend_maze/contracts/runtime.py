@@ -136,6 +136,36 @@ class ModelRouteLease:
     created_at_ms: int
     dispatch_deadline_ms: int
 
+    def __post_init__(self) -> None:
+        for name in (
+            "route_lease_id",
+            "run_id",
+            "task_id",
+            "model_id",
+            "catalog_revision",
+            "instance_id",
+            "adapter_name",
+            "endpoint_id",
+            "instance_node_id",
+            "instance_boot_id",
+            "affinity_key_hash",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ContractValidationError(f"{name} is required")
+        for name in ("attempt", "instance_generation"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ContractValidationError(f"{name} must be positive")
+        for name in ("created_at_ms", "dispatch_deadline_ms"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ContractValidationError(f"{name} must be non-negative")
+        if self.dispatch_deadline_ms <= self.created_at_ms:
+            raise ContractValidationError(
+                "route dispatch deadline must follow creation time"
+            )
+
 
 @dataclass(frozen=True, slots=True)
 class ExecutionRequest:
@@ -195,6 +225,14 @@ class ExecutionRequest:
             if self.model_route is None:
                 raise ContractValidationError(
                     "model service request requires ModelRouteLease"
+                )
+            if (
+                self.model_route.run_id != self.run_id
+                or self.model_route.task_id != self.task_id
+                or self.model_route.attempt != self.attempt
+            ):
+                raise ContractValidationError(
+                    "ModelRouteLease does not match execution Attempt"
                 )
         elif self.model_route is not None:
             raise ContractValidationError(

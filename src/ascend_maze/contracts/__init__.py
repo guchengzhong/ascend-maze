@@ -19,7 +19,7 @@ from ascend_maze.contracts.resources import (
     ResourceDeclaration,
     ResourceSpec,
 )
-from ascend_maze.contracts.runtime import RuntimeBackend
+from ascend_maze.contracts.runtime import ModelRouteLease, RuntimeBackend
 from ascend_maze.contracts.worker import (
     StandbyWorkerDescriptor,
     StandbyWorkerState,
@@ -47,6 +47,7 @@ __all__ = [
     "ExecutionEvent",
     "ExecutionTarget",
     "FlushResult",
+    "ModelRouteLease",
     "ParquetRecorderConfig",
     "PlacementLease",
     "ProducerFlushResult",

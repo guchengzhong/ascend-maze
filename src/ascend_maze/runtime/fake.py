@@ -9,7 +9,7 @@ from typing import Callable
 
 from ascend_maze.contracts.errors import ErrorInfo
 from ascend_maze.contracts.recording import ProducerFlushResult, RunRecordingContext
-from ascend_maze.contracts.resources import PlacementLease
+from ascend_maze.contracts.resources import ExecutionTarget, PlacementLease
 from ascend_maze.contracts.runtime import (
     CodeHandle,
     CodePackage,
@@ -20,6 +20,9 @@ from ascend_maze.core.errors import ContractValidationError
 from ascend_maze.core.identifiers import stable_id
 from ascend_maze.core.time import monotonic_time_ms
 from ascend_maze.data.in_memory import InMemoryDataStore
+from ascend_maze.inference.context import install_route_session
+from ascend_maze.inference.contracts import InferenceCallError
+from ascend_maze.inference.coordinator import InferenceCoordinator
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 from ascend_maze.runtime.code_loader import (
     load_code_package,
@@ -68,11 +71,13 @@ class FakeRuntimeBackend:
         owner_generation: str,
         environment_fingerprint: str,
         event_sink: Callable[[RuntimeEvent], None] | None = None,
+        inference: InferenceCoordinator | None = None,
     ) -> None:
         self.data_store = data_store
         self.owner_generation = owner_generation
         self.environment_fingerprint = environment_fingerprint
         self._event_sink = event_sink
+        self.inference = inference
         self._code: dict[str, _CodeRecord] = {}
         self._dispatches: dict[str, _DispatchRecord] = {}
         self._attempt_dispatches: dict[tuple[str, str, int], str] = {}
@@ -170,6 +175,24 @@ class FakeRuntimeBackend:
             raise ContractValidationError("PlacementLease does not match request")
         if request.environment_fingerprint != self.environment_fingerprint:
             raise ContractValidationError("execution environment mismatch")
+        if request.execution_target is ExecutionTarget.MODEL_SERVICE:
+            if self.inference is None or request.model_route is None:
+                raise ContractValidationError(
+                    "FakeRuntime model service dispatch requires C11"
+                )
+            route = request.model_route
+            if (
+                route.run_id != request.run_id
+                or route.task_id != request.task_id
+                or route.attempt != request.attempt
+            ):
+                raise ContractValidationError(
+                    "ModelRouteLease does not match execution request"
+                )
+            if self.inference.route_snapshot(route.route_lease_id).lease != route:
+                raise ContractValidationError(
+                    "ModelRouteLease payload does not match C11 authority"
+                )
         code = self._code.get(request.code_handle.definition_id)
         if code is None or code.handle != request.code_handle:
             raise ContractValidationError("CodeHandle is not prepared")
@@ -316,6 +339,19 @@ class FakeRuntimeBackend:
                     phase="dispatched",
                 )
                 return
+            if request.execution_target is ExecutionTarget.MODEL_SERVICE:
+                assert self.inference is not None
+                assert request.model_route is not None
+                if not self.inference.activate_route(
+                    request.model_route.route_lease_id
+                ):
+                    self._emit_failure(
+                        record,
+                        RuntimeEventKind.DISPATCH_FAILED,
+                        "model_route_invalidated",
+                        phase="dispatched",
+                    )
+                    return
             self._emit(
                 RuntimeEvent.create(
                     kind=RuntimeEventKind.WORKER_STARTED,
@@ -345,7 +381,31 @@ class FakeRuntimeBackend:
                     assert argument.data_handle is not None
                     kwargs[argument.name] = self.data_store.get(argument.data_handle)
             try:
-                result = await asyncio.to_thread(record.func, **kwargs)
+                if request.execution_target is ExecutionTarget.MODEL_SERVICE:
+                    assert self.inference is not None
+                    assert request.model_route is not None
+                    session = self.inference.create_attempt_session(
+                        request.model_route
+                    )
+                    with install_route_session(session):
+                        result = await self._call_user(record.func, kwargs)
+                    summary = session.summary()
+                    if summary.request_inflight or not summary.context_cleared:
+                        raise InferenceCallError(
+                            "model_protocol_failed",
+                            "model route context was not clean at Task terminal",
+                        )
+                else:
+                    result = await asyncio.to_thread(record.func, **kwargs)
+            except InferenceCallError as exc:
+                self._emit_failure(
+                    record,
+                    RuntimeEventKind.TASK_FAILED,
+                    exc.error_code,
+                    phase="user_code",
+                    message=str(exc),
+                )
+                return
             except Exception as exc:
                 self._emit_failure(
                     record,
@@ -426,6 +486,9 @@ class FakeRuntimeBackend:
     ) -> None:
         request = record.request
         category = (
+            "model"
+            if error_code.startswith("model_")
+            else
             "user"
             if error_code == "user_code_failed"
             else "data"
@@ -447,6 +510,12 @@ class FakeRuntimeBackend:
             attempt=request.attempt,
             dispatch_id=request.dispatch_id,
             lease_id=record.lease.lease_id,
+            route_lease_id=record.handle.route_lease_id,
+            model_instance_id=(
+                None
+                if request.model_route is None
+                else request.model_route.instance_id
+            ),
             occurred_at_ms=monotonic_time_ms(),
         )
         self._emit(
@@ -488,6 +557,17 @@ class FakeRuntimeBackend:
     async def _delay(milliseconds: int) -> None:
         if milliseconds > 0:
             await asyncio.sleep(milliseconds / 1000)
+
+    @staticmethod
+    async def _call_user(
+        func: Callable[..., object], kwargs: dict[str, object]
+    ) -> object:
+        task = asyncio.create_task(asyncio.to_thread(func, **kwargs))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.gather(task, return_exceptions=True)
+            raise
 
     @classmethod
     def _load_package_callable(

@@ -161,12 +161,14 @@ class PlacementLease:
     dispatch_deadline_ms: int
     converted_standby_lease_id: str | None = None
     standby_worker_id: str | None = None
+    allow_npu_colocation: bool = True
+    model_instance_id: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("lease_id", "reservation_kind", "node_id", "boot_id"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ContractValidationError(f"{name} is required")
-        for name in ("run_id", "task_id", "npu_device_id"):
+        for name in ("run_id", "task_id", "npu_device_id", "model_instance_id"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ContractValidationError(f"{name} must be a non-empty string or None")
@@ -200,6 +202,21 @@ class PlacementLease:
         if converted and self.reservation_kind not in {"task", "model_request"}:
             raise ContractValidationError(
                 "only Task reservations can originate from a Standby Worker"
+            )
+        if not isinstance(self.allow_npu_colocation, bool):
+            raise ContractValidationError("allow_npu_colocation must be a boolean")
+        if self.reservation_kind == "model_instance":
+            if self.model_instance_id is None:
+                raise ContractValidationError(
+                    "model_instance reservation requires model_instance_id"
+                )
+            if self.run_id is not None or self.task_id is not None or self.attempt is not None:
+                raise ContractValidationError(
+                    "model_instance reservation cannot belong to a Task Attempt"
+                )
+        elif self.model_instance_id is not None:
+            raise ContractValidationError(
+                "only model_instance reservations carry model_instance_id"
             )
 
 

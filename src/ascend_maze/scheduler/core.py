@@ -25,11 +25,16 @@ from ascend_maze.contracts.recording import (
     ProducerFlushResult,
     RunRecordingContext,
 )
-from ascend_maze.contracts.resources import PlacementLease, ResourceObservation
+from ascend_maze.contracts.resources import (
+    ExecutionTarget,
+    PlacementLease,
+    ResourceObservation,
+)
 from ascend_maze.contracts.runtime import (
     CodeHandle,
     DispatchHandle,
     ExecutionRequest,
+    ModelRouteLease,
     RuntimeArgument,
     RuntimeBackend,
 )
@@ -56,6 +61,7 @@ from ascend_maze.lifecycle.state import (
     RunStatus,
     TaskStatus,
 )
+from ascend_maze.inference import InferenceCoordinator, ModelRouteLeaseStatus
 from ascend_maze.placement.manager import LeaseStatus, PlacementManager
 from ascend_maze.resources.anchors import ResourceAnchorProvider
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
@@ -85,6 +91,7 @@ class _RunExecution:
     code_by_definition: dict[str, CodeHandle]
     index_ref: RunDataIndexRef
     recording_context: RunRecordingContext
+    session_key_hash: str | None
     destroyed: DestroyResult | None = None
 
 
@@ -105,6 +112,7 @@ class _BlockedRecord:
 class _DispatchRecord:
     handle: DispatchHandle
     lease_id: str
+    route_lease: ModelRouteLease | None
 
 
 @dataclass(slots=True)
@@ -198,6 +206,7 @@ class SchedulerCore:
         recorder_flush_timeout_ms: int = 1_000,
         controller_producer_id: str = "controller",
         recovery: RecoveryPolicy | None = None,
+        inference: InferenceCoordinator | None = None,
     ) -> None:
         if placement_lookahead < 1:
             raise ValueError("placement_lookahead must be positive")
@@ -223,6 +232,7 @@ class SchedulerCore:
         self.recorder_flush_timeout_ms = recorder_flush_timeout_ms
         self.controller_producer_id = controller_producer_id
         self.recovery = recovery or RecoveryPolicy()
+        self.inference = inference
         self._queue: asyncio.Queue[object] = asyncio.Queue()
         self._runner: asyncio.Task[None] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -234,6 +244,9 @@ class SchedulerCore:
         self._enqueue_sequence = 0
         self._partition_cursor = 0
         self._dispatches: dict[str, _DispatchRecord] = {}
+        self._attempt_routes: dict[tuple[str, str, int], ModelRouteLease] = {}
+        self._recorded_inference_routes: set[str] = set()
+        self._recorded_route_terminals: set[str] = set()
         self._seen_runtime_events: dict[str, str] = {}
         self._producer_sequence = 0
         self._terminal_waiters: dict[str, list[asyncio.Future[RunSnapshot]]] = {}
@@ -244,6 +257,9 @@ class SchedulerCore:
         self._loop = asyncio.get_running_loop()
         self.runtime.set_event_sink(self.post_runtime_event)
         await self.runtime.start()
+        if self.inference is not None:
+            self.inference.set_capacity_sink(self.post_resource_changed)
+            await self.inference.start()
         self._running = True
         self._runner = asyncio.create_task(self._run_loop())
 
@@ -423,6 +439,9 @@ class SchedulerCore:
                     )
             elif isinstance(item, _ShutdownCommand):
                 await self._shutdown_active_runs()
+                if self.inference is not None:
+                    await self.inference.close()
+                    self.inference.set_capacity_sink(None)
                 self._running = False
                 item.future.set_result(None)
             elif isinstance(item, RuntimeEvent):
@@ -480,6 +499,7 @@ class SchedulerCore:
             code_by_definition=code_by_definition,
             index_ref=index.reference,
             recording_context=command.recording_context,
+            session_key_hash=command.session_key_hash,
         )
         self._runs[command.run_id] = execution
         if command.deadline_at_ms is not None:
@@ -506,6 +526,20 @@ class SchedulerCore:
             compiled=execution.compiled,
             task_id=task_id,
         )
+        node = execution.compiled.tasks[task_id]
+        if (
+            anchor.execution_target is ExecutionTarget.MODEL_SERVICE
+            and self.inference is not None
+        ):
+            if node.model_anchor is None:
+                raise StateTransitionError(
+                    "model service Task is missing its compiled model anchor"
+                )
+            self.inference.register_demand(
+                run_id=run_id,
+                task_id=task_id,
+                model_id=node.model_anchor.model,
+            )
         now = self.clock.monotonic_ms()
         if not self.state.mark_queued(run_id, task_id, now):
             return
@@ -558,30 +592,86 @@ class SchedulerCore:
                     ):
                         continue
                     anchor = queued.view.resource_anchor
-                    if anchor.execution_target.value == "model_service":
-                        reason = "model_route_unavailable"
-                        self.state.set_pending_reason(
-                            key.run_id, key.task_id, reason
-                        )
-                        self._mark_blocked(key, reason)
-                        self._record_scheduling_decision(
-                            run_id=key.run_id,
-                            task_id=key.task_id,
-                            partition=partition,
-                            proposal=proposal,
-                            proposal_rank=proposal_rank,
-                            placement_selected=False,
-                            pending_reason=reason,
-                            policy_select_ms=policy_select_ms,
-                            placement_ms=0.0,
-                        )
-                        blocked_before.append(key)
-                        if self._bypass_exhausted(key):
-                            break
-                        continue
                     task_snapshot = self.state.snapshot(key.run_id).task(key.task_id)
                     next_attempt = task_snapshot.attempt_count + 1
                     now = self.clock.monotonic_ms()
+                    route_lease: ModelRouteLease | None = None
+                    if anchor.execution_target is ExecutionTarget.MODEL_SERVICE:
+                        execution = self._runs[key.run_id]
+                        node = execution.compiled.tasks[key.task_id]
+                        if self.inference is None or node.model_anchor is None:
+                            route_result = None
+                            reason = "model_route_unavailable"
+                        else:
+                            try:
+                                route_result = await self.inference.acquire_route(
+                                    run_id=key.run_id,
+                                    task_id=key.task_id,
+                                    attempt=next_attempt,
+                                    model_id=node.model_anchor.model,
+                                    session_key_hash=execution.session_key_hash,
+                                    dispatch_deadline_ms=(
+                                        now + self.dispatch_timeout_ms
+                                    ),
+                                )
+                            except Exception as exc:
+                                route_result = None
+                                reason = "model_route_unavailable"
+                                self._record(
+                                    key.run_id,
+                                    "model_route_acquire_failed",
+                                    task_id=key.task_id,
+                                    attempt=next_attempt,
+                                    payload={
+                                        "exception_type": type(exc).__name__,
+                                        "message": str(exc),
+                                    },
+                                )
+                            else:
+                                reason = (
+                                    route_result.rejection_reason
+                                    or "model_route_unavailable"
+                                )
+                                route_lease = route_result.lease
+                                if route_lease is not None:
+                                    self._record(
+                                        key.run_id,
+                                        "model_route_reserved",
+                                        task_id=key.task_id,
+                                        attempt=next_attempt,
+                                        route_lease_id=route_lease.route_lease_id,
+                                        model_instance_id=route_lease.instance_id,
+                                        payload={
+                                            "model_id": route_lease.model_id,
+                                            "catalog_revision": (
+                                                route_lease.catalog_revision
+                                            ),
+                                            "instance_generation": (
+                                                route_lease.instance_generation
+                                            ),
+                                            "affinity_hit": route_result.affinity_hit,
+                                        },
+                                    )
+                        if route_lease is None:
+                            self.state.set_pending_reason(
+                                key.run_id, key.task_id, reason
+                            )
+                            self._mark_blocked(key, reason)
+                            self._record_scheduling_decision(
+                                run_id=key.run_id,
+                                task_id=key.task_id,
+                                partition=partition,
+                                proposal=proposal,
+                                proposal_rank=proposal_rank,
+                                placement_selected=False,
+                                pending_reason=reason,
+                                policy_select_ms=policy_select_ms,
+                                placement_ms=0.0,
+                            )
+                            blocked_before.append(key)
+                            if self._bypass_exhausted(key):
+                                break
+                            continue
                     placement_started_ns = perf_counter_ns()
                     placement = self.placement.try_reserve(
                         run_id=key.run_id,
@@ -590,9 +680,24 @@ class SchedulerCore:
                         anchor=anchor,
                         now_ms=now,
                         dispatch_deadline_ms=now + self.dispatch_timeout_ms,
+                        preferred_node_id=(
+                            None
+                            if route_lease is None
+                            else route_lease.instance_node_id
+                        ),
                     )
                     placement_ms = (perf_counter_ns() - placement_started_ns) / 1_000_000
                     if not placement.selected:
+                        if route_lease is not None:
+                            assert self.inference is not None
+                            self.inference.abandon_route(
+                                route_lease,
+                                reason=(
+                                    placement.rejection_reason
+                                    or "client_placement_unavailable"
+                                ),
+                            )
+                            self._record_route_terminal(route_lease)
                         if (
                             placement.rejection_reason
                             == "resource_request_unsatisfiable"
@@ -639,6 +744,10 @@ class SchedulerCore:
                             break
                         continue
                     assert placement.lease is not None
+                    if route_lease is not None:
+                        self._attempt_routes[
+                            (key.run_id, key.task_id, next_attempt)
+                        ] = route_lease
                     self._record_scheduling_decision(
                         run_id=key.run_id,
                         task_id=key.task_id,
@@ -674,6 +783,7 @@ class SchedulerCore:
                         key.task_id,
                         attempt.attempt,
                         dispatch_id,
+                        route_lease,
                     )
                     try:
                         handle = await self.runtime.dispatch(request, placement.lease)
@@ -704,6 +814,7 @@ class SchedulerCore:
                         self._dispatches[dispatch_id] = _DispatchRecord(
                             handle=handle,
                             lease_id=placement.lease.lease_id,
+                            route_lease=route_lease,
                         )
                         self.deadlines.register(
                             kind=DeadlineKind.LEASE,
@@ -718,6 +829,16 @@ class SchedulerCore:
                             task_id=key.task_id,
                             attempt=attempt.attempt,
                             lease_id=placement.lease.lease_id,
+                            route_lease_id=(
+                                None
+                                if route_lease is None
+                                else route_lease.route_lease_id
+                            ),
+                            model_instance_id=(
+                                None
+                                if route_lease is None
+                                else route_lease.instance_id
+                            ),
                         )
                         for blocked_key in blocked_before:
                             blocked = self._blocked.get(blocked_key)
@@ -732,6 +853,7 @@ class SchedulerCore:
         task_id: str,
         attempt: int,
         dispatch_id: str,
+        model_route: ModelRouteLease | None,
     ) -> ExecutionRequest:
         execution = self._runs[run_id]
         node = execution.compiled.tasks[task_id]
@@ -778,7 +900,7 @@ class SchedulerCore:
                 compiled=execution.compiled,
                 task_id=task_id,
             ).execution_target,
-            model_route=None,
+            model_route=model_route,
             code_handle=execution.code_by_definition[definition.definition_id],
             arguments=tuple(arguments),
             expected_outputs=definition.output_names,
@@ -803,13 +925,14 @@ class SchedulerCore:
         }:
             await self._task_failed(event)
         elif event.kind is RuntimeEventKind.TASK_CANCELLED:
-            self.placement.release_lease(
-                event.lease_id,
-                now_ms=self.clock.monotonic_ms(),
+            self._release_event_lease(event, "runtime_cancelled")
+            await self._release_attempt_route(
                 run_id=event.run_id,
                 task_id=event.task_id,
                 attempt=event.attempt,
                 reason="runtime_cancelled",
+                expected_route_lease_id=event.route_lease_id,
+                record_inference=True,
             )
 
     async def _worker_started(self, event: RuntimeEvent) -> None:
@@ -821,6 +944,32 @@ class SchedulerCore:
         ):
             await self._cancel_dispatch(event.dispatch_id, "late_worker_started")
             self._release_event_lease(event, "late_worker_started")
+            await self._release_attempt_route(
+                run_id=event.run_id,
+                task_id=event.task_id,
+                attempt=event.attempt,
+                reason="late_worker_started",
+                expected_route_lease_id=event.route_lease_id,
+            )
+            return
+        expected_route = self._attempt_routes.get(
+            (event.run_id, event.task_id, event.attempt)
+        )
+        if (
+            (expected_route is None and event.route_lease_id is not None)
+            or (
+                expected_route is not None
+                and event.route_lease_id != expected_route.route_lease_id
+            )
+        ):
+            await self._fail_worker_start(
+                run_id=event.run_id,
+                task_id=event.task_id,
+                attempt=event.attempt,
+                dispatch_id=event.dispatch_id,
+                lease_id=event.lease_id,
+                reason="WorkerStarted carried a stale ModelRouteLease",
+            )
             return
         if not self.placement.bind_lease(
             event.lease_id, now_ms=self.clock.monotonic_ms()
@@ -863,6 +1012,10 @@ class SchedulerCore:
                 task_id=event.task_id,
                 attempt=event.attempt,
                 lease_id=event.lease_id,
+                route_lease_id=event.route_lease_id,
+                model_instance_id=(
+                    None if expected_route is None else expected_route.instance_id
+                ),
             )
 
     async def _task_result(self, event: RuntimeEvent) -> None:
@@ -875,6 +1028,53 @@ class SchedulerCore:
             if not self._matches_published_result(event):
                 await self._release_event_outputs(event)
             self._release_event_lease(event, "late_result")
+            await self._release_attempt_route(
+                run_id=event.run_id,
+                task_id=event.task_id,
+                attempt=event.attempt,
+                reason="late_result",
+                expected_route_lease_id=event.route_lease_id,
+                record_inference=True,
+            )
+            return
+        route_released = await self._release_attempt_route(
+            run_id=event.run_id,
+            task_id=event.task_id,
+            attempt=event.attempt,
+            reason="succeeded",
+            expected_route_lease_id=event.route_lease_id,
+            record_inference=True,
+        )
+        if not route_released:
+            await self._release_event_outputs(event)
+            route = self._attempt_routes.get(
+                (event.run_id, event.task_id, event.attempt)
+            )
+            error = self._error(
+                run_id=event.run_id,
+                task_id=event.task_id,
+                attempt=event.attempt,
+                dispatch_id=event.dispatch_id,
+                lease_id=event.lease_id,
+                error_code="model_protocol_failed",
+                category="model",
+                origin="control",
+                phase="cleanup",
+                message="model request or context remained active at Task terminal",
+                route_lease_id=event.route_lease_id,
+                model_instance_id=None if route is None else route.instance_id,
+            )
+            await self._handle_attempt_failure(
+                run_id=event.run_id,
+                task_id=event.task_id,
+                attempt=event.attempt,
+                dispatch_id=event.dispatch_id,
+                lease_id=event.lease_id,
+                error=error,
+                attempt_status=AttemptStatus.FAILED,
+                dispatch_handle=self._dispatches.get(event.dispatch_id),
+                expected_route_lease_id=event.route_lease_id,
+            )
             return
         execution = self._runs[event.run_id]
         definition = self._definition(event.run_id, event.task_id)
@@ -956,6 +1156,14 @@ class SchedulerCore:
             task_id=event.task_id,
             attempt=event.attempt,
             lease_id=event.lease_id,
+            route_lease_id=event.route_lease_id,
+            model_instance_id=(
+                None
+                if event.route_lease_id is None
+                else self._attempt_routes[
+                    (event.run_id, event.task_id, event.attempt)
+                ].instance_id
+            ),
         )
         for task_id in result.ready_task_ids:
             self._enqueue_ready(event.run_id, task_id)
@@ -988,6 +1196,7 @@ class SchedulerCore:
             attempt_status=AttemptStatus.FAILED,
             dispatch_handle=self._dispatches.get(event.dispatch_id),
             resource_observation=event.resource_observation,
+            expected_route_lease_id=event.route_lease_id,
         )
 
     async def _handle_attempt_failure(
@@ -1002,6 +1211,7 @@ class SchedulerCore:
         attempt_status: AttemptStatus,
         dispatch_handle: _DispatchRecord | None,
         resource_observation: ResourceObservation | None = None,
+        expected_route_lease_id: str | None = None,
     ) -> None:
         if not self.state.matches_active_attempt(
             run_id=run_id,
@@ -1015,6 +1225,14 @@ class SchedulerCore:
                 task_id=task_id,
                 attempt=attempt,
                 reason="late_failure",
+            )
+            await self._release_attempt_route(
+                run_id=run_id,
+                task_id=task_id,
+                attempt=attempt,
+                reason="late_failure",
+                expected_route_lease_id=expected_route_lease_id,
+                record_inference=True,
             )
             return
         self.deadlines.cancel(
@@ -1037,6 +1255,14 @@ class SchedulerCore:
             attempt=attempt,
             reason=error.error_code,
         )
+        route_released = await self._release_attempt_route(
+            run_id=run_id,
+            task_id=task_id,
+            attempt=attempt,
+            reason=error.error_code,
+            expected_route_lease_id=expected_route_lease_id,
+            record_inference=True,
+        )
         definition = self._definition(run_id, task_id)
         task_snapshot = self.state.snapshot(run_id).task(task_id)
         run_snapshot = self.state.snapshot(run_id)
@@ -1044,7 +1270,7 @@ class SchedulerCore:
             dispatch_invalidated=self.runtime.dispatch_invalidated(dispatch_id),
             worker_released=self.runtime.worker_released(dispatch_id),
             unpublished_data_released=True,
-            route_released=True,
+            route_released=route_released,
             placement_released=(
                 self.placement.lease_snapshot(lease_id).status
                 not in {LeaseStatus.RESERVED, LeaseStatus.BOUND}
@@ -1364,6 +1590,13 @@ class SchedulerCore:
                 now_ms=self.clock.monotonic_ms(),
                 reason="run_terminal",
             )
+            await self._release_attempt_route(
+                run_id=run_id,
+                task_id=attempt.task_id,
+                attempt=attempt.attempt,
+                reason="run_terminal",
+                record_inference=True,
+            )
 
     async def _on_run_terminal(self, run_id: str) -> None:
         self.deadlines.clear_run(run_id)
@@ -1374,6 +1607,9 @@ class SchedulerCore:
                 self._blocked.pop(key, None)
         snapshot = self.state.snapshot(run_id)
         assert snapshot.finished_at_ms is not None
+        if self.inference is not None:
+            self.inference.replicas.remove_run(run_id)
+            await self.inference.reconcile()
         if isinstance(self.policy, RunLifecycleAwarePolicy):
             try:
                 self.policy.run_terminal(
@@ -1432,6 +1668,19 @@ class SchedulerCore:
             raise RuntimeError("recording is incomplete; force is required")
         if self.placement.active_lease_count(run_id) != 0:
             raise RuntimeError("run still owns placement leases")
+        if self.inference is not None:
+            active_routes = [
+                route
+                for (route_run_id, _, _), route in self._attempt_routes.items()
+                if route_run_id == run_id
+                and self.inference.route_snapshot(route.route_lease_id).status
+                in {
+                    ModelRouteLeaseStatus.RESERVED,
+                    ModelRouteLeaseStatus.ACTIVE,
+                }
+            ]
+            if active_routes:
+                raise RuntimeError("run still owns ModelRouteLeases")
         tombstone = await asyncio.to_thread(
             self.indexes.destroy,
             run_id,
@@ -1444,6 +1693,8 @@ class SchedulerCore:
         execution.code_handles = ()
         execution.code_by_definition.clear()
         await self.runtime.release_run(run_id)
+        if self.inference is not None:
+            self.inference.destroy_run(run_id)
         dispatch_ids = [
             dispatch_id
             for dispatch_id, record in self._dispatches.items()
@@ -1454,6 +1705,19 @@ class SchedulerCore:
         for key in [key for key in self._queue_generations if key.run_id == run_id]:
             del self._queue_generations[key]
             self._blocked.pop(key, None)
+        route_ids = {
+            route.route_lease_id
+            for route_key, route in self._attempt_routes.items()
+            if route_key[0] == run_id
+        }
+        for route_key in [
+            route_key
+            for route_key in self._attempt_routes
+            if route_key[0] == run_id
+        ]:
+            del self._attempt_routes[route_key]
+        self._recorded_inference_routes.difference_update(route_ids)
+        self._recorded_route_terminals.difference_update(route_ids)
         for event_id in [
             event_id
             for event_id, event_run_id in self._seen_runtime_events.items()
@@ -1583,6 +1847,136 @@ class SchedulerCore:
             )
         except StateTransitionError:
             return False
+
+    async def _release_attempt_route(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        attempt: int,
+        reason: str,
+        expected_route_lease_id: str | None = None,
+        record_inference: bool = False,
+    ) -> bool:
+        route = self._attempt_routes.get((run_id, task_id, attempt))
+        if route is None:
+            return expected_route_lease_id is None
+        if (
+            expected_route_lease_id is not None
+            and expected_route_lease_id != route.route_lease_id
+        ):
+            return False
+        if self.inference is None:
+            return False
+        snapshot = self.inference.route_snapshot(route.route_lease_id)
+        if snapshot.status not in {
+            ModelRouteLeaseStatus.RESERVED,
+            ModelRouteLeaseStatus.ACTIVE,
+        }:
+            self._record_route_terminal(route)
+            return True
+        if record_inference and not self._record_attempt_inference(route):
+            return False
+        try:
+            await self.inference.release_route(route, reason=reason)
+        except StateTransitionError:
+            return False
+        snapshot = self.inference.route_snapshot(route.route_lease_id)
+        released = snapshot.status not in {
+            ModelRouteLeaseStatus.RESERVED,
+            ModelRouteLeaseStatus.ACTIVE,
+        }
+        if released:
+            self._record_route_terminal(route)
+        return released
+
+    def _record_route_terminal(self, route: ModelRouteLease) -> None:
+        if (
+            self.inference is None
+            or route.route_lease_id in self._recorded_route_terminals
+        ):
+            return
+        snapshot = self.inference.route_snapshot(route.route_lease_id)
+        if snapshot.status in {
+            ModelRouteLeaseStatus.RESERVED,
+            ModelRouteLeaseStatus.ACTIVE,
+        }:
+            return
+        self._record(
+            route.run_id,
+            f"model_route_{snapshot.status.value}",
+            task_id=route.task_id,
+            attempt=route.attempt,
+            route_lease_id=route.route_lease_id,
+            model_instance_id=route.instance_id,
+            payload={
+                "model_id": route.model_id,
+                "instance_generation": route.instance_generation,
+                "reason": snapshot.finish_reason,
+            },
+        )
+        self._recorded_route_terminals.add(route.route_lease_id)
+
+    def _record_attempt_inference(self, route: ModelRouteLease) -> bool:
+        if route.route_lease_id in self._recorded_inference_routes:
+            return True
+        assert self.inference is not None
+        summary = self.inference.attempt_summary(route.route_lease_id)
+        if summary is not None and (
+            summary.request_inflight or not summary.context_cleared
+        ):
+            self._record(
+                route.run_id,
+                "model_route_cleanup_incomplete",
+                task_id=route.task_id,
+                attempt=route.attempt,
+                route_lease_id=route.route_lease_id,
+                model_instance_id=route.instance_id,
+                payload={
+                    "request_inflight": summary.request_inflight,
+                    "context_cleared": summary.context_cleared,
+                },
+            )
+            return False
+        for request in self.inference.request_records(route.route_lease_id):
+            self._record(
+                request.run_id,
+                "inference_request",
+                task_id=request.task_id,
+                attempt=request.attempt,
+                route_lease_id=request.route_lease_id,
+                model_instance_id=request.instance_id,
+                payload={
+                    "call_index": request.call_index,
+                    "model_id": request.model_id,
+                    "instance_generation": request.instance_generation,
+                    "started_at_ms": request.started_at_ms,
+                    "duration_ms": request.duration_ms,
+                    "status": request.status,
+                    "input_tokens": request.input_tokens,
+                    "output_tokens": request.output_tokens,
+                    "engine_queue_depth": request.engine_queue_depth,
+                    "prefix_cache_hit": request.prefix_cache_hit,
+                    "error_code": request.error_code,
+                },
+            )
+        self._record(
+            route.run_id,
+            "attempt_inference_summary",
+            task_id=route.task_id,
+            attempt=route.attempt,
+            route_lease_id=route.route_lease_id,
+            model_instance_id=route.instance_id,
+            payload={
+                "model_id": route.model_id,
+                "instance_generation": route.instance_generation,
+                "request_count": 0 if summary is None else summary.request_count,
+                "request_inflight": False,
+                "context_cleared": summary is not None and summary.context_cleared,
+            },
+        )
+        self._recorded_inference_routes.add(route.route_lease_id)
+        return True
 
     def _matches_published_result(self, event: RuntimeEvent) -> bool:
         execution = self._runs.get(event.run_id)
@@ -1733,6 +2127,8 @@ class SchedulerCore:
         task_id: str | None = None,
         attempt: int | None = None,
         lease_id: str | None = None,
+        route_lease_id: str | None = None,
+        model_instance_id: str | None = None,
         payload: dict[str, object] | None = None,
     ) -> None:
         self._producer_sequence += 1
@@ -1748,8 +2144,8 @@ class SchedulerCore:
                 task_id=task_id,
                 attempt=attempt,
                 lease_id=lease_id,
-                route_lease_id=None,
-                model_instance_id=None,
+                route_lease_id=route_lease_id,
+                model_instance_id=model_instance_id,
                 event_type=event_type,
                 producer_id=self.controller_producer_id,
                 producer_sequence=self._producer_sequence,
@@ -1783,6 +2179,8 @@ class SchedulerCore:
         origin: str,
         phase: str,
         message: str,
+        route_lease_id: str | None = None,
+        model_instance_id: str | None = None,
     ) -> ErrorInfo:
         return ErrorInfo(
             schema_version=1,
@@ -1798,6 +2196,8 @@ class SchedulerCore:
             attempt=attempt,
             dispatch_id=dispatch_id,
             lease_id=lease_id,
+            route_lease_id=route_lease_id,
+            model_instance_id=model_instance_id,
             occurred_at_ms=self.clock.monotonic_ms(),
         )
 
