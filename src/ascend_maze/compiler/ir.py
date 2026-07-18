@@ -57,6 +57,8 @@ class TaskDefinition:
     output_names: tuple[str, ...]
     task_kind: str
     resources: ResourceSpec
+    static_inferred: ResourceSpec
+    static_signals: tuple[str, ...]
     timeout_ms: int | None
     max_retries: int
     retry_backoff_ms: int

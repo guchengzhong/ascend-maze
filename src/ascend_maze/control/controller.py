@@ -24,7 +24,7 @@ from ascend_maze.lifecycle import DeadlineManager, RunStateManager
 from ascend_maze.lifecycle import RunSnapshot
 from ascend_maze.placement import NodeCapacity, PlacementManager
 from ascend_maze.recording import InMemoryRecorder
-from ascend_maze.resources import DeclaredOnlyAnchorProvider
+from ascend_maze.resources import DeclaredOnlyAnchorProvider, ResourceAnchorProvider
 from ascend_maze.runtime import FakeRuntimeBackend
 from ascend_maze.scheduler import (
     DestroyResult,
@@ -79,6 +79,9 @@ class InMemoryController:
         data_store: DataStore | None = None,
         recorder: ExecutionRecorder | None = None,
         runtime: SchedulerRuntimeBackend | None = None,
+        anchors: ResourceAnchorProvider | None = None,
+        placement: PlacementManager | None = None,
+        dispatch_timeout_ms: int = 5_000,
     ) -> None:
         self.config_fingerprint = config_fingerprint
         self.environment_fingerprint = environment_fingerprint
@@ -92,10 +95,10 @@ class InMemoryController:
         )
         self.state = RunStateManager()
         self.deadlines = DeadlineManager()
-        self.anchors = DeclaredOnlyAnchorProvider(
+        self.anchors = anchors or DeclaredOnlyAnchorProvider(
             environment_fingerprint=environment_fingerprint
         )
-        self.placement = PlacementManager()
+        self.placement = placement or PlacementManager()
         for capacity in node_capacities:
             self.placement.register_node(capacity)
         self.recorder: ExecutionRecorder = recorder or InMemoryRecorder()
@@ -119,6 +122,7 @@ class InMemoryController:
             policy=FcfsPolicy(),
             partitioner=HeterogeneousPartitioner(),
             clock=self.clock,
+            dispatch_timeout_ms=dispatch_timeout_ms,
         )
         self._submissions: dict[str, _SubmissionRecord] = {}
         self._submit_lock = asyncio.Lock()

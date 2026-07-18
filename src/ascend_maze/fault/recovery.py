@@ -78,6 +78,7 @@ _PERMANENT_ERRORS = frozenset(
         "environment_mismatch",
         "invalid_task_output",
         "model_catalog_invalid",
+        "resource_request_unsatisfiable",
         "serialization_failed",
         "task_definition_invalid",
         "user_code_failed",
@@ -92,6 +93,29 @@ class RecoveryPolicy:
         self._decisions: dict[tuple[str, str, int], RecoveryDecision] = {}
         self._lock = RLock()
 
+    @staticmethod
+    def retry_precondition_reason(
+        *,
+        definition: TaskDefinition,
+        error: ErrorInfo,
+        attempt_count: int,
+        cleanup: CleanupBarrier,
+        now_ms: int,
+        run_deadline_at_ms: int | None,
+    ) -> str | None:
+        retries_used = max(0, attempt_count - 1)
+        if not cleanup.satisfied:
+            return "cleanup_barrier_incomplete"
+        if error.error_code in _PERMANENT_ERRORS:
+            return "permanent_error"
+        if error.error_code not in definition.retry_on:
+            return "error_not_in_retry_on"
+        if definition.max_retries - retries_used <= 0:
+            return "retry_budget_exhausted"
+        if run_deadline_at_ms is not None and now_ms >= run_deadline_at_ms:
+            return "run_deadline_exhausted"
+        return None
+
     def decide(
         self,
         *,
@@ -101,6 +125,7 @@ class RecoveryPolicy:
         cleanup: CleanupBarrier,
         now_ms: int,
         run_deadline_at_ms: int | None,
+        retry_block_reason: str | None = None,
     ) -> RecoveryDecision:
         key = (error.run_id, error.task_id, error.attempt)
         with self._lock:
@@ -123,21 +148,22 @@ class RecoveryPolicy:
             )
             action = RecoveryAction.RETRY
             reason = "retry_eligible"
-            if not cleanup.satisfied:
+            precondition_reason: str | None = None
+            if retry_block_reason is not None:
                 action = RecoveryAction.FAIL_TASK
-                reason = "cleanup_barrier_incomplete"
-            elif error.error_code in _PERMANENT_ERRORS:
+                reason = retry_block_reason
+            else:
+                precondition_reason = self.retry_precondition_reason(
+                    definition=definition,
+                    error=error,
+                    attempt_count=attempt_count,
+                    cleanup=cleanup,
+                    now_ms=now_ms,
+                    run_deadline_at_ms=run_deadline_at_ms,
+                )
+            if retry_block_reason is None and precondition_reason is not None:
                 action = RecoveryAction.FAIL_TASK
-                reason = "permanent_error"
-            elif error.error_code not in definition.retry_on:
-                action = RecoveryAction.FAIL_TASK
-                reason = "error_not_in_retry_on"
-            elif budget_before <= 0:
-                action = RecoveryAction.FAIL_TASK
-                reason = "retry_budget_exhausted"
-            elif run_deadline_at_ms is not None and now_ms >= run_deadline_at_ms:
-                action = RecoveryAction.FAIL_TASK
-                reason = "run_deadline_exhausted"
+                reason = precondition_reason
 
             retry = action is RecoveryAction.RETRY
             eligible_at = now_ms + definition.retry_backoff_ms if retry else None

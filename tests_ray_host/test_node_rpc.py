@@ -8,6 +8,13 @@ from ascend_maze.contracts.data import DataHandle
 from ascend_maze.contracts.errors import ErrorInfo
 from ascend_maze.contracts.recording import RunRecordingContext
 from ascend_maze.core.canonical import FrozenMap
+from ascend_maze.placement import (
+    NodeCapacity,
+    NodeObservation,
+    NpuCapacity,
+    NpuObservation,
+    PlacementManager,
+)
 from ascend_maze.recording import InMemoryRecorder
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 from ascend_maze.runtime.ray_node_registry import (
@@ -27,14 +34,18 @@ from ascend_maze.control.proto_codec import decode_runtime_event, encode_runtime
 ENVIRONMENT = "e" * 64
 
 
-def _identity(*, generation: str = "agent_1") -> NodeAgentIdentity:
+def _identity(
+    *,
+    generation: str = "agent_1",
+    environment: str = ENVIRONMENT,
+) -> NodeAgentIdentity:
     return NodeAgentIdentity(
         cluster_id="cluster_1",
         node_id="node_a",
         boot_id="boot_1",
         ray_node_id="ray_node_a",
         agent_generation=generation,
-        environment_fingerprint=ENVIRONMENT,
+        environment_fingerprint=environment,
         producer_id=f"node_agent:node_a:{generation}",
     )
 
@@ -196,6 +207,119 @@ def test_rejected_node_registration_does_not_pollute_runtime_registry() -> None:
             with pytest.raises(Exception, match="unknown configured node"):
                 await agent.start(controller_endpoint=endpoint)
             assert registry.active_bindings() == ()
+        finally:
+            await agent.close(grace_seconds=0)
+            await controller.close(grace_seconds=0)
+
+    asyncio.run(scenario())
+
+
+def test_environment_mismatch_is_registered_but_unschedulable() -> None:
+    async def scenario() -> None:
+        registry = RayNodeRegistry()
+        controller = NodeControlServer(
+            cluster_id="cluster_1",
+            authorization_token=b"test-token",
+            controller_generation="controller_1",
+            environment_fingerprint=ENVIRONMENT,
+            registry=registry,
+            recorder=InMemoryRecorder(),
+            event_sink=lambda event: None,
+        )
+        endpoint = await controller.start()
+        agent = NodeAgent(
+            identity=_identity(environment="f" * 64),
+            authorization_token=b"test-token",
+        )
+        try:
+            await agent.start(controller_endpoint=endpoint)
+            assert registry.binding("node_a").agent_generation == "agent_1"
+            assert registry.status("node_a") is RuntimeNodeStatus.UNSCHEDULABLE
+            assert registry.active_bindings() == ()
+        finally:
+            await agent.close(grace_seconds=0)
+            await controller.close(grace_seconds=0)
+
+    asyncio.run(scenario())
+
+
+def test_node_observation_heartbeat_updates_dynamic_capacity_monotonically() -> None:
+    async def scenario() -> None:
+        manager = PlacementManager(required_environment_fingerprint=ENVIRONMENT)
+        manager.register_node(
+            NodeCapacity(
+                node_id="node_a",
+                boot_id="boot_1",
+                node_ip="127.0.0.1",
+                cpu_total=8,
+                mem_total_mb=32_768,
+                cpu_system_reserved=1,
+                mem_system_reserved_mb=1_024,
+                io_slots_total=4,
+                npus=(NpuCapacity("7", "910B3", 65_536, 4_096, 1, 60_000),),
+                observed_free_mem_mb=30_000,
+                capabilities=FrozenMap(
+                    (("environment_fingerprint", ENVIRONMENT),)
+                ),
+            )
+        )
+        observed_sequences: list[int] = []
+
+        def update(observation: NodeObservation) -> bool:
+            observed_sequences.append(observation.sequence)
+            return manager.update_observation(observation)
+
+        def observe(sequence: int, now_ms: int) -> NodeObservation:
+            return NodeObservation(
+                node_id="node_a",
+                boot_id="boot_1",
+                sequence=sequence,
+                received_at_ms=now_ms,
+                observed_free_mem_mb=20_000 + sequence,
+                npus=(
+                    NpuObservation(
+                        "7",
+                        "healthy",
+                        50_000 + sequence,
+                        float(sequence),
+                    ),
+                ),
+            )
+
+        registry = RayNodeRegistry()
+        controller = NodeControlServer(
+            cluster_id="cluster_1",
+            authorization_token=b"test-token",
+            controller_generation="controller_1",
+            environment_fingerprint=ENVIRONMENT,
+            registry=registry,
+            recorder=InMemoryRecorder(),
+            event_sink=lambda event: None,
+            on_node_observation=update,
+        )
+        endpoint = await controller.start()
+        agent = NodeAgent(
+            identity=_identity(),
+            authorization_token=b"test-token",
+            heartbeat_interval_ms=10,
+            node_observation_provider=observe,
+        )
+        try:
+            await agent.start(controller_endpoint=endpoint)
+            for _ in range(200):
+                if len(observed_sequences) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(observed_sequences) >= 2
+            assert observed_sequences == sorted(set(observed_sequences))
+            snapshot = manager.snapshot().nodes[0]
+            assert snapshot.observation_sequence == observed_sequences[-1]
+            assert snapshot.capacity.observed_free_mem_mb == (
+                20_000 + observed_sequences[-1]
+            )
+            assert snapshot.capacity.npus[0].observed_free_hbm_mb == (
+                50_000 + observed_sequences[-1]
+            )
         finally:
             await agent.close(grace_seconds=0)
             await controller.close(grace_seconds=0)

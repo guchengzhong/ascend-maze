@@ -8,7 +8,7 @@ from typing import Protocol, runtime_checkable
 
 from ascend_maze.contracts.data import DataHandle
 from ascend_maze.contracts.resources import ExecutionTarget, PlacementLease
-from ascend_maze.core.canonical import CanonicalValue, freeze_canonical
+from ascend_maze.core.canonical import CanonicalValue, FrozenMap, freeze_canonical
 from ascend_maze.core.errors import CanonicalizationError, ContractValidationError
 
 
@@ -261,6 +261,77 @@ class RuntimeNodeBinding:
             or self.runtime_generation < 1
         ):
             raise ContractValidationError("runtime_generation must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceBinding:
+    lease_id: str
+    node_id: str
+    boot_id: str
+    runtime_generation: int
+    physical_device_id: str
+    visible_device_index: int
+    environment_variables: FrozenMap[str, str]
+
+    def __post_init__(self) -> None:
+        for name in (
+            "lease_id",
+            "node_id",
+            "boot_id",
+            "physical_device_id",
+        ):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ContractValidationError(f"{name} is required")
+        if (
+            isinstance(self.runtime_generation, bool)
+            or not isinstance(self.runtime_generation, int)
+            or self.runtime_generation < 1
+        ):
+            raise ContractValidationError("runtime_generation must be positive")
+        if self.visible_device_index != 0:
+            raise ContractValidationError(
+                "stage-four local NPU workers require visible_device_index=0"
+            )
+        frozen = freeze_canonical(self.environment_variables)
+        if not isinstance(frozen, FrozenMap) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in frozen.items_tuple()
+        ):
+            raise ContractValidationError(
+                "environment_variables must map strings to strings"
+            )
+        visible = frozen.get("ASCEND_RT_VISIBLE_DEVICES")
+        if visible != self.physical_device_id:
+            raise ContractValidationError(
+                "ASCEND_RT_VISIBLE_DEVICES must select the leased physical device"
+            )
+        object.__setattr__(self, "environment_variables", frozen)
+
+    @classmethod
+    def from_lease(
+        cls,
+        lease: PlacementLease,
+        binding: RuntimeNodeBinding,
+    ) -> "DeviceBinding":
+        if lease.npu_device_id is None or lease.resources.npu_slots != 1:
+            raise ContractValidationError(
+                "local NPU DeviceBinding requires one leased NPU slot"
+            )
+        if lease.node_id != binding.node_id or lease.boot_id != binding.boot_id:
+            raise ContractValidationError(
+                "PlacementLease generation does not match RuntimeNodeBinding"
+            )
+        return cls(
+            lease_id=lease.lease_id,
+            node_id=lease.node_id,
+            boot_id=lease.boot_id,
+            runtime_generation=binding.runtime_generation,
+            physical_device_id=lease.npu_device_id,
+            visible_device_index=0,
+            environment_variables=FrozenMap(
+                (("ASCEND_RT_VISIBLE_DEVICES", lease.npu_device_id),)
+            ),
+        )
 
 
 @runtime_checkable

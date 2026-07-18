@@ -22,7 +22,7 @@ from ascend_maze.contracts.recording import (
     ExecutionRecorder,
     FlushResult,
 )
-from ascend_maze.contracts.resources import PlacementLease
+from ascend_maze.contracts.resources import PlacementLease, ResourceObservation
 from ascend_maze.contracts.runtime import (
     CodeHandle,
     DispatchHandle,
@@ -54,7 +54,7 @@ from ascend_maze.lifecycle.state import (
     TaskStatus,
 )
 from ascend_maze.placement.manager import LeaseStatus, PlacementManager
-from ascend_maze.resources.anchors import DeclaredOnlyAnchorProvider
+from ascend_maze.resources.anchors import ResourceAnchorProvider
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 from ascend_maze.scheduler.contracts import (
     QueueToken,
@@ -154,7 +154,7 @@ class SchedulerCore:
         state: RunStateManager,
         deadlines: DeadlineManager,
         indexes: RunDataIndexRegistry,
-        anchors: DeclaredOnlyAnchorProvider,
+        anchors: ResourceAnchorProvider,
         placement: PlacementManager,
         runtime: SchedulerRuntimeBackend,
         recorder: ExecutionRecorder,
@@ -317,7 +317,7 @@ class SchedulerCore:
                     item = await self._queue.get()
                 else:
                     item = await asyncio.wait_for(self._queue.get(), timeout)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 pass
             try:
                 if item is not None:
@@ -486,6 +486,19 @@ class SchedulerCore:
                         dispatch_deadline_ms=now + self.dispatch_timeout_ms,
                     )
                     if not placement.selected:
+                        if (
+                            placement.rejection_reason
+                            == "resource_request_unsatisfiable"
+                        ):
+                            self.policy.depart(queued.view.queue_token)
+                            del self._queued[key]
+                            await self._fail_pre_attempt_unsatisfiable(
+                                key.run_id,
+                                key.task_id,
+                                anchor.effective.npu_mem_mb,
+                            )
+                            progress = True
+                            break
                         self.state.set_pending_reason(
                             key.run_id, key.task_id, placement.rejection_reason
                         )
@@ -817,6 +830,7 @@ class SchedulerCore:
             error=error,
             attempt_status=AttemptStatus.FAILED,
             dispatch_handle=self._dispatches.get(event.dispatch_id),
+            resource_observation=event.resource_observation,
         )
 
     async def _handle_attempt_failure(
@@ -830,6 +844,7 @@ class SchedulerCore:
         error: ErrorInfo,
         attempt_status: AttemptStatus,
         dispatch_handle: _DispatchRecord | None,
+        resource_observation: ResourceObservation | None = None,
     ) -> None:
         if not self.state.matches_active_attempt(
             run_id=run_id,
@@ -878,6 +893,80 @@ class SchedulerCore:
                 not in {LeaseStatus.RESERVED, LeaseStatus.BOUND}
             ),
         )
+        precondition_reason = self.recovery.retry_precondition_reason(
+            definition=definition,
+            error=error,
+            attempt_count=task_snapshot.attempt_count,
+            cleanup=cleanup,
+            now_ms=self.clock.monotonic_ms(),
+            run_deadline_at_ms=run_snapshot.deadline_at_ms,
+        )
+        retry_block_reason: str | None = None
+        if error.error_code == "npu_oom":
+            execution = self._runs[run_id]
+            observed_peak = None
+            if resource_observation is not None:
+                observed_peak = (
+                    resource_observation.peak_npu_process_hbm_mb
+                    or resource_observation.peak_npu_reserved_mb
+                    or resource_observation.peak_npu_allocated_mb
+                )
+            if precondition_reason is None:
+                reanchor = self.anchors.reanchor_after_oom(
+                    run_id=run_id,
+                    compiled=execution.compiled,
+                    task_id=task_id,
+                    observed_peak_npu_mem_mb=observed_peak,
+                )
+                if not reanchor.created:
+                    retry_block_reason = reanchor.reason
+                elif (
+                    reanchor.anchor.effective.npu_mem_mb
+                    > self.placement.max_single_npu_allocatable_hbm_mb()
+                ):
+                    retry_block_reason = "oom_reanchor_unsatisfiable"
+                    error = self._error(
+                        run_id=run_id,
+                        task_id=task_id,
+                        attempt=attempt,
+                        dispatch_id=dispatch_id,
+                        lease_id=lease_id,
+                        error_code="resource_request_unsatisfiable",
+                        category="configuration",
+                        origin="placement",
+                        phase="cleanup",
+                        message=(
+                            "OOM reanchor exceeds every single-NPU allocatable capacity"
+                        ),
+                    )
+                anchor = reanchor.anchor
+                anchor_created = reanchor.created
+                anchor_reason = reanchor.reason
+                previous_npu_mem_mb = reanchor.previous_npu_mem_mb
+            else:
+                anchor = self.anchors.resolve(
+                    run_id=run_id,
+                    compiled=execution.compiled,
+                    task_id=task_id,
+                )
+                anchor_created = False
+                anchor_reason = precondition_reason
+                previous_npu_mem_mb = anchor.effective.npu_mem_mb
+            self._record(
+                run_id,
+                "resource_anchor_oom",
+                task_id=task_id,
+                attempt=attempt,
+                lease_id=lease_id,
+                payload={
+                    "created": anchor_created,
+                    "reason": anchor_reason,
+                    "previous_npu_mem_mb": previous_npu_mem_mb,
+                    "new_npu_mem_mb": anchor.effective.npu_mem_mb,
+                    "observed_peak_npu_mem_mb": observed_peak,
+                    "revision": anchor.revision,
+                },
+            )
         decision = self.recovery.decide(
             definition=definition,
             error=error,
@@ -885,6 +974,7 @@ class SchedulerCore:
             cleanup=cleanup,
             now_ms=self.clock.monotonic_ms(),
             run_deadline_at_ms=run_snapshot.deadline_at_ms,
+            retry_block_reason=retry_block_reason,
         )
         if decision.action is RecoveryAction.RETRY:
             result = self.state.attempt_retry_wait(
@@ -958,6 +1048,44 @@ class SchedulerCore:
                     "reason": decision.reason,
                     "error_code": error.error_code,
                 },
+            )
+            await self._cleanup_cancelled_attempts(run_id, result.cancelled_attempts)
+            await self._on_run_terminal(run_id)
+
+    async def _fail_pre_attempt_unsatisfiable(
+        self,
+        run_id: str,
+        task_id: str,
+        requested_npu_hbm_mb: int,
+    ) -> None:
+        now = self.clock.monotonic_ms()
+        error = self._error(
+            run_id=run_id,
+            task_id=task_id,
+            attempt=0,
+            dispatch_id=None,
+            lease_id=None,
+            error_code="resource_request_unsatisfiable",
+            category="configuration",
+            origin="placement",
+            phase="pre_attempt",
+            message=(
+                f"requested NPU HBM {requested_npu_hbm_mb} MB exceeds every "
+                "single-device allocatable capacity"
+            ),
+        )
+        result = self.state.pre_attempt_final_failure(
+            run_id=run_id,
+            task_id=task_id,
+            error=error,
+            now_ms=now,
+        )
+        if result.accepted:
+            self._record(
+                run_id,
+                "task_failed",
+                task_id=task_id,
+                payload={"error_code": error.error_code, "attempt": 0},
             )
             await self._cleanup_cancelled_attempts(run_id, result.cancelled_attempts)
             await self._on_run_terminal(run_id)
@@ -1377,8 +1505,8 @@ class SchedulerCore:
         run_id: str,
         task_id: str,
         attempt: int,
-        dispatch_id: str,
-        lease_id: str,
+        dispatch_id: str | None,
+        lease_id: str | None,
         error_code: str,
         category: str,
         origin: str,

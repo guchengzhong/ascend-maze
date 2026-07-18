@@ -6,6 +6,8 @@ from pathlib import Path
 
 from ascend_maze.core.clock import Clock
 from ascend_maze.placement import NodeCapacity
+from ascend_maze.placement import PlacementManager
+from ascend_maze.resources import ResourceAnchorProvider
 from ascend_maze.runtime.ray_cluster import ManagedRayCluster, RayClusterConfig
 
 from ascend_maze.control.ray_controller import RayHostController
@@ -27,6 +29,9 @@ class ManagedRayHost:
         node_rpc_bind_address: str = "127.0.0.1:0",
         node_rpc_advertised_host: str | None = None,
         clock: Clock | None = None,
+        anchors: ResourceAnchorProvider | None = None,
+        placement: PlacementManager | None = None,
+        dispatch_timeout_ms: int = 5_000,
     ) -> None:
         self.ray_cluster = ManagedRayCluster(ray_config)
         self.cluster_id = cluster_id
@@ -40,6 +45,9 @@ class ManagedRayHost:
         self.node_rpc_bind_address = node_rpc_bind_address
         self.node_rpc_advertised_host = node_rpc_advertised_host
         self.clock = clock
+        self.anchors = anchors
+        self.placement = placement
+        self.dispatch_timeout_ms = dispatch_timeout_ms
         self.controller: RayHostController | None = None
 
     async def start(self) -> RayHostController:
@@ -60,6 +68,9 @@ class ManagedRayHost:
                 node_rpc_bind_address=self.node_rpc_bind_address,
                 node_rpc_advertised_host=self.node_rpc_advertised_host,
                 clock=self.clock,
+                anchors=self.anchors,
+                placement=self.placement,
+                dispatch_timeout_ms=self.dispatch_timeout_ms,
             )
             await controller.start()
         except Exception:

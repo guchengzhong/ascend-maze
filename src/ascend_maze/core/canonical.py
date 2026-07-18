@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from collections.abc import Iterable, Iterator, Mapping
 import hashlib
 import json
@@ -179,6 +179,64 @@ def freeze_canonical(
 
 def canonical_bytes(value: object) -> bytes:
     return _node_bytes(freeze_canonical(value))
+
+
+def _decoded_node(node: object) -> CanonicalValue:
+    if not isinstance(node, list) or not node or not isinstance(node[0], str):
+        raise CanonicalizationError("invalid canonical node")
+    tag = node[0]
+    if tag == "none" and len(node) == 1:
+        return None
+    if tag == "bool" and len(node) == 2 and isinstance(node[1], bool):
+        return node[1]
+    if tag == "int" and len(node) == 2 and isinstance(node[1], str):
+        try:
+            return int(node[1])
+        except ValueError as exc:
+            raise CanonicalizationError("invalid canonical integer") from exc
+    if tag == "float" and len(node) == 2 and isinstance(node[1], str):
+        try:
+            value = float.fromhex(node[1])
+        except ValueError as exc:
+            raise CanonicalizationError("invalid canonical float") from exc
+        if not math.isfinite(value):
+            raise CanonicalizationError("non-finite canonical float")
+        return value
+    if tag == "str" and len(node) == 2 and isinstance(node[1], str):
+        return _normalise_string(node[1])
+    if tag == "bytes" and len(node) == 2 and isinstance(node[1], str):
+        try:
+            return b64decode(node[1], validate=True)
+        except ValueError as exc:
+            raise CanonicalizationError("invalid canonical bytes") from exc
+    if tag == "tuple" and len(node) == 2 and isinstance(node[1], list):
+        return tuple(_decoded_node(item) for item in node[1])
+    if tag == "map" and len(node) == 2 and isinstance(node[1], list):
+        pairs: list[tuple[CanonicalValue, CanonicalValue]] = []
+        for pair in node[1]:
+            if not isinstance(pair, list) or len(pair) != 2:
+                raise CanonicalizationError("invalid canonical mapping entry")
+            pairs.append((_decoded_node(pair[0]), _decoded_node(pair[1])))
+        result = FrozenMap(pairs)
+        if _encoded_node(result) != node:
+            raise CanonicalizationError("canonical mapping is not normalized")
+        return result
+    raise CanonicalizationError(f"unsupported canonical node tag: {tag}")
+
+
+def decode_canonical_bytes(payload: bytes) -> CanonicalValue:
+    """Decode bytes produced by canonical_bytes and reject non-canonical forms."""
+
+    if not isinstance(payload, bytes):
+        raise CanonicalizationError("canonical payload must be bytes")
+    try:
+        node = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CanonicalizationError("invalid canonical payload") from exc
+    value = _decoded_node(node)
+    if canonical_bytes(value) != payload:
+        raise CanonicalizationError("payload is not in canonical byte form")
+    return value
 
 
 def canonical_digest(value: object) -> str:

@@ -10,10 +10,15 @@ from ascend_maze.core.identifiers import new_id
 from ascend_maze.contracts.runtime import RuntimeNodeBinding
 from ascend_maze.data.ray_store import RayDataStore
 from ascend_maze.placement import NodeCapacity, NodeStatus
+from ascend_maze.placement import PlacementManager
 from ascend_maze.recording import InMemoryRecorder
 from ascend_maze.runtime.ray_backend import RayRuntimeBackend
-from ascend_maze.runtime.ray_node_registry import RayNodeRegistry
+from ascend_maze.runtime.ray_node_registry import (
+    RayNodeRegistry,
+    RuntimeNodeStatus,
+)
 from ascend_maze.runtime.worker_broker import ColdWorkerBroker
+from ascend_maze.resources import ResourceAnchorProvider
 
 from ascend_maze.control.controller import InMemoryController
 from ascend_maze.control.local_rpc import (
@@ -41,6 +46,9 @@ class RayHostController(InMemoryController):
         node_rpc_bind_address: str = "127.0.0.1:0",
         node_rpc_advertised_host: str | None = None,
         clock: Clock | None = None,
+        anchors: ResourceAnchorProvider | None = None,
+        placement: PlacementManager | None = None,
+        dispatch_timeout_ms: int = 5_000,
     ) -> None:
         generation = controller_generation or new_id("controller")
         data_store = RayDataStore.start(
@@ -72,6 +80,9 @@ class RayHostController(InMemoryController):
             data_store=data_store,
             recorder=recorder,
             runtime=runtime,
+            anchors=anchors,
+            placement=placement,
+            dispatch_timeout_ms=dispatch_timeout_ms,
         )
         self.cluster_id = cluster_id
         self.authorization_token = authorization_token
@@ -98,6 +109,7 @@ class RayHostController(InMemoryController):
             on_binding_disconnected=self._binding_disconnected,
             on_binding_registered=self._binding_registered,
             registration_validator=self._validate_node_registration,
+            on_node_observation=self.placement.update_observation,
             clock=self.clock,
         )
         self.local_rpc = (
@@ -164,10 +176,16 @@ class RayHostController(InMemoryController):
             capacity = replace(capacity, boot_id=binding.boot_id)
             self._node_capacities[binding.node_id] = capacity
             self.placement.register_node(capacity)
-        else:
+        if self.node_registry.status(binding.node_id) is RuntimeNodeStatus.HEALTHY:
             self.placement.set_node_status(
                 binding.node_id,
                 NodeStatus.HEALTHY,
+                now_ms=self.clock.monotonic_ms(),
+            )
+        else:
+            self.placement.set_node_status(
+                binding.node_id,
+                NodeStatus.UNSCHEDULABLE,
                 now_ms=self.clock.monotonic_ms(),
             )
 

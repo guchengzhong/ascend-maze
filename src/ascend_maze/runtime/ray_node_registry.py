@@ -16,6 +16,7 @@ class RuntimeNodeStatus(str, Enum):
     STALE = "stale"
     DRAINING = "draining"
     OFFLINE = "offline"
+    UNSCHEDULABLE = "unschedulable"
 
 
 @dataclass(slots=True)
@@ -40,6 +41,7 @@ class RayNodeRegistry:
         agent_generation: str,
         agent_endpoint: str,
         producer_id: str,
+        status: RuntimeNodeStatus = RuntimeNodeStatus.HEALTHY,
     ) -> tuple[RuntimeNodeBinding, RuntimeNodeBinding | None]:
         with self._lock:
             previous = self._records.get(node_id)
@@ -48,7 +50,7 @@ class RayNodeRegistry:
                 and previous.binding.ray_node_id == ray_node_id
                 and previous.binding.agent_generation == agent_generation
             ):
-                previous.status = RuntimeNodeStatus.HEALTHY
+                previous.status = status
                 return previous.binding, None
             generation = self._generation_by_node.get(node_id, 0) + 1
             binding = RuntimeNodeBinding(
@@ -62,7 +64,7 @@ class RayNodeRegistry:
             )
             self._records[node_id] = _BindingRecord(
                 binding=binding,
-                status=RuntimeNodeStatus.HEALTHY,
+                status=status,
                 heartbeat_sequence=0,
             )
             self._generation_by_node[node_id] = generation

@@ -13,11 +13,12 @@ import grpc
 
 from ascend_maze.contracts.recording import ExecutionEvent, ExecutionRecorder
 from ascend_maze.contracts.runtime import RuntimeNodeBinding
-from ascend_maze.core.canonical import FrozenMap
+from ascend_maze.core.canonical import FrozenMap, freeze_canonical
 from ascend_maze.core.clock import Clock, SystemClock
 from ascend_maze.core.errors import ContractValidationError
 from ascend_maze.core.identifiers import new_id
-from ascend_maze.runtime.events import RuntimeEvent
+from ascend_maze.placement import NodeObservation, NpuObservation
+from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 from ascend_maze.runtime.ray_node_registry import (
     RayNodeRegistry,
     RuntimeNodeStatus,
@@ -118,6 +119,7 @@ class NodeControlServer:
             Callable[[RuntimeNodeBinding, RuntimeNodeBinding | None], None] | None
         ) = None,
         registration_validator: Callable[[str], None] | None = None,
+        on_node_observation: Callable[[NodeObservation], object] | None = None,
         clock: Clock | None = None,
     ) -> None:
         if not cluster_id or not authorization_token or not controller_generation:
@@ -133,6 +135,7 @@ class NodeControlServer:
         self.on_binding_disconnected = on_binding_disconnected
         self.on_binding_registered = on_binding_registered
         self.registration_validator = registration_validator
+        self.on_node_observation = on_node_observation
         self.clock = clock or SystemClock()
         self._server: grpc.aio.Server | None = None
         self.endpoint: str | None = None
@@ -178,10 +181,14 @@ class NodeControlServer:
             bytes(registration.authorization_token), self.authorization_token
         ):
             raise ContractValidationError("NodeAgent authorization failed")
-        if str(registration.environment_fingerprint) != self.environment_fingerprint:
-            raise ContractValidationError("NodeAgent environment mismatch")
         if self.registration_validator is not None:
             self.registration_validator(str(meta.node_id))
+        status = (
+            RuntimeNodeStatus.HEALTHY
+            if str(registration.environment_fingerprint)
+            == self.environment_fingerprint
+            else RuntimeNodeStatus.UNSCHEDULABLE
+        )
         binding, previous = self.registry.register(
             node_id=str(meta.node_id),
             boot_id=str(meta.boot_id),
@@ -189,6 +196,7 @@ class NodeControlServer:
             agent_generation=str(meta.agent_generation),
             agent_endpoint=str(registration.agent_endpoint),
             producer_id=str(registration.producer_id),
+            status=status,
         )
         if previous is not None and self.on_binding_replaced is not None:
             self.on_binding_replaced(previous)
@@ -224,6 +232,32 @@ class NodeControlServer:
                     str(value.event.run_id), f"{type(exc).__name__}: {exc}"
                 )
                 return self._ack(str(meta.message_id), "rejected", str(exc))
+        elif body == "heartbeat" and value.has_observation:
+            try:
+                observation = NodeObservation(
+                    node_id=binding.node_id,
+                    boot_id=binding.boot_id,
+                    sequence=int(meta.sequence),
+                    received_at_ms=self.clock.monotonic_ms(),
+                    observed_free_mem_mb=int(value.observed_free_mem_mb),
+                    npus=tuple(
+                        NpuObservation(
+                            device_id=str(item.device_id),
+                            health=str(item.health),
+                            observed_free_hbm_mb=int(item.observed_free_hbm_mb),
+                            utilization=(
+                                float(item.utilization)
+                                if item.has_utilization
+                                else None
+                            ),
+                        )
+                        for item in value.npus
+                    ),
+                )
+                if self.on_node_observation is not None:
+                    self.on_node_observation(observation)
+            except Exception as exc:
+                return self._ack(str(meta.message_id), "rejected", str(exc))
         return self._ack(str(meta.message_id), "accepted", "")
 
     def _record_node_event(
@@ -232,6 +266,37 @@ class NodeControlServer:
         producer_sequence: int,
         event: RuntimeEvent,
     ) -> None:
+        payload_items: list[tuple[str, object]] = []
+        if event.worker_pid is not None:
+            payload_items.append(("worker_pid", event.worker_pid))
+        if event.device_id is not None:
+            payload_items.extend(
+                (
+                    ("physical_device_id", event.device_id),
+                    ("binding_verified", event.binding_verified),
+                )
+            )
+        observation = event.resource_observation
+        if observation is not None:
+            payload_items.extend(
+                (
+                    ("peak_host_rss_mb", observation.peak_host_rss_mb),
+                    (
+                        "peak_npu_allocated_mb",
+                        observation.peak_npu_allocated_mb,
+                    ),
+                    ("peak_npu_reserved_mb", observation.peak_npu_reserved_mb),
+                    (
+                        "peak_npu_process_hbm_mb",
+                        observation.peak_npu_process_hbm_mb,
+                    ),
+                    ("npu_metric_source", observation.npu_metric_source),
+                    ("npu_metric_quality", observation.npu_metric_quality),
+                )
+            )
+        payload = freeze_canonical(dict(payload_items))
+        if not isinstance(payload, FrozenMap):
+            raise AssertionError("node event payload must be a mapping")
         accepted = self.recorder.emit(
             ExecutionEvent(
                 schema_version=1,
@@ -247,11 +312,11 @@ class NodeControlServer:
                 producer_id=binding.producer_id,
                 producer_sequence=producer_sequence,
                 node_id=binding.node_id,
-                device_id=None,
+                device_id=event.device_id,
                 monotonic_time_ms=event.occurred_at_ms,
                 wall_time_ms=self.clock.wall_ms(),
                 duration_ms=None,
-                payload=FrozenMap(),
+                payload=payload,
             )
         )
         if not accepted:
@@ -298,6 +363,10 @@ class NodeAgent:
         authorization_token: bytes,
         heartbeat_interval_ms: int = 1_000,
         event_queue_capacity: int = 1_024,
+        worker_device_verifier: Callable[[int, str], bool] | None = None,
+        node_observation_provider: (
+            Callable[[int, int], NodeObservation] | None
+        ) = None,
         clock: Clock | None = None,
     ) -> None:
         if not authorization_token:
@@ -308,6 +377,8 @@ class NodeAgent:
         self.authorization_token = authorization_token
         self.heartbeat_interval_ms = heartbeat_interval_ms
         self.clock = clock or SystemClock()
+        self.worker_device_verifier = worker_device_verifier
+        self.node_observation_provider = node_observation_provider
         self._queue: asyncio.Queue[Any] = asyncio.Queue(event_queue_capacity)
         self._sequence = 0
         self._producer_sequence = 0
@@ -412,10 +483,31 @@ class NodeAgent:
                 message = await asyncio.wait_for(
                     self._queue.get(), self.heartbeat_interval_ms / 1_000
                 )
-            except TimeoutError:
-                message = control_pb2.AgentStreamMessage(
-                    heartbeat=control_pb2.NodeHeartbeat(meta=self._next_meta())
-                )
+            except asyncio.TimeoutError:
+                meta = self._next_meta()
+                heartbeat = control_pb2.NodeHeartbeat(meta=meta)
+                provider = self.node_observation_provider
+                if provider is not None:
+                    try:
+                        observation = provider(
+                            int(meta.sequence), self.clock.monotonic_ms()
+                        )
+                    except Exception:
+                        observation = None
+                    if observation is not None:
+                        heartbeat.has_observation = True
+                        heartbeat.observed_free_mem_mb = (
+                            observation.observed_free_mem_mb
+                        )
+                        for item in observation.npus:
+                            heartbeat.npus.add(
+                                device_id=item.device_id,
+                                health=item.health,
+                                observed_free_hbm_mb=item.observed_free_hbm_mb,
+                                utilization=item.utilization or 0.0,
+                                has_utilization=item.utilization is not None,
+                            )
+                message = control_pb2.AgentStreamMessage(heartbeat=heartbeat)
             yield message
 
     async def _consume_responses(self) -> None:
@@ -445,6 +537,28 @@ class NodeAgent:
             )
         if event_id in self._event_ids:
             return control_pb2.WorkerEventAck(event_id=event_id, accepted=True)
+        if str(request.event.kind) == RuntimeEventKind.WORKER_STARTED.value and str(
+            request.event.device_id
+        ):
+            verifier = self.worker_device_verifier
+            if (
+                verifier is None
+                or not request.event.has_worker_pid
+                or not request.event.binding_verified
+                or not verifier(
+                    int(request.event.worker_pid),
+                    str(request.event.device_id),
+                )
+            ):
+                return control_pb2.WorkerEventAck(
+                    event_id=event_id,
+                    accepted=False,
+                    error_code="device_bind_failed",
+                    message=(
+                        "NodeAgent could not verify Worker PID on the leased "
+                        "physical NPU"
+                    ),
+                )
         message = control_pb2.AgentStreamMessage(
             runtime_event=control_pb2.NodeRuntimeEvent(
                 meta=self._next_meta(),

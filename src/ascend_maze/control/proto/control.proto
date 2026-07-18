@@ -51,6 +51,45 @@ message ErrorMessage {
   string worker_id = 17;
   string exception_type = 18;
   int64 occurred_at_ms = 19;
+  string device_id = 20;
+  string platform_error_code = 21;
+  bytes canonical_details = 22;
+  string traceback_ref = 23;
+  string model_instance_id = 24;
+}
+
+message ResourceSpecMessage {
+  uint64 cpu_num = 1;
+  uint64 mem_mb = 2;
+  uint64 npu_mem_mb = 3;
+  uint64 io_num = 4;
+}
+
+message ResourceObservationMessage {
+  string run_id = 1;
+  string task_id = 2;
+  string definition_id = 3;
+  uint32 attempt = 4;
+  string code_hash = 5;
+  string environment_fingerprint = 6;
+  ResourceSpecMessage requested = 7;
+  string status = 8;
+  bytes canonical_input_features = 9;
+  uint64 peak_host_rss_mb = 10;
+  bool has_peak_host_rss_mb = 11;
+  uint64 peak_npu_allocated_mb = 12;
+  bool has_peak_npu_allocated_mb = 13;
+  uint64 peak_npu_reserved_mb = 14;
+  bool has_peak_npu_reserved_mb = 15;
+  uint64 peak_npu_process_hbm_mb = 16;
+  bool has_peak_npu_process_hbm_mb = 17;
+  string npu_metric_source = 18;
+  string npu_metric_quality = 19;
+  string error_type = 20;
+  string device_id = 21;
+  uint64 worker_pid = 22;
+  bool has_worker_pid = 23;
+  bool binding_verified = 24;
 }
 
 message RuntimeEventMessage {
@@ -66,6 +105,12 @@ message RuntimeEventMessage {
   repeated NamedDataHandle output_handles = 10;
   ErrorMessage error = 11;
   bool has_error = 12;
+  uint64 worker_pid = 13;
+  bool has_worker_pid = 14;
+  string device_id = 15;
+  bool binding_verified = 16;
+  ResourceObservationMessage resource_observation = 17;
+  bool has_resource_observation = 18;
 }
 
 message RegisterNode {
@@ -77,8 +122,19 @@ message RegisterNode {
   bytes authorization_token = 6;
 }
 
+message NpuObservationMessage {
+  string device_id = 1;
+  string health = 2;
+  uint64 observed_free_hbm_mb = 3;
+  double utilization = 4;
+  bool has_utilization = 5;
+}
+
 message NodeHeartbeat {
   AgentMeta meta = 1;
+  bool has_observation = 2;
+  uint64 observed_free_mem_mb = 3;
+  repeated NpuObservationMessage npus = 4;
 }
 
 message NodeRuntimeEvent {

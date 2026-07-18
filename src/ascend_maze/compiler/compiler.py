@@ -63,11 +63,21 @@ class CompileOptions:
             )
 
 
-def _resolve_kind(declared: str | None, resources: ResourceSpec) -> str:
+def _resolve_kind(
+    declared: str | None,
+    resources: ResourceSpec,
+    static_kind: str | None,
+) -> str:
+    if declared is not None and static_kind == "npu" and declared != "npu":
+        raise TaskDefinitionError(
+            f"task_kind={declared} conflicts with high-confidence Ascend APIs"
+        )
     if declared is not None:
         kind = declared
     elif resources.npu_mem_mb > 0:
         kind = "npu"
+    elif static_kind is not None:
+        kind = static_kind
     elif resources.io_num > 0:
         kind = "io"
     else:
@@ -82,7 +92,17 @@ def _resolve_kind(declared: str | None, resources: ResourceSpec) -> str:
 def _definition(draft: _DraftTask, options: CompileOptions) -> TaskDefinition:
     template = draft.template
     resources = template.resource_declaration.resolve(options.default_resources)
-    task_kind = _resolve_kind(template.declared_task_kind, resources)
+    task_kind = _resolve_kind(
+        template.declared_task_kind,
+        resources,
+        template.analysis.static_task_kind,
+    )
+    static_inferred = ResourceSpec(
+        cpu_num=template.analysis.static_cpu_num,
+        mem_mb=0,
+        npu_mem_mb=0,
+        io_num=template.analysis.static_io_num,
+    )
     signature = inspect.signature(template.func)
     default_names: list[str] = []
     default_digests: list[tuple[str, str]] = []
@@ -110,6 +130,13 @@ def _definition(draft: _DraftTask, options: CompileOptions) -> TaskDefinition:
             "npu_mem_mb": resources.npu_mem_mb,
             "io_num": resources.io_num,
         },
+        "static_inferred": {
+            "cpu_num": static_inferred.cpu_num,
+            "mem_mb": static_inferred.mem_mb,
+            "npu_mem_mb": static_inferred.npu_mem_mb,
+            "io_num": static_inferred.io_num,
+        },
+        "static_signals": template.analysis.static_signals,
         "timeout_ms": template.timeout_ms,
         "max_retries": template.max_retries,
         "retry_backoff_ms": template.retry_backoff_ms,
@@ -128,6 +155,8 @@ def _definition(draft: _DraftTask, options: CompileOptions) -> TaskDefinition:
         output_names=template.analysis.output_names,
         task_kind=task_kind,
         resources=resources,
+        static_inferred=static_inferred,
+        static_signals=template.analysis.static_signals,
         timeout_ms=template.timeout_ms,
         max_retries=template.max_retries,
         retry_backoff_ms=template.retry_backoff_ms,
@@ -304,6 +333,8 @@ def _ir_payload(
                 "output_names": definition.output_names,
                 "task_kind": definition.task_kind,
                 "resources": _resource_payload(definition.resources),
+                "static_inferred": _resource_payload(definition.static_inferred),
+                "static_signals": definition.static_signals,
                 "timeout_ms": definition.timeout_ms,
                 "max_retries": definition.max_retries,
                 "retry_backoff_ms": definition.retry_backoff_ms,

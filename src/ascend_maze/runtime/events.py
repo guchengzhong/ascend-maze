@@ -7,6 +7,7 @@ from enum import Enum
 
 from ascend_maze.contracts.data import DataHandle
 from ascend_maze.contracts.errors import ErrorInfo
+from ascend_maze.contracts.resources import ResourceObservation
 from ascend_maze.core.identifiers import new_id
 
 
@@ -31,6 +32,10 @@ class RuntimeEvent:
     occurred_at_ms: int
     output_handles: tuple[tuple[str, DataHandle], ...] = ()
     error: ErrorInfo | None = None
+    worker_pid: int | None = None
+    device_id: str | None = None
+    binding_verified: bool = False
+    resource_observation: ResourceObservation | None = None
 
     @classmethod
     def create(
@@ -46,6 +51,10 @@ class RuntimeEvent:
         occurred_at_ms: int,
         output_handles: tuple[tuple[str, DataHandle], ...] = (),
         error: ErrorInfo | None = None,
+        worker_pid: int | None = None,
+        device_id: str | None = None,
+        binding_verified: bool = False,
+        resource_observation: ResourceObservation | None = None,
     ) -> "RuntimeEvent":
         return cls(
             event_id=new_id("event"),
@@ -59,4 +68,8 @@ class RuntimeEvent:
             occurred_at_ms=occurred_at_ms,
             output_handles=output_handles,
             error=error,
+            worker_pid=worker_pid,
+            device_id=device_id,
+            binding_verified=binding_verified,
+            resource_observation=resource_observation,
         )

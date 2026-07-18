@@ -7,6 +7,7 @@ from enum import Enum
 from collections.abc import Mapping
 import warnings
 
+from ascend_maze.core.canonical import CanonicalValue, FrozenMap, freeze_canonical
 from ascend_maze.core.errors import ContractValidationError
 
 
@@ -172,3 +173,57 @@ class PlacementLease:
             raise ContractValidationError(
                 "dispatch_deadline_ms cannot precede created_at_ms"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceObservation:
+    run_id: str
+    task_id: str
+    definition_id: str
+    attempt: int
+    code_hash: str
+    environment_fingerprint: str
+    requested: ResourceSpec
+    status: str
+    input_features: FrozenMap[CanonicalValue, CanonicalValue] = FrozenMap()
+    peak_host_rss_mb: int | None = None
+    peak_npu_allocated_mb: int | None = None
+    peak_npu_reserved_mb: int | None = None
+    peak_npu_process_hbm_mb: int | None = None
+    npu_metric_source: str | None = None
+    npu_metric_quality: str | None = None
+    error_type: str | None = None
+    device_id: str | None = None
+    worker_pid: int | None = None
+    binding_verified: bool = False
+
+    def __post_init__(self) -> None:
+        for name in (
+            "run_id",
+            "task_id",
+            "definition_id",
+            "code_hash",
+            "environment_fingerprint",
+            "status",
+        ):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ContractValidationError(f"{name} is required")
+        _non_negative_int("attempt", self.attempt)
+        if not isinstance(self.requested, ResourceSpec):
+            raise ContractValidationError("requested must be ResourceSpec")
+        for name in (
+            "peak_host_rss_mb",
+            "peak_npu_allocated_mb",
+            "peak_npu_reserved_mb",
+            "peak_npu_process_hbm_mb",
+            "worker_pid",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                _non_negative_int(name, value)
+        if not isinstance(self.binding_verified, bool):
+            raise ContractValidationError("binding_verified must be a boolean")
+        frozen = freeze_canonical(self.input_features)
+        if not isinstance(frozen, FrozenMap):
+            raise ContractValidationError("input_features must be a mapping")
+        object.__setattr__(self, "input_features", frozen)

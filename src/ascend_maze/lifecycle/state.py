@@ -478,6 +478,43 @@ class RunStateManager:
                 run_terminal=True,
             )
 
+    def pre_attempt_final_failure(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        error: ErrorInfo,
+        now_ms: int,
+    ) -> TransitionResult:
+        """Fail a queued task when admission proves it can never be placed."""
+
+        with self._lock:
+            run, task = self._require_task(run_id, task_id)
+            if run.status in RUN_TERMINAL or task.status in TASK_TERMINAL:
+                return TransitionResult(False, run_terminal=run.status in RUN_TERMINAL)
+            if task.status is not TaskStatus.QUEUED or task.attempt_count != 0:
+                raise StateTransitionError(
+                    "pre-attempt failure requires a queued task with no Attempt"
+                )
+            task.status = TaskStatus.FAILED
+            task.finished_at_ms = now_ms
+            task.pending_reason = None
+            task.last_error = error
+            run.status = RunStatus.FAILED
+            run.finished_at_ms = now_ms
+            run.failure = error
+            cancelled = self._cancel_other_tasks(
+                run,
+                except_task_id=task_id,
+                reason="upstream_failed",
+                now_ms=now_ms,
+            )
+            return TransitionResult(
+                True,
+                cancelled_attempts=cancelled,
+                run_terminal=True,
+            )
+
     def terminate_run(
         self,
         *,

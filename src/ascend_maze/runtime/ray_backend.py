@@ -16,6 +16,7 @@ from ascend_maze.contracts.resources import ExecutionTarget, PlacementLease
 from ascend_maze.contracts.runtime import (
     CodeHandle,
     CodePackage,
+    DeviceBinding,
     DispatchHandle,
     ExecutionRequest,
     RuntimeNodeBinding,
@@ -210,6 +211,23 @@ class RayRuntimeBackend:
             execution_target=request.execution_target,
             now_ms=monotonic_time_ms(),
         )
+        device_binding: DeviceBinding | None = None
+        if request.task_kind == "npu":
+            device_binding = DeviceBinding.from_lease(lease, binding)
+            if worker_lease.bound_device_id != device_binding.physical_device_id:
+                self.worker_broker.release(
+                    worker_lease.worker_lease_id, disposition="discard"
+                )
+                raise ContractValidationError(
+                    "WorkerLease device does not match PlacementLease"
+                )
+        elif lease.npu_device_id is not None or lease.resources.npu_slots != 0:
+            self.worker_broker.release(
+                worker_lease.worker_lease_id, disposition="discard"
+            )
+            raise ContractValidationError(
+                "CPU/I/O Worker cannot receive an NPU PlacementLease"
+            )
         handle = DispatchHandle(
             dispatch_id=request.dispatch_id,
             backend_name=self.backend_name,
@@ -244,6 +262,7 @@ class RayRuntimeBackend:
                 data_store_descriptor=self.data_store.descriptor,
                 code_package_handle=code.package_handle,
                 event_timeout_seconds=self.event_timeout_seconds,
+                device_binding=device_binding,
             )
         except Exception:
             self.worker_broker.release(
@@ -449,7 +468,7 @@ class RayRuntimeBackend:
                         record.node_terminal_received.wait(),
                         timeout=self.event_timeout_seconds,
                     )
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     self._record_delivery_error(
                         record.request.run_id,
                         "Controller did not receive the NodeAgent terminal event",

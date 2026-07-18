@@ -8,9 +8,11 @@ from ascend_maze.placement.manager import (
     NodeSnapshot,
     NodeStatus,
     NpuCapacity,
+    NpuObservation,
     PlacementManager,
     PlacementResult,
     RunPlacementSnapshot,
+    NodeObservation,
 )
 
 __all__ = [
@@ -21,6 +23,8 @@ __all__ = [
     "NodeSnapshot",
     "NodeStatus",
     "NpuCapacity",
+    "NpuObservation",
+    "NodeObservation",
     "PlacementManager",
     "PlacementResult",
     "RunPlacementSnapshot",

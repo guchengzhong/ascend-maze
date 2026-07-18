@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from threading import RLock
 from typing import Mapping
@@ -114,10 +114,45 @@ class NodeCapacity:
         object.__setattr__(self, "capabilities", frozen)
 
 
+@dataclass(frozen=True, slots=True)
+class NpuObservation:
+    device_id: str
+    health: str
+    observed_free_hbm_mb: int
+    utilization: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.device_id or not self.health:
+            raise ContractValidationError("NPU observation identity is required")
+        _non_negative("observed_free_hbm_mb", self.observed_free_hbm_mb)
+        if self.utilization is not None and not 0 <= self.utilization <= 100:
+            raise ContractValidationError("NPU utilization must be within 0..100")
+
+
+@dataclass(frozen=True, slots=True)
+class NodeObservation:
+    node_id: str
+    boot_id: str
+    sequence: int
+    received_at_ms: int
+    observed_free_mem_mb: int
+    npus: tuple[NpuObservation, ...]
+
+    def __post_init__(self) -> None:
+        if not self.node_id or not self.boot_id:
+            raise ContractValidationError("node observation identity is required")
+        for name in ("sequence", "received_at_ms", "observed_free_mem_mb"):
+            _non_negative(name, getattr(self, name))
+        device_ids = [item.device_id for item in self.npus]
+        if len(device_ids) != len(set(device_ids)):
+            raise ContractValidationError("NPU observation IDs must be unique")
+
+
 @dataclass(slots=True)
 class _NodeRecord:
     capacity: NodeCapacity
     status: NodeStatus
+    observation_sequence: int = 0
 
 
 @dataclass(slots=True)
@@ -168,6 +203,7 @@ class RunPlacementSnapshot:
 class NodeSnapshot:
     capacity: NodeCapacity
     status: NodeStatus
+    observation_sequence: int
     reserved: ReservationVector
     per_npu_reserved: tuple[tuple[str, int, int], ...]
 
@@ -187,6 +223,7 @@ class PlacementManager:
         *,
         host_mem_headroom_mb: int = 0,
         npu_hbm_headroom_mb: int = 0,
+        required_environment_fingerprint: str | None = None,
     ) -> None:
         self.host_mem_headroom_mb = _non_negative(
             "host_mem_headroom_mb", host_mem_headroom_mb
@@ -194,6 +231,9 @@ class PlacementManager:
         self.npu_hbm_headroom_mb = _non_negative(
             "npu_hbm_headroom_mb", npu_hbm_headroom_mb
         )
+        if required_environment_fingerprint is not None and not required_environment_fingerprint:
+            raise ValueError("required_environment_fingerprint cannot be empty")
+        self.required_environment_fingerprint = required_environment_fingerprint
         self._nodes: dict[str, _NodeRecord] = {}
         self._leases: dict[str, _LeaseRecord] = {}
         self._run_contexts: dict[str, _RunPlacementRecord] = {}
@@ -207,6 +247,11 @@ class PlacementManager:
         status: NodeStatus = NodeStatus.HEALTHY,
     ) -> None:
         with self._lock:
+            required = self.required_environment_fingerprint
+            if required is not None and capacity.capabilities.get(
+                "environment_fingerprint"
+            ) != required:
+                status = NodeStatus.UNSCHEDULABLE
             current = self._nodes.get(capacity.node_id)
             if current is not None and current.capacity.boot_id != capacity.boot_id:
                 self._invalidate_affinity_locked(
@@ -221,6 +266,46 @@ class PlacementManager:
                 )
             self._nodes[capacity.node_id] = _NodeRecord(capacity, status)
             self._snapshot_version += 1
+
+    def update_observation(self, observation: NodeObservation) -> bool:
+        with self._lock:
+            record = self._nodes.get(observation.node_id)
+            if (
+                record is None
+                or record.capacity.boot_id != observation.boot_id
+                or observation.sequence <= record.observation_sequence
+            ):
+                return False
+            by_device = {item.device_id: item for item in observation.npus}
+            unknown = set(by_device) - {item.device_id for item in record.capacity.npus}
+            if unknown:
+                raise ContractValidationError(
+                    f"observation contains unknown NPU IDs: {sorted(unknown)}"
+                )
+            npus = tuple(
+                replace(
+                    npu,
+                    observed_free_hbm_mb=(
+                        by_device[npu.device_id].observed_free_hbm_mb
+                        if npu.device_id in by_device
+                        else npu.observed_free_hbm_mb
+                    ),
+                    healthy=(
+                        by_device[npu.device_id].health == "healthy"
+                        if npu.device_id in by_device
+                        else npu.healthy
+                    ),
+                )
+                for npu in record.capacity.npus
+            )
+            record.capacity = replace(
+                record.capacity,
+                observed_free_mem_mb=observation.observed_free_mem_mb,
+                npus=npus,
+            )
+            record.observation_sequence = observation.sequence
+            self._snapshot_version += 1
+            return True
 
     def set_node_status(
         self,
@@ -268,6 +353,14 @@ class PlacementManager:
                 else "task"
             )
             vector = self._reservation_vector(anchor)
+            if self._permanently_unsatisfiable(vector):
+                return PlacementResult(
+                    False,
+                    None,
+                    "resource_request_unsatisfiable",
+                    snapshot_version,
+                    False,
+                )
             healthy = [
                 record
                 for record in self._nodes.values()
@@ -502,6 +595,17 @@ class PlacementManager:
                 for record in self._leases.values()
             )
 
+    def max_single_npu_allocatable_hbm_mb(self) -> int:
+        with self._lock:
+            return max(
+                (
+                    npu.total_hbm_mb - npu.system_reserved_hbm_mb
+                    for record in self._nodes.values()
+                    for npu in record.capacity.npus
+                ),
+                default=0,
+            )
+
     def lease_record_count(self, run_id: str | None = None) -> int:
         with self._lock:
             return sum(
@@ -523,6 +627,7 @@ class PlacementManager:
                     NodeSnapshot(
                         capacity=record.capacity,
                         status=record.status,
+                        observation_sequence=record.observation_sequence,
                         reserved=reserved,
                         per_npu_reserved=tuple(per_npu),
                     )
@@ -606,6 +711,22 @@ class PlacementManager:
         if not any_hbm:
             return None, "insufficient_npu_hbm"
         return None, "npu_task_slots_full"
+
+    def _permanently_unsatisfiable(self, vector: ReservationVector) -> bool:
+        if vector.npu_hbm_mb == 0 and vector.npu_slots == 0:
+            return False
+        npus = [
+            npu
+            for record in self._nodes.values()
+            for npu in record.capacity.npus
+        ]
+        if not npus:
+            return False
+        return not any(
+            npu.total_hbm_mb - npu.system_reserved_hbm_mb >= vector.npu_hbm_mb
+            and npu.task_slots_total >= vector.npu_slots
+            for npu in npus
+        )
 
     def _pressure_score(
         self,

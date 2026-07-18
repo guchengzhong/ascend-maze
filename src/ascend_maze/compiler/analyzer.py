@@ -24,12 +24,83 @@ class AnalyzedCallable:
     source: str
     normalized_ast: str
     code_hash: str
+    static_task_kind: str | None
+    static_cpu_num: int
+    static_io_num: int
+    static_signals: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class _Flow:
     return_key_sets: tuple[tuple[str, ...], ...]
     may_fallthrough: bool
+
+
+def _dotted_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _dotted_name(node.value)
+        return None if prefix is None else f"{prefix}.{node.attr}"
+    return None
+
+
+def _static_resource_hints(node: ast.FunctionDef) -> tuple[str | None, int, int, tuple[str, ...]]:
+    names: set[str] = set()
+    cpu_num = 0
+    io_num = 0
+    for item in ast.walk(node):
+        if isinstance(item, ast.Import):
+            names.update(alias.name for alias in item.names)
+        elif isinstance(item, ast.ImportFrom) and item.module:
+            names.add(item.module)
+        elif isinstance(item, ast.Call):
+            dotted = _dotted_name(item.func)
+            if dotted is not None:
+                names.add(dotted)
+            for keyword in item.keywords:
+                if (
+                    keyword.arg in {"max_workers", "n_jobs", "num_workers"}
+                    and isinstance(keyword.value, ast.Constant)
+                    and isinstance(keyword.value.value, int)
+                    and not isinstance(keyword.value.value, bool)
+                    and keyword.value.value > 0
+                ):
+                    cpu_num = max(cpu_num, keyword.value.value)
+
+    npu_prefixes = (
+        "acl",
+        "torch.npu",
+        "torch_npu",
+        "mindspore.runtime",
+        "mindspore.set_context",
+    )
+    io_prefixes = (
+        "aiofiles",
+        "httpx",
+        "requests",
+        "socket",
+        "urllib",
+    )
+    npu_signals = sorted(
+        name for name in names if any(name.startswith(prefix) for prefix in npu_prefixes)
+    )
+    io_signals = sorted(
+        name for name in names if any(name.startswith(prefix) for prefix in io_prefixes)
+    )
+    if npu_signals:
+        kind = "npu"
+    elif io_signals:
+        kind = "io"
+        io_num = max(io_num, 1)
+    else:
+        kind = None
+    signals = tuple(f"npu:{name}" for name in npu_signals) + tuple(
+        f"io:{name}" for name in io_signals
+    )
+    if cpu_num:
+        signals += (f"cpu_workers:{cpu_num}",)
+    return kind, cpu_num, io_num, signals
 
 
 class _TryStatement(Protocol):
@@ -251,6 +322,9 @@ def analyse_callable(func: object) -> AnalyzedCallable:
             }
         )
     ).hexdigest()
+    static_task_kind, static_cpu_num, static_io_num, static_signals = (
+        _static_resource_hints(node)
+    )
     return AnalyzedCallable(
         module=module,
         qualname=qualname,
@@ -259,4 +333,8 @@ def analyse_callable(func: object) -> AnalyzedCallable:
         source=source,
         normalized_ast=normalized_ast,
         code_hash=code_hash,
+        static_task_kind=static_task_kind,
+        static_cpu_num=static_cpu_num,
+        static_io_num=static_io_num,
+        static_signals=static_signals,
     )
