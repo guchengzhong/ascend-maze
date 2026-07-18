@@ -35,6 +35,9 @@ dev = [
     "pytest>=8.3,<9",
     "ruff>=0.9,<1",
 ]
+ray-host = [
+    "ray[default]==2.55.1",
+]
 
 [tool.setuptools.package-dir]
 "" = "src"
