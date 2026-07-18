@@ -120,6 +120,66 @@ message RegisterNode {
   string producer_id = 4;
   string environment_fingerprint = 5;
   bytes authorization_token = 6;
+  bool records_locally = 7;
+}
+
+message RunRecordingContextMessage {
+  uint32 schema_version = 1;
+  string experiment_id = 2;
+  string run_id = 3;
+  string workflow_fingerprint = 4;
+  string config_fingerprint = 5;
+  string environment_fingerprint = 6;
+  string build_revision = 7;
+  int64 started_wall_time_ms = 8;
+  repeated string initial_expected_producer_ids = 9;
+}
+
+message OpenRunRecordingRequest {
+  uint32 schema_version = 1;
+  string cluster_id = 2;
+  string node_id = 3;
+  string boot_id = 4;
+  string agent_generation = 5;
+  string controller_generation = 6;
+  uint64 runtime_generation = 7;
+  bytes authorization_token = 8;
+  RunRecordingContextMessage context = 9;
+}
+
+message RecorderControlAck {
+  string run_id = 1;
+  bool accepted = 2;
+  string error_code = 3;
+  string message = 4;
+}
+
+message FlushRunRecordingRequest {
+  uint32 schema_version = 1;
+  string cluster_id = 2;
+  string node_id = 3;
+  string boot_id = 4;
+  string agent_generation = 5;
+  string controller_generation = 6;
+  uint64 runtime_generation = 7;
+  bytes authorization_token = 8;
+  string run_id = 9;
+  uint64 timeout_ms = 10;
+}
+
+message FlushResultMessage {
+  string run_id = 1;
+  repeated string committed_files = 2;
+  uint64 dropped_control_event_count = 3;
+  uint64 dropped_telemetry_count = 4;
+  uint64 sequence_gap_count = 5;
+  uint64 missing_producer_count = 6;
+  repeated string writer_errors = 7;
+  bool recording_complete = 8;
+  uint64 flush_duration_ms = 9;
+  bool accepted = 10;
+  string error_code = 11;
+  string message = 12;
 }
 
 message NpuObservationMessage {
@@ -220,6 +280,8 @@ service NodeControl {
 
 service WorkerEventSink {
   rpc Report(WorkerEventRequest) returns (WorkerEventAck);
+  rpc OpenRunRecording(OpenRunRecordingRequest) returns (RecorderControlAck);
+  rpc FlushRunRecording(FlushRunRecordingRequest) returns (FlushResultMessage);
 }
 
 service LocalControl {

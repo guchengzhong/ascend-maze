@@ -7,6 +7,11 @@ from pathlib import Path
 
 from ascend_maze.core.clock import Clock
 from ascend_maze.core.identifiers import new_id
+from ascend_maze.contracts.recording import (
+    ExecutionRecorder,
+    HistoricalEventReader,
+    RunEventPage,
+)
 from ascend_maze.contracts.runtime import RuntimeNodeBinding
 from ascend_maze.contracts.worker import WorkerPoolConfig
 from ascend_maze.data.ray_store import RayDataStore
@@ -61,13 +66,14 @@ class RayHostController(InMemoryController):
         max_bypass_count: int = 8,
         dispatch_timeout_ms: int = 5_000,
         worker_pool_config: WorkerPoolConfig | None = None,
+        recorder: ExecutionRecorder | None = None,
     ) -> None:
         generation = controller_generation or new_id("controller")
         data_store = RayDataStore.start(
             owner_generation=generation,
             namespace=ray_namespace,
         )
-        recorder = InMemoryRecorder()
+        effective_recorder = recorder or InMemoryRecorder()
         node_registry = RayNodeRegistry()
         effective_placement = placement or PlacementManager()
         pool_events: list[WorkerPoolEvent] = []
@@ -93,7 +99,8 @@ class RayHostController(InMemoryController):
             cluster_id=cluster_id,
             owner_generation=generation,
             environment_fingerprint=environment_fingerprint,
-            recording_error_sink=recorder.record_writer_error,
+            authorization_token=authorization_token,
+            recording_error_sink=effective_recorder.record_writer_error,
         )
         super().__init__(
             config_fingerprint=config_fingerprint,
@@ -103,7 +110,7 @@ class RayHostController(InMemoryController):
             controller_generation=generation,
             clock=clock,
             data_store=data_store,
-            recorder=recorder,
+            recorder=effective_recorder,
             runtime=runtime,
             anchors=anchors,
             placement=effective_placement,
@@ -117,7 +124,7 @@ class RayHostController(InMemoryController):
         self.authorization_token = authorization_token
         self.ray_namespace = ray_namespace
         self.ray_data_store = data_store
-        self.ray_recorder = recorder
+        self.ray_recorder = effective_recorder
         self.node_registry = node_registry
         self.worker_broker = worker_broker
         self.worker_pool_config = worker_pool_config
@@ -134,7 +141,7 @@ class RayHostController(InMemoryController):
             controller_generation=generation,
             environment_fingerprint=environment_fingerprint,
             registry=node_registry,
-            recorder=recorder,
+            recorder=effective_recorder,
             event_sink=runtime.post_node_event,
             on_binding_replaced=runtime.invalidate_binding,
             on_binding_disconnected=self._binding_disconnected,
@@ -203,6 +210,17 @@ class RayHostController(InMemoryController):
             environment_fingerprint=self.environment_fingerprint,
             healthy_node_count=len(self.node_registry.active_bindings()),
         )
+
+    def get_run_events(
+        self,
+        run_id: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> RunEventPage:
+        if not isinstance(self.recorder, HistoricalEventReader):
+            raise RuntimeError("configured recorder has no historical event reader")
+        return self.recorder.get_run_events(run_id, cursor=cursor, limit=limit)
 
     def _binding_registered(
         self,

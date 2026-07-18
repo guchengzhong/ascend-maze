@@ -25,6 +25,7 @@ class _RunRecording:
     dropped_control: int = 0
     sequence_gaps: int = 0
     writer_errors: list[str] = field(default_factory=list)
+    producer_flushes: dict[str, FlushResult] = field(default_factory=dict)
     flushed: FlushResult | None = None
 
 
@@ -111,6 +112,25 @@ class InMemoryRecorder:
             if recording is not None and recording.flushed is None:
                 recording.writer_errors.append(message)
 
+    def merge_producer_flush(
+        self,
+        run_id: str,
+        producer_id: str,
+        result: FlushResult,
+    ) -> None:
+        if not producer_id:
+            raise ContractValidationError("producer_id is required")
+        if result.run_id != run_id:
+            raise ContractValidationError("producer FlushResult run_id mismatch")
+        with self._lock:
+            recording = self._require_run(run_id)
+            if recording.flushed is not None:
+                raise RuntimeError("run recording is already flushed")
+            existing = recording.producer_flushes.get(producer_id)
+            if existing is not None and existing != result:
+                raise ContractValidationError("producer FlushResult conflict")
+            recording.producer_flushes[producer_id] = result
+
     async def flush_run(self, run_id: str, timeout_ms: int) -> FlushResult:
         del timeout_ms
         started = monotonic_time_ms()
@@ -118,21 +138,53 @@ class InMemoryRecorder:
             recording = self._require_run(run_id)
             if recording.flushed is not None:
                 return recording.flushed
-            missing = recording.expected_producers - recording.seen_producers
+            remote_producers = set(recording.producer_flushes)
+            missing = (
+                recording.expected_producers
+                - recording.seen_producers
+                - remote_producers
+            )
+            remote_results = tuple(recording.producer_flushes.values())
+            committed_files = tuple(
+                dict.fromkeys(
+                    path
+                    for result in remote_results
+                    for path in result.committed_files
+                )
+            )
+            dropped_control = recording.dropped_control + sum(
+                result.dropped_control_event_count for result in remote_results
+            )
+            dropped_telemetry = sum(
+                result.dropped_telemetry_count for result in remote_results
+            )
+            sequence_gaps = recording.sequence_gaps + sum(
+                result.sequence_gap_count for result in remote_results
+            )
+            missing_count = len(missing) + sum(
+                result.missing_producer_count for result in remote_results
+            )
+            writer_errors = tuple(recording.writer_errors) + tuple(
+                error
+                for result in remote_results
+                for error in result.writer_errors
+            )
             complete = (
-                recording.dropped_control == 0
-                and recording.sequence_gaps == 0
-                and not missing
-                and not recording.writer_errors
+                dropped_control == 0
+                and dropped_telemetry == 0
+                and sequence_gaps == 0
+                and missing_count == 0
+                and not writer_errors
+                and all(result.recording_complete for result in remote_results)
             )
             result = FlushResult(
                 run_id=run_id,
-                committed_files=(),
-                dropped_control_event_count=recording.dropped_control,
-                dropped_telemetry_count=0,
-                sequence_gap_count=recording.sequence_gaps,
-                missing_producer_count=len(missing),
-                writer_errors=tuple(recording.writer_errors),
+                committed_files=committed_files,
+                dropped_control_event_count=dropped_control,
+                dropped_telemetry_count=dropped_telemetry,
+                sequence_gap_count=sequence_gaps,
+                missing_producer_count=missing_count,
+                writer_errors=writer_errors,
                 recording_complete=complete,
                 flush_duration_ms=max(0, monotonic_time_ms() - started),
             )
@@ -185,6 +237,14 @@ class NoopRecorder:
 
     def record_writer_error(self, run_id: str, message: str) -> None:
         del run_id, message
+
+    def merge_producer_flush(
+        self,
+        run_id: str,
+        producer_id: str,
+        result: FlushResult,
+    ) -> None:
+        del run_id, producer_id, result
 
     async def flush_run(self, run_id: str, timeout_ms: int) -> FlushResult:
         del timeout_ms

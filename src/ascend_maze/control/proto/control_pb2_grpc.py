@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from . import control_pb2 as control__pb2
+from ascend_maze.control.proto import control_pb2 as control__pb2
 
 GRPC_GENERATED_VERSION = '1.82.1'
 GRPC_VERSION = grpc.__version__
@@ -111,12 +111,34 @@ class WorkerEventSinkStub:
                 request_serializer=control__pb2.WorkerEventRequest.SerializeToString,
                 response_deserializer=control__pb2.WorkerEventAck.FromString,
                 _registered_method=True)
+        self.OpenRunRecording = channel.unary_unary(
+                '/ascend_maze.control.v1.WorkerEventSink/OpenRunRecording',
+                request_serializer=control__pb2.OpenRunRecordingRequest.SerializeToString,
+                response_deserializer=control__pb2.RecorderControlAck.FromString,
+                _registered_method=True)
+        self.FlushRunRecording = channel.unary_unary(
+                '/ascend_maze.control.v1.WorkerEventSink/FlushRunRecording',
+                request_serializer=control__pb2.FlushRunRecordingRequest.SerializeToString,
+                response_deserializer=control__pb2.FlushResultMessage.FromString,
+                _registered_method=True)
 
 
 class WorkerEventSinkServicer:
     """Missing associated documentation comment in .proto file."""
 
     def Report(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def OpenRunRecording(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def FlushRunRecording(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -129,6 +151,16 @@ def add_WorkerEventSinkServicer_to_server(servicer, server):
                     servicer.Report,
                     request_deserializer=control__pb2.WorkerEventRequest.FromString,
                     response_serializer=control__pb2.WorkerEventAck.SerializeToString,
+            ),
+            'OpenRunRecording': grpc.unary_unary_rpc_method_handler(
+                    servicer.OpenRunRecording,
+                    request_deserializer=control__pb2.OpenRunRecordingRequest.FromString,
+                    response_serializer=control__pb2.RecorderControlAck.SerializeToString,
+            ),
+            'FlushRunRecording': grpc.unary_unary_rpc_method_handler(
+                    servicer.FlushRunRecording,
+                    request_deserializer=control__pb2.FlushRunRecordingRequest.FromString,
+                    response_serializer=control__pb2.FlushResultMessage.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -158,6 +190,60 @@ class WorkerEventSink:
             '/ascend_maze.control.v1.WorkerEventSink/Report',
             control__pb2.WorkerEventRequest.SerializeToString,
             control__pb2.WorkerEventAck.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def OpenRunRecording(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ascend_maze.control.v1.WorkerEventSink/OpenRunRecording',
+            control__pb2.OpenRunRecordingRequest.SerializeToString,
+            control__pb2.RecorderControlAck.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def FlushRunRecording(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ascend_maze.control.v1.WorkerEventSink/FlushRunRecording',
+            control__pb2.FlushRunRecordingRequest.SerializeToString,
+            control__pb2.FlushResultMessage.FromString,
             options,
             channel_credentials,
             insecure,

@@ -5,13 +5,18 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hmac
 from typing import Any
 
 import grpc
 
-from ascend_maze.contracts.recording import ExecutionEvent, ExecutionRecorder
+from ascend_maze.contracts.recording import (
+    ExecutionEvent,
+    ExecutionRecorder,
+    FlushResult,
+    RunRecordingContext,
+)
 from ascend_maze.contracts.runtime import RuntimeNodeBinding
 from ascend_maze.core.canonical import FrozenMap, freeze_canonical
 from ascend_maze.core.clock import Clock, SystemClock
@@ -29,6 +34,64 @@ from ascend_maze.control.proto import control_pb2_grpc
 from ascend_maze.control.proto_codec import decode_runtime_event, encode_runtime_event
 
 control_pb2: Any = _control_pb2
+
+
+def _execution_event_from_runtime(
+    *,
+    producer_id: str,
+    producer_sequence: int,
+    node_id: str,
+    event: RuntimeEvent,
+    wall_time_ms: int,
+) -> ExecutionEvent:
+    payload_items: list[tuple[str, object]] = []
+    if event.worker_pid is not None:
+        payload_items.append(("worker_pid", event.worker_pid))
+    if event.device_id is not None:
+        payload_items.extend(
+            (
+                ("physical_device_id", event.device_id),
+                ("binding_verified", event.binding_verified),
+            )
+        )
+    observation = event.resource_observation
+    if observation is not None:
+        payload_items.extend(
+            (
+                ("peak_host_rss_mb", observation.peak_host_rss_mb),
+                ("peak_npu_allocated_mb", observation.peak_npu_allocated_mb),
+                ("peak_npu_reserved_mb", observation.peak_npu_reserved_mb),
+                (
+                    "peak_npu_process_hbm_mb",
+                    observation.peak_npu_process_hbm_mb,
+                ),
+                ("npu_metric_source", observation.npu_metric_source),
+                ("npu_metric_quality", observation.npu_metric_quality),
+            )
+        )
+    payload = freeze_canonical(dict(payload_items))
+    if not isinstance(payload, FrozenMap):
+        raise AssertionError("node event payload must be a mapping")
+    return ExecutionEvent(
+        schema_version=1,
+        event_id=f"node_record:{event.event_id}",
+        experiment_id=event.run_id,
+        run_id=event.run_id,
+        task_id=event.task_id,
+        attempt=event.attempt,
+        lease_id=event.lease_id,
+        route_lease_id=event.route_lease_id,
+        model_instance_id=None,
+        event_type=event.kind.value,
+        producer_id=producer_id,
+        producer_sequence=producer_sequence,
+        node_id=node_id,
+        device_id=event.device_id,
+        monotonic_time_ms=event.occurred_at_ms,
+        wall_time_ms=wall_time_ms,
+        duration_ms=None,
+        payload=payload,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +259,7 @@ class NodeControlServer:
             agent_generation=str(meta.agent_generation),
             agent_endpoint=str(registration.agent_endpoint),
             producer_id=str(registration.producer_id),
+            records_locally=bool(registration.records_locally),
             status=status,
         )
         if previous is not None and self.on_binding_replaced is not None:
@@ -223,9 +287,10 @@ class NodeControlServer:
         if body == "runtime_event":
             try:
                 event = decode_runtime_event(value.event)
-                self._record_node_event(
-                    binding, int(value.producer_sequence), event
-                )
+                if not binding.records_locally:
+                    self._record_node_event(
+                        binding, int(value.producer_sequence), event
+                    )
                 self.event_sink(event)
             except Exception as exc:
                 self.recorder.record_writer_error(
@@ -266,57 +331,13 @@ class NodeControlServer:
         producer_sequence: int,
         event: RuntimeEvent,
     ) -> None:
-        payload_items: list[tuple[str, object]] = []
-        if event.worker_pid is not None:
-            payload_items.append(("worker_pid", event.worker_pid))
-        if event.device_id is not None:
-            payload_items.extend(
-                (
-                    ("physical_device_id", event.device_id),
-                    ("binding_verified", event.binding_verified),
-                )
-            )
-        observation = event.resource_observation
-        if observation is not None:
-            payload_items.extend(
-                (
-                    ("peak_host_rss_mb", observation.peak_host_rss_mb),
-                    (
-                        "peak_npu_allocated_mb",
-                        observation.peak_npu_allocated_mb,
-                    ),
-                    ("peak_npu_reserved_mb", observation.peak_npu_reserved_mb),
-                    (
-                        "peak_npu_process_hbm_mb",
-                        observation.peak_npu_process_hbm_mb,
-                    ),
-                    ("npu_metric_source", observation.npu_metric_source),
-                    ("npu_metric_quality", observation.npu_metric_quality),
-                )
-            )
-        payload = freeze_canonical(dict(payload_items))
-        if not isinstance(payload, FrozenMap):
-            raise AssertionError("node event payload must be a mapping")
         accepted = self.recorder.emit(
-            ExecutionEvent(
-                schema_version=1,
-                event_id=f"node_record:{event.event_id}",
-                experiment_id=event.run_id,
-                run_id=event.run_id,
-                task_id=event.task_id,
-                attempt=event.attempt,
-                lease_id=event.lease_id,
-                route_lease_id=event.route_lease_id,
-                model_instance_id=None,
-                event_type=event.kind.value,
+            _execution_event_from_runtime(
                 producer_id=binding.producer_id,
                 producer_sequence=producer_sequence,
                 node_id=binding.node_id,
-                device_id=event.device_id,
-                monotonic_time_ms=event.occurred_at_ms,
+                event=event,
                 wall_time_ms=self.clock.wall_ms(),
-                duration_ms=None,
-                payload=payload,
             )
         )
         if not accepted:
@@ -354,6 +375,22 @@ class _WorkerEventServicer:
         del context
         return self.owner._accept_worker_event(request)
 
+    async def OpenRunRecording(
+        self,
+        request: Any,
+        context: grpc.aio.ServicerContext[Any, Any],
+    ) -> Any:
+        del context
+        return self.owner._open_run_recording(request)
+
+    async def FlushRunRecording(
+        self,
+        request: Any,
+        context: grpc.aio.ServicerContext[Any, Any],
+    ) -> Any:
+        del context
+        return await self.owner._flush_run_recording(request)
+
 
 class NodeAgent:
     def __init__(
@@ -363,6 +400,7 @@ class NodeAgent:
         authorization_token: bytes,
         heartbeat_interval_ms: int = 1_000,
         event_queue_capacity: int = 1_024,
+        recorder: ExecutionRecorder | None = None,
         worker_device_verifier: Callable[[int, str], bool] | None = None,
         node_observation_provider: (
             Callable[[int, int], NodeObservation] | None
@@ -377,11 +415,14 @@ class NodeAgent:
         self.authorization_token = authorization_token
         self.heartbeat_interval_ms = heartbeat_interval_ms
         self.clock = clock or SystemClock()
+        self.recorder = recorder
         self.worker_device_verifier = worker_device_verifier
         self.node_observation_provider = node_observation_provider
         self._queue: asyncio.Queue[Any] = asyncio.Queue(event_queue_capacity)
         self._sequence = 0
         self._producer_sequence = 0
+        self._recording_contexts: dict[str, RunRecordingContext] = {}
+        self._active_leases: dict[str, dict[str, str | None]] = {}
         self._event_ids: set[str] = set()
         self._event_id_order: deque[str] = deque()
         self._event_dedup_capacity = max(1_024, event_queue_capacity * 4)
@@ -392,6 +433,7 @@ class NodeAgent:
         self._registered = asyncio.Event()
         self._closed = False
         self.endpoint: str | None = None
+        self.controller_generation: str | None = None
         self.runtime_generation: int | None = None
 
     async def start(
@@ -457,6 +499,8 @@ class NodeAgent:
         if self._server is not None:
             await self._server.stop(grace_seconds)
         self._server = None
+        if self.recorder is not None:
+            await self.recorder.close(max(1, int(grace_seconds * 1_000) or 1_000))
 
     async def stop_worker_event_server(self, grace_seconds: float = 0) -> None:
         server = self._server
@@ -475,6 +519,7 @@ class NodeAgent:
                 producer_id=self.identity.producer_id,
                 environment_fingerprint=self.identity.environment_fingerprint,
                 authorization_token=self.authorization_token,
+                records_locally=self.recorder is not None,
             )
         )
         await self._registered.wait()
@@ -495,6 +540,7 @@ class NodeAgent:
                     except Exception:
                         observation = None
                     if observation is not None:
+                        self._record_observation(observation)
                         heartbeat.has_observation = True
                         heartbeat.observed_free_mem_mb = (
                             observation.observed_free_mem_mb
@@ -517,6 +563,9 @@ class NodeAgent:
             if body == "registration":
                 if response.registration.status_code != "accepted":
                     raise RuntimeError(response.registration.message)
+                self.controller_generation = str(
+                    response.registration.controller_generation
+                )
                 self.runtime_generation = int(response.registration.runtime_generation)
                 self._registered.set()
 
@@ -559,11 +608,22 @@ class NodeAgent:
                         "physical NPU"
                     ),
                 )
+        try:
+            event = decode_runtime_event(request.event)
+        except Exception as exc:
+            return control_pb2.WorkerEventAck(
+                event_id=event_id,
+                accepted=False,
+                error_code="invalid_worker_event",
+                message=str(exc),
+            )
+        producer_sequence = self._next_producer_sequence()
+        self._record_runtime_event(event, producer_sequence)
         message = control_pb2.AgentStreamMessage(
             runtime_event=control_pb2.NodeRuntimeEvent(
                 meta=self._next_meta(),
                 event=request.event,
-                producer_sequence=self._next_producer_sequence(),
+                producer_sequence=producer_sequence,
             )
         )
         try:
@@ -575,12 +635,241 @@ class NodeAgent:
                 error_code="node_event_queue_full",
                 message="NodeAgent control event queue is full",
             )
+        if event.kind is RuntimeEventKind.WORKER_STARTED:
+            self._active_leases.setdefault(event.run_id, {})[event.lease_id] = (
+                event.device_id
+            )
+        else:
+            active = self._active_leases.get(event.run_id)
+            if active is not None:
+                active.pop(event.lease_id, None)
+                if not active:
+                    self._active_leases.pop(event.run_id, None)
         self._event_ids.add(event_id)
         self._event_id_order.append(event_id)
         if len(self._event_id_order) > self._event_dedup_capacity:
             expired = self._event_id_order.popleft()
             self._event_ids.discard(expired)
         return control_pb2.WorkerEventAck(event_id=event_id, accepted=True)
+
+    def _open_run_recording(self, request: Any) -> Any:
+        run_id = str(request.context.run_id)
+        error = self._recording_request_error(request)
+        if error is not None:
+            return control_pb2.RecorderControlAck(
+                run_id=run_id,
+                accepted=False,
+                error_code=error[0],
+                message=error[1],
+            )
+        recorder = self.recorder
+        if recorder is None:
+            return control_pb2.RecorderControlAck(
+                run_id=run_id,
+                accepted=False,
+                error_code="recording_disabled",
+                message="NodeAgent has no local recorder",
+            )
+        try:
+            received = _decode_recording_context(request.context)
+            local = replace(
+                received,
+                initial_expected_producer_ids=(self.identity.producer_id,),
+            )
+            existing = self._recording_contexts.get(local.run_id)
+            if existing is not None and existing != local:
+                raise ContractValidationError("run recording context conflict")
+            recorder.open_run(local)
+            self._recording_contexts[local.run_id] = local
+            if existing is None:
+                self._emit_local(
+                    ExecutionEvent(
+                        schema_version=1,
+                        event_id=new_id("node_record"),
+                        experiment_id=local.experiment_id,
+                        run_id=local.run_id,
+                        task_id=None,
+                        attempt=None,
+                        lease_id=None,
+                        route_lease_id=None,
+                        model_instance_id=None,
+                        event_type="recorder_producer_joined",
+                        producer_id=self.identity.producer_id,
+                        producer_sequence=self._next_producer_sequence(),
+                        node_id=self.identity.node_id,
+                        device_id=None,
+                        monotonic_time_ms=self.clock.monotonic_ms(),
+                        wall_time_ms=self.clock.wall_ms(),
+                        duration_ms=None,
+                    )
+                )
+        except Exception as exc:
+            return control_pb2.RecorderControlAck(
+                run_id=run_id,
+                accepted=False,
+                error_code="recording_open_failed",
+                message=f"{type(exc).__name__}: {exc}",
+            )
+        return control_pb2.RecorderControlAck(run_id=run_id, accepted=True)
+
+    async def _flush_run_recording(self, request: Any) -> Any:
+        run_id = str(request.run_id)
+        error = self._recording_request_error(request)
+        if error is not None:
+            return _encode_flush_error(run_id, error[0], error[1])
+        recorder = self.recorder
+        if recorder is None:
+            return _encode_flush_error(
+                run_id, "recording_disabled", "NodeAgent has no local recorder"
+            )
+        if run_id not in self._recording_contexts:
+            return _encode_flush_error(
+                run_id, "unknown_recording_run", "Run recording was not opened"
+            )
+        try:
+            result = await recorder.flush_run(run_id, int(request.timeout_ms))
+        except Exception as exc:
+            return _encode_flush_error(
+                run_id,
+                "recording_flush_failed",
+                f"{type(exc).__name__}: {exc}",
+            )
+        return _encode_flush_result(result)
+
+    def _recording_request_error(self, request: Any) -> tuple[str, str] | None:
+        if int(request.schema_version) != 1:
+            return "unsupported_schema", "Unsupported recorder control schema"
+        if not hmac.compare_digest(
+            bytes(request.authorization_token), self.authorization_token
+        ):
+            return "authorization_failed", "Recorder control authorization failed"
+        expected = (
+            self.identity.cluster_id,
+            self.identity.node_id,
+            self.identity.boot_id,
+            self.identity.agent_generation,
+            self.controller_generation,
+            self.runtime_generation,
+        )
+        actual = (
+            str(request.cluster_id),
+            str(request.node_id),
+            str(request.boot_id),
+            str(request.agent_generation),
+            str(request.controller_generation),
+            int(request.runtime_generation),
+        )
+        if actual != expected:
+            return "stale_recording_generation", "Recorder control generation mismatch"
+        return None
+
+    def _record_runtime_event(
+        self, event: RuntimeEvent, producer_sequence: int
+    ) -> None:
+        if self.recorder is None:
+            return
+        self._emit_local(
+            _execution_event_from_runtime(
+                producer_id=self.identity.producer_id,
+                producer_sequence=producer_sequence,
+                node_id=self.identity.node_id,
+                event=event,
+                wall_time_ms=self.clock.wall_ms(),
+            )
+        )
+
+    def _record_observation(self, observation: NodeObservation) -> None:
+        if self.recorder is None:
+            return
+        for run_id, leases in tuple(self._active_leases.items()):
+            context = self._recording_contexts.get(run_id)
+            if context is None:
+                continue
+            node_payload = freeze_canonical(
+                {
+                    "observed_free_mem_mb": observation.observed_free_mem_mb,
+                    "active_lease_count": len(leases),
+                    "observation_sequence": observation.sequence,
+                }
+            )
+            assert isinstance(node_payload, FrozenMap)
+            self._emit_local(
+                ExecutionEvent(
+                    schema_version=1,
+                    event_id=new_id("node_record"),
+                    experiment_id=context.experiment_id,
+                    run_id=run_id,
+                    task_id=None,
+                    attempt=None,
+                    lease_id=None,
+                    route_lease_id=None,
+                    model_instance_id=None,
+                    event_type="node_resource_sample",
+                    producer_id=self.identity.producer_id,
+                    producer_sequence=self._next_producer_sequence(),
+                    node_id=self.identity.node_id,
+                    device_id=None,
+                    monotonic_time_ms=observation.received_at_ms,
+                    wall_time_ms=self.clock.wall_ms(),
+                    duration_ms=None,
+                    payload=node_payload,
+                )
+            )
+            for npu in observation.npus:
+                device_payload = freeze_canonical(
+                    {
+                        "health": npu.health,
+                        "observed_free_hbm_mb": npu.observed_free_hbm_mb,
+                        "utilization": npu.utilization,
+                        "active_lease_count": sum(
+                            device_id == npu.device_id
+                            for device_id in leases.values()
+                        ),
+                        "observation_sequence": observation.sequence,
+                    }
+                )
+                assert isinstance(device_payload, FrozenMap)
+                self._emit_local(
+                    ExecutionEvent(
+                        schema_version=1,
+                        event_id=new_id("node_record"),
+                        experiment_id=context.experiment_id,
+                        run_id=run_id,
+                        task_id=None,
+                        attempt=None,
+                        lease_id=None,
+                        route_lease_id=None,
+                        model_instance_id=None,
+                        event_type="device_resource_sample",
+                        producer_id=self.identity.producer_id,
+                        producer_sequence=self._next_producer_sequence(),
+                        node_id=self.identity.node_id,
+                        device_id=npu.device_id,
+                        monotonic_time_ms=observation.received_at_ms,
+                        wall_time_ms=self.clock.wall_ms(),
+                        duration_ms=None,
+                        payload=device_payload,
+                    )
+                )
+
+    def _emit_local(self, event: ExecutionEvent) -> None:
+        recorder = self.recorder
+        if recorder is None:
+            return
+        try:
+            if not recorder.emit(event) and event.run_id is not None:
+                recorder.record_writer_error(
+                    event.run_id,
+                    f"NodeAgent recorder rejected {event.event_type}",
+                )
+        except Exception as exc:
+            if event.run_id is not None:
+                try:
+                    recorder.record_writer_error(
+                        event.run_id, f"{type(exc).__name__}: {exc}"
+                    )
+                except Exception:
+                    pass
 
     def _next_meta(self) -> Any:
         self._sequence += 1
@@ -598,6 +887,130 @@ class NodeAgent:
     def _next_producer_sequence(self) -> int:
         self._producer_sequence += 1
         return self._producer_sequence
+
+
+def _encode_recording_context(context: RunRecordingContext) -> Any:
+    return control_pb2.RunRecordingContextMessage(
+        schema_version=context.schema_version,
+        experiment_id=context.experiment_id,
+        run_id=context.run_id,
+        workflow_fingerprint=context.workflow_fingerprint,
+        config_fingerprint=context.config_fingerprint,
+        environment_fingerprint=context.environment_fingerprint,
+        build_revision=context.build_revision,
+        started_wall_time_ms=context.started_wall_time_ms,
+        initial_expected_producer_ids=context.initial_expected_producer_ids,
+    )
+
+
+def _decode_recording_context(message: Any) -> RunRecordingContext:
+    return RunRecordingContext(
+        schema_version=int(message.schema_version),
+        experiment_id=str(message.experiment_id),
+        run_id=str(message.run_id),
+        workflow_fingerprint=str(message.workflow_fingerprint),
+        config_fingerprint=str(message.config_fingerprint),
+        environment_fingerprint=str(message.environment_fingerprint),
+        build_revision=str(message.build_revision),
+        started_wall_time_ms=int(message.started_wall_time_ms),
+        initial_expected_producer_ids=tuple(message.initial_expected_producer_ids),
+    )
+
+
+def _encode_flush_result(result: FlushResult) -> Any:
+    return control_pb2.FlushResultMessage(
+        run_id=result.run_id,
+        committed_files=result.committed_files,
+        dropped_control_event_count=result.dropped_control_event_count,
+        dropped_telemetry_count=result.dropped_telemetry_count,
+        sequence_gap_count=result.sequence_gap_count,
+        missing_producer_count=result.missing_producer_count,
+        writer_errors=result.writer_errors,
+        recording_complete=result.recording_complete,
+        flush_duration_ms=result.flush_duration_ms,
+        accepted=True,
+    )
+
+
+def _encode_flush_error(run_id: str, error_code: str, message: str) -> Any:
+    return control_pb2.FlushResultMessage(
+        run_id=run_id,
+        accepted=False,
+        error_code=error_code,
+        message=message,
+    )
+
+
+def _decode_flush_result(message: Any) -> FlushResult:
+    if not bool(message.accepted):
+        raise RuntimeError(f"{message.error_code}: {message.message}")
+    return FlushResult(
+        run_id=str(message.run_id),
+        committed_files=tuple(message.committed_files),
+        dropped_control_event_count=int(message.dropped_control_event_count),
+        dropped_telemetry_count=int(message.dropped_telemetry_count),
+        sequence_gap_count=int(message.sequence_gap_count),
+        missing_producer_count=int(message.missing_producer_count),
+        writer_errors=tuple(message.writer_errors),
+        recording_complete=bool(message.recording_complete),
+        flush_duration_ms=int(message.flush_duration_ms),
+    )
+
+
+def open_node_recording(
+    *,
+    binding: RuntimeNodeBinding,
+    cluster_id: str,
+    controller_generation: str,
+    authorization_token: bytes,
+    context: RunRecordingContext,
+    timeout_seconds: float,
+) -> None:
+    request = control_pb2.OpenRunRecordingRequest(
+        schema_version=1,
+        cluster_id=cluster_id,
+        node_id=binding.node_id,
+        boot_id=binding.boot_id,
+        agent_generation=binding.agent_generation,
+        controller_generation=controller_generation,
+        runtime_generation=binding.runtime_generation,
+        authorization_token=authorization_token,
+        context=_encode_recording_context(context),
+    )
+    with grpc.insecure_channel(binding.agent_endpoint) as channel:
+        response = control_pb2_grpc.WorkerEventSinkStub(channel).OpenRunRecording(
+            request, timeout=timeout_seconds
+        )
+    if not response.accepted:
+        raise RuntimeError(f"{response.error_code}: {response.message}")
+
+
+def flush_node_recording(
+    *,
+    binding: RuntimeNodeBinding,
+    cluster_id: str,
+    controller_generation: str,
+    authorization_token: bytes,
+    run_id: str,
+    timeout_ms: int,
+) -> FlushResult:
+    request = control_pb2.FlushRunRecordingRequest(
+        schema_version=1,
+        cluster_id=cluster_id,
+        node_id=binding.node_id,
+        boot_id=binding.boot_id,
+        agent_generation=binding.agent_generation,
+        controller_generation=controller_generation,
+        runtime_generation=binding.runtime_generation,
+        authorization_token=authorization_token,
+        run_id=run_id,
+        timeout_ms=timeout_ms,
+    )
+    with grpc.insecure_channel(binding.agent_endpoint) as channel:
+        response = control_pb2_grpc.WorkerEventSinkStub(channel).FlushRunRecording(
+            request, timeout=max(0.001, timeout_ms / 1_000)
+        )
+    return _decode_flush_result(response)
 
 
 def report_worker_event(

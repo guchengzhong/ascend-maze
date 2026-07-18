@@ -13,6 +13,10 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from ascend_maze.contracts.data import DataHandle, DataOwner
 from ascend_maze.contracts.errors import ErrorInfo
+from ascend_maze.contracts.recording import (
+    ProducerFlushResult,
+    RunRecordingContext,
+)
 from ascend_maze.contracts.resources import ExecutionTarget, PlacementLease
 from ascend_maze.contracts.runtime import (
     CodeHandle,
@@ -35,7 +39,12 @@ from ascend_maze.runtime.ray_worker import RAY_ONE_SHOT_WORKER, RayWorkerOutcome
 from ascend_maze.runtime.worker_broker import ColdWorkerBroker
 from ascend_maze.runtime.worker_pool import StandbyWorkerBroker
 
-from ascend_maze.control.node_rpc import NodeAgentIdentity, report_worker_event
+from ascend_maze.control.node_rpc import (
+    NodeAgentIdentity,
+    flush_node_recording,
+    open_node_recording,
+    report_worker_event,
+)
 
 
 @dataclass(slots=True)
@@ -75,6 +84,7 @@ class RayRuntimeBackend:
         cluster_id: str,
         owner_generation: str,
         environment_fingerprint: str,
+        authorization_token: bytes = b"",
         event_timeout_seconds: float = 2.0,
         event_sink: Callable[[RuntimeEvent], None] | None = None,
         recording_error_sink: Callable[[str, str], None] | None = None,
@@ -87,6 +97,7 @@ class RayRuntimeBackend:
         self.cluster_id = cluster_id
         self.owner_generation = owner_generation
         self.environment_fingerprint = environment_fingerprint
+        self.authorization_token = authorization_token
         self.event_timeout_seconds = event_timeout_seconds
         self._event_sink = event_sink
         self._recording_error_sink = recording_error_sink
@@ -95,6 +106,10 @@ class RayRuntimeBackend:
         self._attempt_dispatches: dict[tuple[str, str, int], str] = {}
         self._emitted_events: dict[str, str] = {}
         self._retired_runs: set[str] = set()
+        self._run_recording_bindings: dict[
+            str, dict[str, RuntimeNodeBinding]
+        ] = {}
+        self._opened_run_recordings: set[tuple[str, str]] = set()
         self._started = False
         self._closed = False
 
@@ -387,6 +402,72 @@ class RayRuntimeBackend:
     def producer_for_lease(self, lease: PlacementLease) -> str | None:
         return self.node_registry.producer_for_lease(lease)
 
+    async def prepare_run_recording(
+        self,
+        context: RunRecordingContext,
+        lease: PlacementLease,
+    ) -> None:
+        binding = self.node_registry.resolve_lease(lease)
+        if not binding.records_locally:
+            return
+        run_bindings = self._run_recording_bindings.setdefault(context.run_id, {})
+        existing = run_bindings.get(binding.producer_id)
+        if existing is not None and existing != binding:
+            raise ContractValidationError("recording producer binding conflict")
+        run_bindings[binding.producer_id] = binding
+        key = (context.run_id, binding.producer_id)
+        if key in self._opened_run_recordings:
+            return
+        if not self.authorization_token:
+            raise RuntimeError("NodeAgent recording authorization is not configured")
+        await asyncio.to_thread(
+            open_node_recording,
+            binding=binding,
+            cluster_id=self.cluster_id,
+            controller_generation=self.owner_generation,
+            authorization_token=self.authorization_token,
+            context=context,
+            timeout_seconds=self.event_timeout_seconds,
+        )
+        self._opened_run_recordings.add(key)
+
+    async def flush_run_recorders(
+        self,
+        run_id: str,
+        timeout_ms: int,
+    ) -> tuple[ProducerFlushResult, ...]:
+        bindings = self._run_recording_bindings.get(run_id, {})
+
+        async def flush_one(
+            producer_id: str, binding: RuntimeNodeBinding
+        ) -> ProducerFlushResult:
+            try:
+                result = await asyncio.to_thread(
+                    flush_node_recording,
+                    binding=binding,
+                    cluster_id=self.cluster_id,
+                    controller_generation=self.owner_generation,
+                    authorization_token=self.authorization_token,
+                    run_id=run_id,
+                    timeout_ms=timeout_ms,
+                )
+            except Exception as exc:
+                return ProducerFlushResult(
+                    producer_id=producer_id,
+                    result=None,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            return ProducerFlushResult(producer_id=producer_id, result=result)
+
+        return tuple(
+            await asyncio.gather(
+                *(
+                    flush_one(producer_id, bindings[producer_id])
+                    for producer_id in sorted(bindings)
+                )
+            )
+        )
+
     def dispatch_invalidated(self, dispatch_id: str) -> bool:
         record = self._dispatches.get(dispatch_id)
         return (
@@ -407,6 +488,9 @@ class RayRuntimeBackend:
 
     async def release_run(self, run_id: str) -> int:
         self._retired_runs.add(run_id)
+        bindings = self._run_recording_bindings.pop(run_id, {})
+        for producer_id in bindings:
+            self._opened_run_recordings.discard((run_id, producer_id))
         dispatch_ids = [
             dispatch_id
             for dispatch_id, record in self._dispatches.items()

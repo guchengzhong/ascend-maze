@@ -242,6 +242,7 @@ class RuntimeNodeBinding:
     agent_generation: str
     agent_endpoint: str
     producer_id: str
+    records_locally: bool = False
 
     def __post_init__(self) -> None:
         for name in (
@@ -261,6 +262,8 @@ class RuntimeNodeBinding:
             or self.runtime_generation < 1
         ):
             raise ContractValidationError("runtime_generation must be positive")
+        if not isinstance(self.records_locally, bool):
+            raise ContractValidationError("records_locally must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)

@@ -24,6 +24,7 @@ classifiers = [
 ]
 dependencies = [
     "cloudpickle>=3.1,<4",
+    "pyarrow>=19,<25",
 ]
 
 [project.optional-dependencies]
@@ -64,7 +65,7 @@ disallow_untyped_defs = true
 files = ["src/ascend_maze"]
 
 [[tool.mypy.overrides]]
-module = ["ray", "ray.*", "grpc", "grpc.*"]
+module = ["ray", "ray.*", "grpc", "grpc.*", "pyarrow", "pyarrow.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

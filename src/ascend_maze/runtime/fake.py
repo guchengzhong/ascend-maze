@@ -8,6 +8,7 @@ from threading import RLock
 from typing import Callable
 
 from ascend_maze.contracts.errors import ErrorInfo
+from ascend_maze.contracts.recording import ProducerFlushResult, RunRecordingContext
 from ascend_maze.contracts.resources import PlacementLease
 from ascend_maze.contracts.runtime import (
     CodeHandle,
@@ -272,6 +273,21 @@ class FakeRuntimeBackend:
     def producer_for_lease(self, lease: PlacementLease) -> str | None:
         del lease
         return None
+
+    async def prepare_run_recording(
+        self,
+        context: RunRecordingContext,
+        lease: PlacementLease,
+    ) -> None:
+        del context, lease
+
+    async def flush_run_recorders(
+        self,
+        run_id: str,
+        timeout_ms: int,
+    ) -> tuple[ProducerFlushResult, ...]:
+        del run_id, timeout_ms
+        return ()
 
     async def release_run(self, run_id: str) -> int:
         self._retired_runs.add(run_id)

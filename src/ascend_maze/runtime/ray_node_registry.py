@@ -41,6 +41,7 @@ class RayNodeRegistry:
         agent_generation: str,
         agent_endpoint: str,
         producer_id: str,
+        records_locally: bool = False,
         status: RuntimeNodeStatus = RuntimeNodeStatus.HEALTHY,
     ) -> tuple[RuntimeNodeBinding, RuntimeNodeBinding | None]:
         with self._lock:
@@ -61,6 +62,7 @@ class RayNodeRegistry:
                 agent_generation=agent_generation,
                 agent_endpoint=agent_endpoint,
                 producer_id=producer_id,
+                records_locally=records_locally,
             )
             self._records[node_id] = _BindingRecord(
                 binding=binding,

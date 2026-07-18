@@ -13,6 +13,7 @@ from ascend_maze.control.node_rpc import NodeAgent, NodeAgentIdentity
 from ascend_maze.control.node_rpc import report_worker_event
 from ascend_maze.control.ray_controller import RayHostController
 from ascend_maze.contracts.submission import SubmissionState
+from ascend_maze.contracts.recording import ParquetRecorderConfig
 from ascend_maze.core.errors import DataHandleInvalidError
 from ascend_maze.core.errors import (
     ResponseLostError,
@@ -20,6 +21,7 @@ from ascend_maze.core.errors import (
 )
 from ascend_maze.lifecycle import RunStatus, TaskStatus
 from ascend_maze.placement import LeaseStatus, NodeCapacity, NodeStatus
+from ascend_maze.recording import ParquetRecorder
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 
 
@@ -136,6 +138,184 @@ def test_ray_host_controller_completes_submit_result_destroy_closure(
             assert destroyed.tombstone.destroy_succeeded
             assert controller.ray_data_store.active_count == 0
             assert controller.ray_runtime.code_reference_count() == 0
+            assert controller.indexes.active_count == 0
+        finally:
+            if agent is not None:
+                await agent.close(grace_seconds=0)
+            await controller.close()
+
+    asyncio.run(scenario())
+
+
+def test_ray_host_merges_controller_and_node_parquet_shards(
+    ray_namespace: str,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        @task
+        def echo(value: str):
+            return {"result": value}
+
+        root = tmp_path / "records"
+        recorder_config = ParquetRecorderConfig(
+            root_directory=str(root),
+            batch_size=4,
+            flush_interval_ms=5,
+        )
+        controller_recorder = ParquetRecorder(
+            recorder_config, cursor_signing_key=b"controller-cursor-key"
+        )
+        controller = RayHostController(
+            cluster_id="cluster_parquet",
+            authorization_token=b"test-token",
+            ray_namespace=ray_namespace,
+            config_fingerprint=CONFIG,
+            environment_fingerprint=ENVIRONMENT,
+            build_revision="test_build",
+            node_capacities=(_node(),),
+            recorder=controller_recorder,
+        )
+        node_recorder = ParquetRecorder(
+            recorder_config, cursor_signing_key=b"node-recorder-cursor-key"
+        )
+        agent: NodeAgent | None = None
+        try:
+            await controller.start()
+            identity = NodeAgentIdentity(
+                cluster_id="cluster_parquet",
+                node_id="node_a",
+                boot_id="boot_1",
+                ray_node_id=ray.get_runtime_context().get_node_id(),
+                agent_generation="agent_parquet",
+                environment_fingerprint=ENVIRONMENT,
+                producer_id="node_agent:node_a:agent_parquet",
+            )
+            agent = NodeAgent(
+                identity=identity,
+                authorization_token=b"test-token",
+                heartbeat_interval_ms=50,
+                recorder=node_recorder,
+            )
+            await agent.start(controller_endpoint=controller.node_rpc_endpoint)
+            workflow = Workflow("ray-parquet-recording")
+            output = workflow.add_task(echo, inputs={"value": "recorded"})
+            outcome = await InMemoryRuntimeClient(controller).submit(
+                workflow,
+                inputs={},
+                submission_id="submission_ray_parquet",
+            )
+            assert outcome.run_id is not None
+            terminal = await controller.wait_run(outcome.run_id, timeout_seconds=20)
+            assert terminal.status is RunStatus.SUCCEEDED
+            assert controller.result(outcome.run_id, output.task_id) == {
+                "result": "recorded"
+            }
+
+            destroyed = await controller.destroy_run(outcome.run_id)
+            assert destroyed.flush_result.recording_complete
+            files = destroyed.flush_result.committed_files
+            assert any("_controller" in path for path in files)
+            assert any("node_a" in path and ".control." in path for path in files)
+            assert len([path for path in files if ".context." in path]) == 2
+
+            page = controller.get_run_events(outcome.run_id, limit=100)
+            assert page.exhausted
+            producer_ids = {event.producer_id for event in page.events}
+            assert producer_ids == {"controller", identity.producer_id}
+            node_runtime_events = tuple(
+                event
+                for event in page.events
+                if event.producer_id == identity.producer_id
+                and event.event_type
+                in {
+                    RuntimeEventKind.WORKER_STARTED.value,
+                    RuntimeEventKind.TASK_RESULT.value,
+                }
+            )
+            assert len(node_runtime_events) == 2
+            assert len({event.event_id for event in node_runtime_events}) == 2
+            assert all(event.event_id.startswith("node_record:") for event in node_runtime_events)
+            node_events = tuple(
+                event
+                for event in page.events
+                if event.producer_id == identity.producer_id
+            )
+            assert node_events[0].event_type == "recorder_producer_joined"
+        finally:
+            if agent is not None:
+                await agent.close(grace_seconds=0)
+            await controller.close()
+
+    asyncio.run(scenario())
+
+
+def test_missing_node_recorder_flush_requires_force_destroy(
+    ray_namespace: str,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        @task
+        def echo(value: str):
+            return {"result": value}
+
+        config = ParquetRecorderConfig(
+            root_directory=str(tmp_path / "records"),
+            batch_size=4,
+            flush_interval_ms=5,
+        )
+        controller = RayHostController(
+            cluster_id="cluster_missing_recorder",
+            authorization_token=b"test-token",
+            ray_namespace=ray_namespace,
+            config_fingerprint=CONFIG,
+            environment_fingerprint=ENVIRONMENT,
+            build_revision="test_build",
+            node_capacities=(_node(),),
+            recorder=ParquetRecorder(config),
+        )
+        agent: NodeAgent | None = None
+        try:
+            await controller.start()
+            identity = NodeAgentIdentity(
+                cluster_id="cluster_missing_recorder",
+                node_id="node_a",
+                boot_id="boot_1",
+                ray_node_id=ray.get_runtime_context().get_node_id(),
+                agent_generation="agent_missing_recorder",
+                environment_fingerprint=ENVIRONMENT,
+                producer_id="node_agent:node_a:agent_missing_recorder",
+            )
+            agent = NodeAgent(
+                identity=identity,
+                authorization_token=b"test-token",
+                recorder=ParquetRecorder(config),
+            )
+            await agent.start(controller_endpoint=controller.node_rpc_endpoint)
+            workflow = Workflow("missing-node-recorder")
+            output = workflow.add_task(echo, inputs={"value": "complete"})
+            outcome = await InMemoryRuntimeClient(controller).submit(
+                workflow,
+                inputs={},
+                submission_id="submission_missing_node_recorder",
+            )
+            assert outcome.run_id is not None
+            terminal = await controller.wait_run(outcome.run_id, timeout_seconds=20)
+            assert terminal.status is RunStatus.SUCCEEDED
+            assert controller.result(outcome.run_id, output.task_id) == {
+                "result": "complete"
+            }
+
+            await agent.stop_worker_event_server(grace_seconds=0)
+            with pytest.raises(RuntimeError, match="recording is incomplete"):
+                await controller.destroy_run(outcome.run_id)
+            assert controller.indexes.active_count == 1
+            destroyed = await controller.destroy_run(outcome.run_id, force=True)
+            assert not destroyed.flush_result.recording_complete
+            assert destroyed.flush_result.missing_producer_count == 1
+            assert any(
+                "flush failed" in error
+                for error in destroyed.flush_result.writer_errors
+            )
             assert controller.indexes.active_count == 0
         finally:
             if agent is not None:

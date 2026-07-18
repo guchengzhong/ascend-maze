@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 import os
+from pathlib import Path
 import time
 
 import pytest
@@ -21,6 +22,10 @@ from ascend_maze.control.node_rpc import NodeAgent, NodeAgentIdentity
 from ascend_maze.control.node_rpc import report_worker_event
 from ascend_maze.control.ray_controller import RayHostController
 from ascend_maze.contracts.config import ConfigSnapshot
+from ascend_maze.contracts.recording import (
+    ExecutionRecorder,
+    ParquetRecorderConfig,
+)
 from ascend_maze.contracts.resources import ReservationVector
 from ascend_maze.contracts.worker import (
     StandbyWorkerState,
@@ -33,6 +38,7 @@ from ascend_maze.data.index import RunDataState
 from ascend_maze.lifecycle import AttemptStatus, RunStatus
 from ascend_maze.core.errors import DataHandleInvalidError
 from ascend_maze.placement import LeaseStatus, NpuCapacity, PlacementManager
+from ascend_maze.recording import ParquetRecorder
 from ascend_maze.resources import DeclaredOnlyAnchorProvider
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 from tests_ascend.conftest import AscendAdmission
@@ -59,6 +65,8 @@ async def _start_controller(
     worker_pool_config: WorkerPoolConfig | None = None,
     config_fingerprint: str | None = None,
     platform_config: AscendCorrectnessConfig | AscendColocationConfig | None = None,
+    controller_recorder: ExecutionRecorder | None = None,
+    node_recorder: ExecutionRecorder | None = None,
 ) -> tuple[RayHostController, NodeAgent]:
     environment = admission.environment
     effective_config = admission.config if platform_config is None else platform_config
@@ -112,6 +120,7 @@ async def _start_controller(
         placement=placement,
         dispatch_timeout_ms=effective_config.worker_binding_deadline_ms,
         worker_pool_config=worker_pool_config,
+        recorder=controller_recorder,
     )
     await controller.start()
     identity = NodeAgentIdentity(
@@ -147,6 +156,7 @@ async def _start_controller(
             pid, physical, deadline_seconds=2
         ),
         node_observation_provider=observation_provider,
+        recorder=node_recorder,
     )
     try:
         await agent.start(controller_endpoint=controller.node_rpc_endpoint)
@@ -302,6 +312,85 @@ def test_real_dcmi_inventory_and_frozen_environment(
     assert not admission.config.allow_colocation
     assert admission.config.max_tasks_per_worker == 1
     assert admission.config.standby_min_idle == 0
+
+
+def test_real_npu_events_merge_controller_and_node_parquet(
+    ascend_admission: AscendAdmission,
+    ascend_ray: str,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        admission = ascend_admission
+        baseline = admission.adapter.device(
+            admission.device.physical_device_id
+        ).used_hbm_mb
+        recorder_config = ParquetRecorderConfig(
+            root_directory=str(tmp_path / "records"),
+            batch_size=4,
+            flush_interval_ms=5,
+        )
+        controller, agent = await _start_controller(
+            admission,
+            ascend_ray,
+            controller_recorder=ParquetRecorder(
+                recorder_config,
+                cursor_signing_key=b"stage5d-ascend-controller-key",
+            ),
+            node_recorder=ParquetRecorder(
+                recorder_config,
+                cursor_signing_key=b"stage5d-ascend-node-key",
+            ),
+        )
+        try:
+            workflow = Workflow("stage5d-real-npu-recording")
+            npu_node = workflow.add_task(npu_add, inputs={"megabytes": 64})
+            outcome = await InMemoryRuntimeClient(controller).submit(
+                workflow,
+                inputs={},
+                submission_id="stage5d_real_npu_recording",
+            )
+            assert outcome.run_id is not None
+            terminal = await controller.wait_run(outcome.run_id, timeout_seconds=60)
+            assert terminal.status is RunStatus.SUCCEEDED
+            assert controller.result(outcome.run_id, npu_node.task_id) == {
+                "result": 1024
+            }
+            destroyed = await controller.destroy_run(outcome.run_id)
+            assert destroyed.flush_result.recording_complete
+            assert len(
+                [
+                    path
+                    for path in destroyed.flush_result.committed_files
+                    if ".context." in path
+                ]
+            ) == 2
+            page = controller.get_run_events(outcome.run_id, limit=100)
+            assert page.exhausted
+            node_events = tuple(
+                event
+                for event in page.events
+                if event.producer_id == "node_agent:stage4"
+            )
+            assert node_events[0].event_type == "recorder_producer_joined"
+            started = next(
+                event
+                for event in node_events
+                if event.event_type == RuntimeEventKind.WORKER_STARTED.value
+            )
+            terminal_event = next(
+                event
+                for event in node_events
+                if event.event_type == RuntimeEventKind.TASK_RESULT.value
+            )
+            assert started.device_id == admission.device.physical_device_id
+            assert started.payload["binding_verified"] is True
+            assert terminal_event.payload["peak_npu_process_hbm_mb"] is not None
+        finally:
+            await agent.close(grace_seconds=0)
+            await controller.close()
+        await _wait_hbm_recovery(admission, baseline)
+
+    asyncio.run(scenario())
 
 
 def test_zero_hbm_standby_jit_binds_one_shot_and_replenishes(

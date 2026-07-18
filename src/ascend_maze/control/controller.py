@@ -204,19 +204,18 @@ class InMemoryController:
                 code_handles = await self.runtime.prepare(request.code_packages)
                 self._maybe_fail("after_prepare")
                 provisional_run_id = new_id("run")
-                self.recorder.open_run(
-                    RunRecordingContext(
-                        schema_version=1,
-                        experiment_id=provisional_run_id,
-                        run_id=provisional_run_id,
-                        workflow_fingerprint=request.compiled.workflow_fingerprint,
-                        config_fingerprint=self.config_fingerprint,
-                        environment_fingerprint=self.environment_fingerprint,
-                        build_revision=self.build_revision,
-                        started_wall_time_ms=self.clock.wall_ms(),
-                        initial_expected_producer_ids=("controller",),
-                    )
+                recording_context = RunRecordingContext(
+                    schema_version=1,
+                    experiment_id=provisional_run_id,
+                    run_id=provisional_run_id,
+                    workflow_fingerprint=request.compiled.workflow_fingerprint,
+                    config_fingerprint=self.config_fingerprint,
+                    environment_fingerprint=self.environment_fingerprint,
+                    build_revision=self.build_revision,
+                    started_wall_time_ms=self.clock.wall_ms(),
+                    initial_expected_producer_ids=("controller",),
                 )
+                self.recorder.open_run(recording_context)
                 recording_open = True
                 self._maybe_fail("after_open_run")
                 self._maybe_fail("before_commit")
@@ -234,6 +233,7 @@ class InMemoryController:
                     session_key_hash=contract.session_key_hash,
                     submitted_at_ms=submitted_at,
                     deadline_at_ms=deadline_at,
+                    recording_context=recording_context,
                 )
             except Exception as exc:
                 if code_handles:

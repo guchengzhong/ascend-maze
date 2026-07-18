@@ -22,6 +22,8 @@ from ascend_maze.contracts.recording import (
     ExecutionEvent,
     ExecutionRecorder,
     FlushResult,
+    ProducerFlushResult,
+    RunRecordingContext,
 )
 from ascend_maze.contracts.resources import PlacementLease, ResourceObservation
 from ascend_maze.contracts.runtime import (
@@ -82,6 +84,7 @@ class _RunExecution:
     code_handles: tuple[CodeHandle, ...]
     code_by_definition: dict[str, CodeHandle]
     index_ref: RunDataIndexRef
+    recording_context: RunRecordingContext
     destroyed: DestroyResult | None = None
 
 
@@ -113,6 +116,7 @@ class _CommitCommand:
     session_key_hash: str | None
     submitted_at_ms: int
     deadline_at_ms: int | None
+    recording_context: RunRecordingContext
     future: asyncio.Future[RunDataIndexRef]
 
 
@@ -156,6 +160,18 @@ class SchedulerRuntimeBackend(RuntimeBackend, Protocol):
     def worker_released(self, dispatch_id: str) -> bool: ...
 
     def producer_for_lease(self, lease: PlacementLease) -> str | None: ...
+
+    async def prepare_run_recording(
+        self,
+        context: RunRecordingContext,
+        lease: PlacementLease,
+    ) -> None: ...
+
+    async def flush_run_recorders(
+        self,
+        run_id: str,
+        timeout_ms: int,
+    ) -> tuple[ProducerFlushResult, ...]: ...
 
     async def release_run(self, run_id: str) -> int: ...
 
@@ -241,6 +257,7 @@ class SchedulerCore:
         session_key_hash: str | None,
         submitted_at_ms: int,
         deadline_at_ms: int | None,
+        recording_context: RunRecordingContext,
     ) -> RunDataIndexRef:
         future: asyncio.Future[RunDataIndexRef] = self._new_future()
         await self._queue.put(
@@ -252,6 +269,7 @@ class SchedulerCore:
                 session_key_hash,
                 submitted_at_ms,
                 deadline_at_ms,
+                recording_context,
                 future,
             )
         )
@@ -461,6 +479,7 @@ class SchedulerCore:
             code_handles=command.code_handles,
             code_by_definition=code_by_definition,
             index_ref=index.reference,
+            recording_context=command.recording_context,
         )
         self._runs[command.run_id] = execution
         if command.deadline_at_ms is not None:
@@ -631,7 +650,7 @@ class SchedulerCore:
                         policy_select_ms=policy_select_ms,
                         placement_ms=placement_ms,
                     )
-                    self._expect_runtime_producer(key.run_id, placement.lease)
+                    await self._expect_runtime_producer(key.run_id, placement.lease)
                     dispatch_id = new_id("dispatch")
                     attempt = self.state.create_attempt(
                         run_id=key.run_id,
@@ -1383,9 +1402,32 @@ class SchedulerCore:
         snapshot = self.state.snapshot(run_id)
         if not snapshot.terminal:
             raise RunNotTerminalError("run must be terminal before destroy")
-        flush = await self.recorder.flush_run(
-            run_id, self.recorder_flush_timeout_ms
-        )
+        flush_started = perf_counter_ns()
+        try:
+            producer_results = await self.runtime.flush_run_recorders(
+                run_id, self.recorder_flush_timeout_ms
+            )
+        except Exception as exc:
+            producer_results = ()
+            self._record_recorder_error(run_id, exc)
+        for producer in producer_results:
+            if producer.result is not None:
+                try:
+                    self.recorder.merge_producer_flush(
+                        run_id, producer.producer_id, producer.result
+                    )
+                except Exception as exc:
+                    self._record_recorder_error(run_id, exc)
+            else:
+                self._record_recorder_error(
+                    run_id,
+                    RuntimeError(
+                        f"producer {producer.producer_id} flush failed: {producer.error}"
+                    ),
+                )
+        elapsed_ms = max(0, (perf_counter_ns() - flush_started) // 1_000_000)
+        remaining_ms = max(1, self.recorder_flush_timeout_ms - elapsed_ms)
+        flush = await self.recorder.flush_run(run_id, remaining_ms)
         if not flush.recording_complete and not force:
             raise RuntimeError("recording is incomplete; force is required")
         if self.placement.active_lease_count(run_id) != 0:
@@ -1657,20 +1699,31 @@ class SchedulerCore:
             },
         )
 
-    def _expect_runtime_producer(self, run_id: str, lease: PlacementLease) -> None:
+    async def _expect_runtime_producer(
+        self, run_id: str, lease: PlacementLease
+    ) -> None:
         producer_id = self.runtime.producer_for_lease(lease)
         if producer_id is None:
             return
         try:
             self.recorder.expect_producer(run_id, producer_id)
         except Exception as exc:
-            try:
-                self.recorder.record_writer_error(
-                    run_id,
-                    f"{type(exc).__name__}: {exc}",
-                )
-            except Exception:
-                pass
+            self._record_recorder_error(run_id, exc)
+        try:
+            await self.runtime.prepare_run_recording(
+                self._runs[run_id].recording_context, lease
+            )
+        except Exception as exc:
+            self._record_recorder_error(run_id, exc)
+
+    def _record_recorder_error(self, run_id: str, exc: Exception) -> None:
+        try:
+            self.recorder.record_writer_error(
+                run_id,
+                f"{type(exc).__name__}: {exc}",
+            )
+        except Exception:
+            pass
 
     def _record(
         self,
