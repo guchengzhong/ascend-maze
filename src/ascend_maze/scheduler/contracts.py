@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from ascend_maze.resources.anchors import ResourceAnchor
 
@@ -61,3 +61,28 @@ class SchedulingPolicy(Protocol):
     def depart(self, token: QueueToken) -> None: ...
 
     def propose(self, partition: str, limit: int) -> tuple[DispatchProposal, ...]: ...
+
+
+@runtime_checkable
+class RunLifecycleAwarePolicy(Protocol):
+    """Optional lifecycle input for policies whose priority spans a whole Run."""
+
+    def register_run(
+        self,
+        *,
+        run_id: str,
+        submitted_at_ms: int,
+        total_value_tasks: int,
+    ) -> None: ...
+
+    def unregister_run(self, run_id: str) -> None: ...
+
+    def task_succeeded(self, *, run_id: str, task_id: str, task_kind: str) -> None: ...
+
+    def run_terminal(
+        self,
+        *,
+        run_id: str,
+        status: str,
+        finished_at_ms: int,
+    ) -> None: ...

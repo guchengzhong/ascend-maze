@@ -30,6 +30,18 @@ class FcfsPolicy:
         self._active: set[QueueToken] = set()
         self._token_partitions: dict[QueueToken, str] = {}
 
+    def register_run(
+        self,
+        *,
+        run_id: str,
+        submitted_at_ms: int,
+        total_value_tasks: int,
+    ) -> None:
+        del run_id, submitted_at_ms, total_value_tasks
+
+    def unregister_run(self, run_id: str) -> None:
+        del run_id
+
     def enqueue(self, partition: str, task: SchedulableTaskView) -> None:
         token = task.queue_token
         if token in self._active:
@@ -75,6 +87,18 @@ class FcfsPolicy:
             )
             for entry in smallest
         )
+
+    def task_succeeded(self, *, run_id: str, task_id: str, task_kind: str) -> None:
+        del run_id, task_id, task_kind
+
+    def run_terminal(
+        self,
+        *,
+        run_id: str,
+        status: str,
+        finished_at_ms: int,
+    ) -> None:
+        del run_id, status, finished_at_ms
 
     def active_count(self) -> int:
         return len(self._active)

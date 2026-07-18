@@ -9,6 +9,7 @@ from ascend_maze.placement import NodeCapacity
 from ascend_maze.placement import PlacementManager
 from ascend_maze.resources import ResourceAnchorProvider
 from ascend_maze.runtime.ray_cluster import ManagedRayCluster, RayClusterConfig
+from ascend_maze.scheduler import QueuePartitioner, SchedulingPolicy
 
 from ascend_maze.control.ray_controller import RayHostController
 
@@ -31,6 +32,10 @@ class ManagedRayHost:
         clock: Clock | None = None,
         anchors: ResourceAnchorProvider | None = None,
         placement: PlacementManager | None = None,
+        policy: SchedulingPolicy | None = None,
+        partitioner: QueuePartitioner | None = None,
+        placement_lookahead: int = 8,
+        max_bypass_count: int = 8,
         dispatch_timeout_ms: int = 5_000,
     ) -> None:
         self.ray_cluster = ManagedRayCluster(ray_config)
@@ -47,6 +52,10 @@ class ManagedRayHost:
         self.clock = clock
         self.anchors = anchors
         self.placement = placement
+        self.policy = policy
+        self.partitioner = partitioner
+        self.placement_lookahead = placement_lookahead
+        self.max_bypass_count = max_bypass_count
         self.dispatch_timeout_ms = dispatch_timeout_ms
         self.controller: RayHostController | None = None
 
@@ -70,6 +79,10 @@ class ManagedRayHost:
                 clock=self.clock,
                 anchors=self.anchors,
                 placement=self.placement,
+                policy=self.policy,
+                partitioner=self.partitioner,
+                placement_lookahead=self.placement_lookahead,
+                max_bypass_count=self.max_bypass_count,
                 dispatch_timeout_ms=self.dispatch_timeout_ms,
             )
             await controller.start()

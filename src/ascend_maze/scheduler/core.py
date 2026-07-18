@@ -57,12 +57,14 @@ from ascend_maze.placement.manager import LeaseStatus, PlacementManager
 from ascend_maze.resources.anchors import ResourceAnchorProvider
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 from ascend_maze.scheduler.contracts import (
+    DispatchProposal,
+    QueuePartitioner,
     QueueToken,
+    RunLifecycleAwarePolicy,
     SchedulableTaskView,
     SchedulingPolicy,
     TaskKey,
 )
-from ascend_maze.scheduler.partitioners import HeterogeneousPartitioner
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +88,13 @@ class _RunExecution:
 class _QueuedRecord:
     view: SchedulableTaskView
     partition: str
+
+
+@dataclass(slots=True)
+class _BlockedRecord:
+    blocked_since_ms: int
+    bypass_count: int
+    last_reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,14 +168,23 @@ class SchedulerCore:
         runtime: SchedulerRuntimeBackend,
         recorder: ExecutionRecorder,
         policy: SchedulingPolicy,
-        partitioner: HeterogeneousPartitioner,
+        partitioner: QueuePartitioner,
         clock: Clock | None = None,
         placement_lookahead: int = 8,
+        max_bypass_count: int = 8,
         dispatch_timeout_ms: int = 5_000,
         recorder_flush_timeout_ms: int = 1_000,
         controller_producer_id: str = "controller",
         recovery: RecoveryPolicy | None = None,
     ) -> None:
+        if placement_lookahead < 1:
+            raise ValueError("placement_lookahead must be positive")
+        if max_bypass_count < 0:
+            raise ValueError("max_bypass_count must be non-negative")
+        if policy.capabilities.requires_prediction:
+            raise ValueError("this SchedulerCore has no task-time prediction provider")
+        if policy.capabilities.uses_cluster_snapshot:
+            raise ValueError("this SchedulerCore does not expose cluster snapshots to policies")
         self.state = state
         self.deadlines = deadlines
         self.indexes = indexes
@@ -178,6 +196,7 @@ class SchedulerCore:
         self.partitioner = partitioner
         self.clock = clock or SystemClock()
         self.placement_lookahead = placement_lookahead
+        self.max_bypass_count = max_bypass_count
         self.dispatch_timeout_ms = dispatch_timeout_ms
         self.recorder_flush_timeout_ms = recorder_flush_timeout_ms
         self.controller_producer_id = controller_producer_id
@@ -188,6 +207,7 @@ class SchedulerCore:
         self._running = False
         self._runs: dict[str, _RunExecution] = {}
         self._queued: dict[TaskKey, _QueuedRecord] = {}
+        self._blocked: dict[TaskKey, _BlockedRecord] = {}
         self._queue_generations: dict[TaskKey, int] = {}
         self._enqueue_sequence = 0
         self._partition_cursor = 0
@@ -379,6 +399,20 @@ class SchedulerCore:
             submitted_at_ms=command.submitted_at_ms,
             deadline_at_ms=command.deadline_at_ms,
         )
+        total_value_tasks = sum(
+            command.compiled.definitions[node.definition_id].task_kind == "npu"
+            for node in command.compiled.tasks.values()
+        )
+        try:
+            if isinstance(self.policy, RunLifecycleAwarePolicy):
+                self.policy.register_run(
+                    run_id=command.run_id,
+                    submitted_at_ms=command.submitted_at_ms,
+                    total_value_tasks=total_value_tasks,
+                )
+        except Exception:
+            self.state.remove_submitted_run(command.run_id)
+            raise
         try:
             index = await asyncio.to_thread(
                 self.indexes.create_and_adopt,
@@ -386,6 +420,8 @@ class SchedulerCore:
                 workflow_inputs=command.workflow_inputs,
             )
         except Exception:
+            if isinstance(self.policy, RunLifecycleAwarePolicy):
+                self.policy.unregister_run(command.run_id)
             self.state.remove_submitted_run(command.run_id)
             raise
         code_by_definition = {item.definition_id: item for item in command.code_handles}
@@ -459,7 +495,8 @@ class SchedulerCore:
             self._partition_cursor = (self._partition_cursor + 1) % len(partitions)
             for partition in ordered:
                 proposals = self.policy.propose(partition, self.placement_lookahead)
-                for proposal in proposals:
+                blocked_before: list[TaskKey] = []
+                for proposal_rank, proposal in enumerate(proposals, start=1):
                     key = proposal.task_key
                     queued = self._queued.get(key)
                     if (
@@ -470,9 +507,23 @@ class SchedulerCore:
                         continue
                     anchor = queued.view.resource_anchor
                     if anchor.execution_target.value == "model_service":
+                        reason = "model_route_unavailable"
                         self.state.set_pending_reason(
-                            key.run_id, key.task_id, "model_route_unavailable"
+                            key.run_id, key.task_id, reason
                         )
+                        self._mark_blocked(key, reason)
+                        self._record_scheduling_decision(
+                            run_id=key.run_id,
+                            task_id=key.task_id,
+                            partition=partition,
+                            proposal=proposal,
+                            proposal_rank=proposal_rank,
+                            placement_selected=False,
+                            pending_reason=reason,
+                        )
+                        blocked_before.append(key)
+                        if self._bypass_exhausted(key):
+                            break
                         continue
                     task_snapshot = self.state.snapshot(key.run_id).task(key.task_id)
                     next_attempt = task_snapshot.attempt_count + 1
@@ -492,6 +543,16 @@ class SchedulerCore:
                         ):
                             self.policy.depart(queued.view.queue_token)
                             del self._queued[key]
+                            self._blocked.pop(key, None)
+                            self._record_scheduling_decision(
+                                run_id=key.run_id,
+                                task_id=key.task_id,
+                                partition=partition,
+                                proposal=proposal,
+                                proposal_rank=proposal_rank,
+                                placement_selected=False,
+                                pending_reason=placement.rejection_reason,
+                            )
                             await self._fail_pre_attempt_unsatisfiable(
                                 key.run_id,
                                 key.task_id,
@@ -499,11 +560,34 @@ class SchedulerCore:
                             )
                             progress = True
                             break
+                        reason = placement.rejection_reason or "placement_unavailable"
                         self.state.set_pending_reason(
-                            key.run_id, key.task_id, placement.rejection_reason
+                            key.run_id, key.task_id, reason
                         )
+                        self._mark_blocked(key, reason)
+                        self._record_scheduling_decision(
+                            run_id=key.run_id,
+                            task_id=key.task_id,
+                            partition=partition,
+                            proposal=proposal,
+                            proposal_rank=proposal_rank,
+                            placement_selected=False,
+                            pending_reason=reason,
+                        )
+                        blocked_before.append(key)
+                        if self._bypass_exhausted(key):
+                            break
                         continue
                     assert placement.lease is not None
+                    self._record_scheduling_decision(
+                        run_id=key.run_id,
+                        task_id=key.task_id,
+                        partition=partition,
+                        proposal=proposal,
+                        proposal_rank=proposal_rank,
+                        placement_selected=True,
+                        pending_reason=None,
+                    )
                     self._expect_runtime_producer(key.run_id, placement.lease)
                     dispatch_id = new_id("dispatch")
                     attempt = self.state.create_attempt(
@@ -522,6 +606,7 @@ class SchedulerCore:
                     )
                     self.policy.depart(queued.view.queue_token)
                     del self._queued[key]
+                    self._blocked.pop(key, None)
                     request = self._build_request(
                         key.run_id,
                         key.task_id,
@@ -572,6 +657,10 @@ class SchedulerCore:
                             attempt=attempt.attempt,
                             lease_id=placement.lease.lease_id,
                         )
+                        for blocked_key in blocked_before:
+                            blocked = self._blocked.get(blocked_key)
+                            if blocked is not None and blocked_key in self._queued:
+                                blocked.bypass_count += 1
                     progress = True
                     break
 
@@ -793,6 +882,12 @@ class SchedulerCore:
         if not result.accepted:
             await self._release_event_outputs(event)
             return
+        if isinstance(self.policy, RunLifecycleAwarePolicy):
+            self.policy.task_succeeded(
+                run_id=event.run_id,
+                task_id=event.task_id,
+                task_kind=definition.task_kind,
+            )
         self._record(
             event.run_id,
             "task_succeeded",
@@ -1214,7 +1309,26 @@ class SchedulerCore:
             if key.run_id == run_id:
                 self.policy.depart(queued.view.queue_token)
                 del self._queued[key]
+                self._blocked.pop(key, None)
         snapshot = self.state.snapshot(run_id)
+        assert snapshot.finished_at_ms is not None
+        if isinstance(self.policy, RunLifecycleAwarePolicy):
+            try:
+                self.policy.run_terminal(
+                    run_id=run_id,
+                    status=snapshot.status.value,
+                    finished_at_ms=snapshot.finished_at_ms,
+                )
+            except Exception as exc:
+                self._record(
+                    run_id,
+                    "policy_lifecycle_error",
+                    payload={
+                        "hook": "run_terminal",
+                        "exception_type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                )
         for future in self._terminal_waiters.pop(run_id, []):
             if not future.done():
                 future.set_result(snapshot)
@@ -1254,6 +1368,7 @@ class SchedulerCore:
             del self._dispatches[dispatch_id]
         for key in [key for key in self._queue_generations if key.run_id == run_id]:
             del self._queue_generations[key]
+            self._blocked.pop(key, None)
         for event_id in [
             event_id
             for event_id, event_run_id in self._seen_runtime_events.items()
@@ -1439,6 +1554,61 @@ class SchedulerCore:
         definition_id = execution.compiled.tasks[task_id].definition_id
         return execution.compiled.definitions[definition_id]
 
+    def _mark_blocked(self, key: TaskKey, reason: str) -> None:
+        blocked = self._blocked.get(key)
+        if blocked is None:
+            self._blocked[key] = _BlockedRecord(
+                blocked_since_ms=self.clock.monotonic_ms(),
+                bypass_count=0,
+                last_reason=reason,
+            )
+        else:
+            blocked.last_reason = reason
+
+    def _bypass_exhausted(self, key: TaskKey) -> bool:
+        blocked = self._blocked.get(key)
+        return blocked is not None and blocked.bypass_count >= self.max_bypass_count
+
+    def _record_scheduling_decision(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        partition: str,
+        proposal: DispatchProposal,
+        proposal_rank: int,
+        placement_selected: bool,
+        pending_reason: str | None,
+    ) -> None:
+        blocked = self._blocked.get(proposal.task_key)
+        try:
+            policy_metadata: object = dict(proposal.policy_metadata)
+        except Exception as exc:
+            policy_metadata = {
+                "metadata_error": f"{type(exc).__name__}: {exc}",
+            }
+        self._record(
+            run_id,
+            "scheduling_decision",
+            task_id=task_id,
+            payload={
+                "policy_name": self.policy.name,
+                "policy_version": self.policy.version,
+                "partition": partition,
+                "proposal_rank": proposal_rank,
+                "policy_metadata": policy_metadata,
+                "placement_selected": placement_selected,
+                "pending_reason": pending_reason,
+                "queue_length": sum(
+                    queued.partition == partition for queued in self._queued.values()
+                ),
+                "blocked_since_ms": (
+                    None if blocked is None else blocked.blocked_since_ms
+                ),
+                "bypass_count": 0 if blocked is None else blocked.bypass_count,
+            },
+        )
+
     def _expect_runtime_producer(self, run_id: str, lease: PlacementLease) -> None:
         producer_id = self.runtime.producer_for_lease(lease)
         if producer_id is None:
@@ -1465,30 +1635,30 @@ class SchedulerCore:
         payload: dict[str, object] | None = None,
     ) -> None:
         self._producer_sequence += 1
-        frozen_payload = freeze_canonical(payload or {})
-        if not isinstance(frozen_payload, FrozenMap):
-            raise TypeError("recording payload must freeze to a mapping")
-        event = ExecutionEvent(
-            schema_version=1,
-            event_id=new_id("event"),
-            experiment_id=run_id,
-            run_id=run_id,
-            task_id=task_id,
-            attempt=attempt,
-            lease_id=lease_id,
-            route_lease_id=None,
-            model_instance_id=None,
-            event_type=event_type,
-            producer_id=self.controller_producer_id,
-            producer_sequence=self._producer_sequence,
-            node_id=None,
-            device_id=None,
-            monotonic_time_ms=self.clock.monotonic_ms(),
-            wall_time_ms=self.clock.wall_ms(),
-            duration_ms=None,
-            payload=frozen_payload,
-        )
         try:
+            frozen_payload = freeze_canonical(payload or {})
+            if not isinstance(frozen_payload, FrozenMap):
+                raise TypeError("recording payload must freeze to a mapping")
+            event = ExecutionEvent(
+                schema_version=1,
+                event_id=new_id("event"),
+                experiment_id=run_id,
+                run_id=run_id,
+                task_id=task_id,
+                attempt=attempt,
+                lease_id=lease_id,
+                route_lease_id=None,
+                model_instance_id=None,
+                event_type=event_type,
+                producer_id=self.controller_producer_id,
+                producer_sequence=self._producer_sequence,
+                node_id=None,
+                device_id=None,
+                monotonic_time_ms=self.clock.monotonic_ms(),
+                wall_time_ms=self.clock.wall_ms(),
+                duration_ms=None,
+                payload=frozen_payload,
+            )
             self.recorder.emit(event)
         except Exception as exc:
             try:

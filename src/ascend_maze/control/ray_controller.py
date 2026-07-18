@@ -19,6 +19,7 @@ from ascend_maze.runtime.ray_node_registry import (
 )
 from ascend_maze.runtime.worker_broker import ColdWorkerBroker
 from ascend_maze.resources import ResourceAnchorProvider
+from ascend_maze.scheduler import QueuePartitioner, SchedulingPolicy
 
 from ascend_maze.control.controller import InMemoryController
 from ascend_maze.control.local_rpc import (
@@ -48,6 +49,10 @@ class RayHostController(InMemoryController):
         clock: Clock | None = None,
         anchors: ResourceAnchorProvider | None = None,
         placement: PlacementManager | None = None,
+        policy: SchedulingPolicy | None = None,
+        partitioner: QueuePartitioner | None = None,
+        placement_lookahead: int = 8,
+        max_bypass_count: int = 8,
         dispatch_timeout_ms: int = 5_000,
     ) -> None:
         generation = controller_generation or new_id("controller")
@@ -82,6 +87,10 @@ class RayHostController(InMemoryController):
             runtime=runtime,
             anchors=anchors,
             placement=placement,
+            policy=policy,
+            partitioner=partitioner,
+            placement_lookahead=placement_lookahead,
+            max_bypass_count=max_bypass_count,
             dispatch_timeout_ms=dispatch_timeout_ms,
         )
         self.cluster_id = cluster_id

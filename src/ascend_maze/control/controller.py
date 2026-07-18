@@ -30,6 +30,8 @@ from ascend_maze.scheduler import (
     DestroyResult,
     FcfsPolicy,
     HeterogeneousPartitioner,
+    QueuePartitioner,
+    SchedulingPolicy,
     SchedulerCore,
 )
 from ascend_maze.scheduler.core import SchedulerRuntimeBackend
@@ -81,6 +83,10 @@ class InMemoryController:
         runtime: SchedulerRuntimeBackend | None = None,
         anchors: ResourceAnchorProvider | None = None,
         placement: PlacementManager | None = None,
+        policy: SchedulingPolicy | None = None,
+        partitioner: QueuePartitioner | None = None,
+        placement_lookahead: int = 8,
+        max_bypass_count: int = 8,
         dispatch_timeout_ms: int = 5_000,
     ) -> None:
         self.config_fingerprint = config_fingerprint
@@ -119,9 +125,11 @@ class InMemoryController:
             placement=self.placement,
             runtime=self.runtime,
             recorder=self.recorder,
-            policy=FcfsPolicy(),
-            partitioner=HeterogeneousPartitioner(),
+            policy=policy or FcfsPolicy(),
+            partitioner=partitioner or HeterogeneousPartitioner(),
             clock=self.clock,
+            placement_lookahead=placement_lookahead,
+            max_bypass_count=max_bypass_count,
             dispatch_timeout_ms=dispatch_timeout_ms,
         )
         self._submissions: dict[str, _SubmissionRecord] = {}
