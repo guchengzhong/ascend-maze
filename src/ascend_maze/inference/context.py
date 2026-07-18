@@ -29,12 +29,14 @@ class AttemptInferenceSession:
         lease: ModelRouteLease,
         router: InferenceRouter,
         adapter: InferenceEngineAdapter,
+        instance_placement_lease_id: str,
         record_sink: Callable[[InferenceRequestRecord], None],
         clock: Clock | None = None,
     ) -> None:
         self.lease = lease
         self.router = router
         self.adapter = adapter
+        self.instance_placement_lease_id = instance_placement_lease_id
         self.record_sink = record_sink
         self.clock = clock or SystemClock()
         self.context = ModelRouteContext(
@@ -106,6 +108,9 @@ class AttemptInferenceSession:
                             model_id=self.lease.model_id,
                             instance_id=self.lease.instance_id,
                             instance_generation=self.lease.instance_generation,
+                            instance_placement_lease_id=(
+                                self.instance_placement_lease_id
+                            ),
                             started_at_ms=started,
                             duration_ms=duration,
                             status=status,
@@ -123,6 +128,7 @@ class AttemptInferenceSession:
                             prefix_cache_hit=(
                                 None if response is None else response.prefix_cache_hit
                             ),
+                            ttft_ms=None if response is None else response.ttft_ms,
                             error_code=error_code,
                         )
                     )

@@ -39,6 +39,7 @@ def test_stage6a_snapshot_covers_complete_catalog_and_control_thresholds(
     inference = snapshot.resolved["inference"]
     assert inference["catalog_content_digest"] == catalog.content_digest
     assert inference["affinity_ttl_ms"] == config.affinity_ttl_ms
+    assert inference["reconcile_interval_ms"] == config.reconcile_interval_ms
 
     changed = create_stage6a_config_snapshot(
         replace(config, affinity_capacity=config.affinity_capacity + 1),

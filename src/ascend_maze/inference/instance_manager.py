@@ -21,9 +21,11 @@ from ascend_maze.inference.contracts import (
     ModelInstanceState,
     ModelSpec,
     PortLease,
+    PortLeaseManager,
     ServiceHandle,
     ServiceProcessBackend,
 )
+from ascend_maze.inference.ports import InMemoryPortLeaseManager
 from ascend_maze.placement import PlacementManager
 
 
@@ -43,6 +45,8 @@ class _InstanceRecord:
     actual_request_inflight: int = 0
     last_used_at_ms: int = 0
     failure_reason: str | None = None
+    cleanup_deadline_at_ms: int | None = None
+    cleanup_timeout_reported: bool = False
 
 
 class ModelInstanceManager:
@@ -55,16 +59,20 @@ class ModelInstanceManager:
         event_sink: Callable[[ModelControlEvent], None] | None = None,
         clock: Clock | None = None,
         first_port: int = 25_000,
+        last_port: int = 65_535,
+        port_leases: PortLeaseManager | None = None,
     ) -> None:
-        if first_port < 1 or first_port > 65_535:
-            raise ValueError("first_port is invalid")
         self.catalog = catalog
         self.placement = placement
         self.service_backend = service_backend
         self.event_sink = event_sink
         self.clock = clock or SystemClock()
+        self.port_leases = port_leases or InMemoryPortLeaseManager(
+            first_port=first_port,
+            last_port=last_port,
+        )
         self._records: dict[str, _InstanceRecord] = {}
-        self._next_port = first_port
+        self._ready_index: dict[tuple[str, str], set[tuple[str, int]]] = {}
         self._lock = RLock()
 
     def create_requested(self, model_id: str) -> ModelInstance:
@@ -84,6 +92,36 @@ class ModelInstanceManager:
         self._emit(record, "model_instance_requested")
         return self._snapshot(record)
 
+    def restart_stopped(self, instance_id: str) -> ModelInstance:
+        with self._lock:
+            record = self._require(instance_id)
+            if record.state is not ModelInstanceState.STOPPED:
+                raise StateTransitionError("only a stopped model instance can restart")
+            if (
+                record.placement_lease is not None
+                or record.port_lease is not None
+                or record.service_handle is not None
+                or record.route_occupancy
+                or record.actual_request_inflight
+            ):
+                raise StateTransitionError("stopped model instance still owns resources")
+            previous_generation = record.generation
+            now = self.clock.monotonic_ms()
+            record.generation += 1
+            record.state = ModelInstanceState.REQUESTED
+            record.created_at_ms = now
+            record.state_changed_at_ms = now
+            record.ready_at_ms = None
+            record.last_used_at_ms = now
+            record.failure_reason = None
+            snapshot = self._snapshot(record)
+        self._emit(
+            record,
+            "model_instance_restarted",
+            {"previous_generation": previous_generation},
+        )
+        return snapshot
+
     async def start_instance(self, instance_id: str) -> ModelInstance:
         with self._lock:
             record = self._require(instance_id)
@@ -97,53 +135,85 @@ class ModelInstanceManager:
                     f"cannot start instance from {record.state.value}"
                 )
             self._transition(record, ModelInstanceState.RESERVING)
-            now = self.clock.monotonic_ms()
-            placement = self.placement.reserve_model_instance(
-                instance_id=record.instance_id,
-                generation=record.generation,
-                resources=record.spec.reservation,
-                allow_colocation=record.spec.allow_colocation,
-                now_ms=now,
-                startup_deadline_ms=now + record.spec.startup_timeout_ms,
-            )
-            if not placement.selected:
-                self._emit(
-                    record,
-                    "model_placement_pending",
-                    {"reason": placement.rejection_reason},
-                )
-                return self._snapshot(record)
-            assert placement.lease is not None
-            record.placement_lease = placement.lease
-            self._transition(record, ModelInstanceState.STARTING)
-            port = self._allocate_port(record)
-            adapter = self.catalog.adapter(record.spec.model_id)
-            request = adapter.build_launch_request(record.spec, placement.lease, port)
+            generation = record.generation
+            spec = record.spec
+        startup_deadline = monotonic() + spec.startup_timeout_ms / 1_000
         try:
-            startup_deadline = monotonic() + record.spec.startup_timeout_ms / 1_000
+            now = self.clock.monotonic_ms()
+            with self._lock:
+                current = self._require_generation(instance_id, generation)
+                placement = self.placement.reserve_model_instance(
+                    instance_id=current.instance_id,
+                    generation=current.generation,
+                    resources=spec.reservation,
+                    allow_colocation=spec.allow_colocation,
+                    now_ms=now,
+                    startup_deadline_ms=now + spec.startup_timeout_ms,
+                )
+                if not placement.selected:
+                    self._emit(
+                        current,
+                        "model_placement_pending",
+                        {"reason": placement.rejection_reason},
+                    )
+                    return self._snapshot(current)
+                assert placement.lease is not None
+                current.placement_lease = placement.lease
+                self._transition(
+                    current,
+                    ModelInstanceState.STARTING,
+                    {"startup_deadline_ms": placement.lease.dispatch_deadline_ms},
+                )
+            adapter = self.catalog.adapter(spec.model_id)
+            port = await asyncio.wait_for(
+                self.port_leases.acquire(
+                    node_id=placement.lease.node_id,
+                    boot_id=placement.lease.boot_id,
+                    owner_instance_id=instance_id,
+                    generation=generation,
+                ),
+                timeout=self._remaining(startup_deadline),
+            )
+            with self._lock:
+                current = self._require_generation(instance_id, generation)
+                current.port_lease = port
+            request = adapter.build_launch_request(spec, placement.lease, port)
             handle = await asyncio.wait_for(
                 self.service_backend.launch(request, placement.lease),
                 timeout=self._remaining(startup_deadline),
             )
+            with self._lock:
+                current = self._require_generation(instance_id, generation)
+                current.service_handle = handle
+            self._validate_service_handle(
+                instance_id=instance_id,
+                generation=generation,
+                lease=placement.lease,
+                request_endpoint_id=request.endpoint_id,
+                handle=handle,
+            )
             attach = getattr(self.service_backend, "attach_spec", None)
             if callable(attach):
-                attach(handle, record.spec)
+                attach(handle, spec)
             with self._lock:
-                current = self._require_generation(instance_id, record.generation)
-                current.service_handle = handle
+                current = self._require_generation(instance_id, generation)
                 if not self.placement.bind_lease(
                     placement.lease.lease_id,
                     now_ms=self.clock.monotonic_ms(),
                 ):
                     raise RuntimeError("model PlacementLease could not be bound")
-                self._transition(current, ModelInstanceState.WARMING)
+                self._transition(
+                    current,
+                    ModelInstanceState.WARMING,
+                    {"process_id": handle.process_id},
+                )
             probe = await asyncio.wait_for(
-                adapter.probe(handle, record.spec),
+                adapter.probe(handle, spec),
                 timeout=self._remaining(startup_deadline),
             )
-            self._validate_probe(record.spec, placement.lease, probe)
+            self._validate_probe(spec, placement.lease, probe)
             warmup = await asyncio.wait_for(
-                adapter.warmup(handle, record.spec),
+                adapter.warmup(handle, spec),
                 timeout=self._remaining(startup_deadline),
             )
             if not warmup.succeeded or not warmup.response_digest:
@@ -155,22 +225,32 @@ class ModelInstanceManager:
             if metrics.actual_request_inflight != 0:
                 raise RuntimeError("new model instance reported active requests")
             with self._lock:
-                current = self._require_generation(instance_id, record.generation)
+                current = self._require_generation(instance_id, generation)
                 now = self.clock.monotonic_ms()
                 current.ready_at_ms = now
                 current.last_used_at_ms = now
-                self._transition(current, ModelInstanceState.READY)
+                self._transition(
+                    current,
+                    ModelInstanceState.READY,
+                    {
+                        "warmup_duration_ms": warmup.duration_ms,
+                        "warmup_response_digest": warmup.response_digest,
+                        "process_hbm_mb": probe.process_hbm_mb,
+                        "request_capacity": probe.request_capacity,
+                        "engine_queue_depth": metrics.queue_depth,
+                    },
+                )
                 return self._snapshot(current)
         except Exception as exc:
             with self._lock:
-                current = self._require_generation(instance_id, record.generation)
+                current = self._require_generation(instance_id, generation)
                 current.failure_reason = f"{type(exc).__name__}: {exc}"
                 self._transition(
                     current,
                     ModelInstanceState.FAILED,
                     {"reason": current.failure_reason},
                 )
-            await self._cleanup_failed(instance_id, record.generation)
+            await self._cleanup_failed(instance_id, generation)
             return self.snapshot(instance_id)
 
     def begin_drain(self, instance_id: str, generation: int) -> bool:
@@ -181,6 +261,10 @@ class ModelInstanceManager:
             if record.state is not ModelInstanceState.READY:
                 return False
             self._transition(record, ModelInstanceState.DRAINING)
+            record.cleanup_deadline_at_ms = (
+                self.clock.monotonic_ms() + record.spec.drain_timeout_ms
+            )
+            record.cleanup_timeout_reported = False
             return True
 
     def cancel_drain(self, instance_id: str, generation: int) -> bool:
@@ -188,7 +272,74 @@ class ModelInstanceManager:
             record = self._require_generation(instance_id, generation)
             if record.state is not ModelInstanceState.DRAINING:
                 return False
+            record.cleanup_deadline_at_ms = None
+            record.cleanup_timeout_reported = False
             self._transition(record, ModelInstanceState.READY)
+            return True
+
+    def mark_failed(
+        self,
+        instance_id: str,
+        generation: int,
+        *,
+        reason: str,
+    ) -> ModelInstance:
+        if not reason:
+            raise ValueError("model failure reason is required")
+        with self._lock:
+            record = self._require_generation(instance_id, generation)
+            if record.state in {ModelInstanceState.STOPPED, ModelInstanceState.STOPPING}:
+                return self._snapshot(record)
+            if record.state is ModelInstanceState.FAILED:
+                return self._snapshot(record)
+            record.failure_reason = reason
+            self._transition(
+                record,
+                ModelInstanceState.FAILED,
+                {"reason": reason},
+            )
+            record.cleanup_deadline_at_ms = (
+                self.clock.monotonic_ms() + record.spec.drain_timeout_ms
+            )
+            record.cleanup_timeout_reported = False
+            self._emit(
+                record,
+                "model_instance_unhealthy",
+                {"reason": reason},
+            )
+            return self._snapshot(record)
+
+    def check_cleanup_timeout(
+        self,
+        instance_id: str,
+        generation: int,
+    ) -> bool:
+        with self._lock:
+            record = self._require_generation(instance_id, generation)
+            if record.state not in {
+                ModelInstanceState.DRAINING,
+                ModelInstanceState.FAILED,
+            }:
+                return False
+            if not (record.route_occupancy or record.actual_request_inflight):
+                return False
+            deadline = record.cleanup_deadline_at_ms
+            if (
+                deadline is None
+                or self.clock.monotonic_ms() < deadline
+                or record.cleanup_timeout_reported
+            ):
+                return False
+            record.cleanup_timeout_reported = True
+            self._emit(
+                record,
+                "model_drain_timed_out",
+                {
+                    "deadline_at_ms": deadline,
+                    "route_occupancy": record.route_occupancy,
+                    "actual_request_inflight": record.actual_request_inflight,
+                },
+            )
             return True
 
     async def stop_if_drained(
@@ -208,6 +359,7 @@ class ModelInstanceManager:
             self._transition(record, ModelInstanceState.STOPPING)
             handle = record.service_handle
             lease = record.placement_lease
+            port_lease = record.port_lease
             timeout_ms = record.spec.drain_timeout_ms
         try:
             if handle is not None:
@@ -223,6 +375,13 @@ class ModelInstanceManager:
                     raise RuntimeError(
                         "service stop did not confirm process, port and HBM recovery"
                     )
+            if port_lease is not None:
+                if not await self.port_leases.release(port_lease):
+                    raise RuntimeError("PortLease authority could not confirm release")
+                with self._lock:
+                    current = self._require_generation(instance_id, generation)
+                    if current.port_lease == port_lease:
+                        current.port_lease = None
             if lease is not None:
                 self.placement.release_lease(
                     lease.lease_id,
@@ -231,7 +390,18 @@ class ModelInstanceManager:
                 )
             with self._lock:
                 current = self._require_generation(instance_id, generation)
-                self._transition(current, ModelInstanceState.STOPPED)
+                current.placement_lease = None
+                current.service_handle = None
+                current.cleanup_deadline_at_ms = None
+                self._transition(
+                    current,
+                    ModelInstanceState.STOPPED,
+                    {
+                        "process_exited": True,
+                        "port_released": True,
+                        "hbm_recovered": True,
+                    },
+                )
                 return self._snapshot(current)
         except Exception as exc:
             with self._lock:
@@ -254,6 +424,11 @@ class ModelInstanceManager:
                 raise StateTransitionError("model route capacity is full")
             record.route_occupancy += 1
             record.last_used_at_ms = self.clock.monotonic_ms()
+            self._emit(
+                record,
+                "model_route_capacity_changed",
+                {"reason": "route_reserved"},
+            )
 
     def release_route(self, instance_id: str, generation: int) -> None:
         with self._lock:
@@ -262,6 +437,11 @@ class ModelInstanceManager:
                 raise StateTransitionError("model route occupancy underflow")
             record.route_occupancy -= 1
             record.last_used_at_ms = self.clock.monotonic_ms()
+            self._emit(
+                record,
+                "model_route_capacity_changed",
+                {"reason": "route_released"},
+            )
 
     def request_started(self, instance_id: str, generation: int) -> None:
         with self._lock:
@@ -275,6 +455,11 @@ class ModelInstanceManager:
                 raise StateTransitionError("model request requires route occupancy")
             record.actual_request_inflight += 1
             record.last_used_at_ms = self.clock.monotonic_ms()
+            self._emit(
+                record,
+                "model_request_inflight_changed",
+                {"reason": "request_started"},
+            )
 
     def request_finished(self, instance_id: str, generation: int) -> None:
         with self._lock:
@@ -283,6 +468,11 @@ class ModelInstanceManager:
                 raise StateTransitionError("actual request inflight underflow")
             record.actual_request_inflight -= 1
             record.last_used_at_ms = self.clock.monotonic_ms()
+            self._emit(
+                record,
+                "model_request_inflight_changed",
+                {"reason": "request_finished"},
+            )
 
     def snapshot(self, instance_id: str) -> ModelInstance:
         with self._lock:
@@ -302,6 +492,23 @@ class ModelInstanceManager:
                 )
                 if (model_id is None or record.spec.model_id == model_id)
                 and (states is None or record.state in states)
+            )
+
+    def ready_instances(
+        self,
+        model_id: str,
+        catalog_revision: str,
+    ) -> tuple[ModelInstance, ...]:
+        with self._lock:
+            identities = self._ready_index.get(
+                (model_id, catalog_revision),
+                set(),
+            )
+            return tuple(
+                self._snapshot(self._records[instance_id])
+                for instance_id, generation in sorted(identities)
+                if self._records[instance_id].generation == generation
+                and self._records[instance_id].state is ModelInstanceState.READY
             )
 
     def spec_for_instance(self, instance_id: str) -> ModelSpec:
@@ -326,23 +533,33 @@ class ModelInstanceManager:
     async def _cleanup_failed(self, instance_id: str, generation: int) -> None:
         await self.stop_if_drained(instance_id, generation)
 
-    def _allocate_port(self, record: _InstanceRecord) -> PortLease:
-        port = self._next_port
-        self._next_port += 1
-        if self._next_port > 65_535:
-            self._next_port = 25_000
-        lease = record.placement_lease
-        assert lease is not None
-        result = PortLease(
-            port_lease_id=new_id("port"),
-            node_id=lease.node_id,
-            boot_id=lease.boot_id,
-            port=port,
-            owner_instance_id=record.instance_id,
-            generation=record.generation,
+    @staticmethod
+    def _validate_service_handle(
+        *,
+        instance_id: str,
+        generation: int,
+        lease: PlacementLease,
+        request_endpoint_id: str,
+        handle: ServiceHandle,
+    ) -> None:
+        expected = (
+            instance_id,
+            generation,
+            request_endpoint_id,
+            lease.node_id,
+            lease.boot_id,
+            lease.npu_device_id,
         )
-        record.port_lease = result
-        return result
+        actual = (
+            handle.instance_id,
+            handle.generation,
+            handle.endpoint_id,
+            handle.node_id,
+            handle.boot_id,
+            handle.npu_device_id,
+        )
+        if actual != expected:
+            raise RuntimeError("ServiceHandle identity does not match launch request")
 
     @staticmethod
     def _validate_probe(
@@ -422,7 +639,13 @@ class ModelInstanceManager:
             raise StateTransitionError(
                 f"invalid model instance transition {record.state.value}->{target.value}"
             )
+        ready_key = (record.spec.model_id, record.spec.catalog_revision)
+        identity = (record.instance_id, record.generation)
+        if record.state is ModelInstanceState.READY:
+            self._ready_index.get(ready_key, set()).discard(identity)
         record.state = target
+        if target is ModelInstanceState.READY:
+            self._ready_index.setdefault(ready_key, set()).add(identity)
         record.state_changed_at_ms = self.clock.monotonic_ms()
         self._emit(record, f"model_instance_{target.value}", payload)
 
@@ -434,6 +657,26 @@ class ModelInstanceManager:
     ) -> None:
         if self.event_sink is None:
             return
+        lease = record.placement_lease
+        port = record.port_lease
+        handle = record.service_handle
+        event_payload: dict[str, object] = {
+            "state": record.state.value,
+            "catalog_revision": record.spec.catalog_revision,
+            "placement_lease_id": None if lease is None else lease.lease_id,
+            "node_id": None if lease is None else lease.node_id,
+            "boot_id": None if lease is None else lease.boot_id,
+            "npu_device_id": None if lease is None else lease.npu_device_id,
+            "port_lease_id": None if port is None else port.port_lease_id,
+            "port": None if port is None else port.port,
+            "service_handle_id": (
+                None if handle is None else handle.service_handle_id
+            ),
+            "route_occupancy": record.route_occupancy,
+            "actual_request_inflight": record.actual_request_inflight,
+        }
+        if payload is not None:
+            event_payload.update(payload)
         self.event_sink(
             ModelControlEvent(
                 event_type=event_type,
@@ -441,7 +684,7 @@ class ModelInstanceManager:
                 model_id=record.spec.model_id,
                 instance_id=record.instance_id,
                 instance_generation=record.generation,
-                payload=self._event_payload(payload),
+                payload=self._event_payload(event_payload),
             )
         )
 

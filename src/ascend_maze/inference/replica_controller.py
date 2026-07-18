@@ -36,18 +36,46 @@ class ReplicaController:
         router: InferenceRouter,
         event_sink: Callable[[ModelControlEvent], None] | None = None,
         clock: Clock | None = None,
+        reconcile_interval_ms: int = 100,
     ) -> None:
+        if (
+            isinstance(reconcile_interval_ms, bool)
+            or not isinstance(reconcile_interval_ms, int)
+            or reconcile_interval_ms < 1
+        ):
+            raise ValueError("reconcile_interval_ms must be positive")
         self.catalog = catalog
         self.instances = instances
         self.router = router
         self.event_sink = event_sink
         self.clock = clock or SystemClock()
+        self.reconcile_interval_ms = reconcile_interval_ms
         self._demands: dict[str, ModelDemand] = {}
         self._demand_keys: dict[tuple[str, str, str, str], str] = {}
         self._scale = {spec.model_id: _ScaleState() for spec in catalog.specs}
         self._start_tasks: dict[str, asyncio.Task[None]] = {}
         self._stop_tasks: dict[str, asyncio.Task[None]] = {}
+        self._reconcile_lock = asyncio.Lock()
+        self._wake = asyncio.Event()
+        self._runner: asyncio.Task[None] | None = None
+        self._closing = False
         self._lock = RLock()
+
+    async def start(self) -> None:
+        if self._runner is not None:
+            return
+        self._closing = False
+        await self.reconcile()
+        self._runner = asyncio.create_task(self._run_loop())
+
+    async def close(self) -> None:
+        self._closing = True
+        self._wake.set()
+        runner = self._runner
+        self._runner = None
+        if runner is not None:
+            await runner
+        await self.wait_for_background()
 
     def register_demand(
         self,
@@ -84,6 +112,7 @@ class ReplicaController:
             run_id=run_id,
             task_id=task_id,
         )
+        self._wake.set()
         return demand
 
     def remove_demand(
@@ -106,6 +135,7 @@ class ReplicaController:
             run_id=run_id,
             task_id=task_id,
         )
+        self._wake.set()
         return True
 
     def remove_run(self, run_id: str) -> int:
@@ -142,8 +172,12 @@ class ReplicaController:
         )
 
     async def reconcile(self) -> None:
-        for spec in self.catalog.specs:
-            await self._reconcile_model(spec.model_id)
+        async with self._reconcile_lock:
+            for spec in self.catalog.specs:
+                await self._reconcile_model(spec.model_id)
+
+    def wake(self) -> None:
+        self._wake.set()
 
     async def wait_for_background(self) -> None:
         while True:
@@ -155,16 +189,47 @@ class ReplicaController:
                 return
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def _run_loop(self) -> None:
+        interval = self.reconcile_interval_ms / 1_000
+        while not self._closing:
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            self._wake.clear()
+            if not self._closing:
+                try:
+                    await self.reconcile()
+                except Exception as exc:
+                    for spec in self.catalog.specs:
+                        self._emit(
+                            "model_reconcile_failed",
+                            spec.model_id,
+                            payload={
+                                "exception_type": type(exc).__name__,
+                                "message": str(exc),
+                            },
+                        )
+
     async def _reconcile_model(self, model_id: str) -> None:
         spec = self.catalog.get(model_id)
         now = self.clock.monotonic_ms()
         instances = self.instances.instances(model_id=model_id)
-        for instance in instances:
-            if instance.state in {
+        available_start_slots = max(
+            0,
+            spec.max_parallel_starts - self._active_start_count(model_id),
+        )
+        waiting_to_start = [
+            instance
+            for instance in instances
+            if instance.state
+            in {
                 ModelInstanceState.REQUESTED,
                 ModelInstanceState.RESERVING,
-            }:
-                self._schedule_start(instance.instance_id)
+            }
+        ]
+        for instance in waiting_to_start[:available_start_slots]:
+            self._schedule_start(instance.instance_id)
         instances = self.instances.instances(model_id=model_id)
         pending = self.pending_count(model_id)
         route_occupancy = sum(item.route_occupancy for item in instances)
@@ -212,20 +277,29 @@ class ReplicaController:
             )
             sustained = now - scale.pressure_since_ms >= spec.scale_up_sustain_ms
             if cooldown_done and sustained:
-                with self._lock:
-                    active_starts = sum(
-                        not task.done()
-                        and self.instances.spec_for_instance(instance_id).model_id
-                        == model_id
-                        for instance_id, task in self._start_tasks.items()
-                    )
+                active_starts = self._active_start_count(model_id)
                 starts = min(
                     desired - len(live),
                     max(0, spec.max_parallel_starts - active_starts),
                     spec.max_replicas - len(live),
                 )
+                stopped = iter(
+                    sorted(
+                        (
+                            item
+                            for item in instances
+                            if item.state is ModelInstanceState.STOPPED
+                        ),
+                        key=lambda item: item.instance_id,
+                    )
+                )
                 for _ in range(max(0, starts)):
-                    requested = self.instances.create_requested(model_id)
+                    reusable = next(stopped, None)
+                    requested = (
+                        self.instances.create_requested(model_id)
+                        if reusable is None
+                        else self.instances.restart_stopped(reusable.instance_id)
+                    )
                     self._schedule_start(requested.instance_id)
                 if starts:
                     scale.last_scale_at_ms = now
@@ -235,7 +309,11 @@ class ReplicaController:
                         payload={
                             "reason": "pending_or_utilization",
                             "target_replicas": desired,
+                            "actual_replicas": len(live),
                             "started": starts,
+                            "pending_demand": pending,
+                            "route_occupancy": route_occupancy,
+                            "cooldown_until_ms": now + spec.scale_cooldown_ms,
                         },
                     )
         else:
@@ -257,7 +335,14 @@ class ReplicaController:
                     and item.actual_request_inflight == 0
                     and now - item.last_used_at_ms >= spec.scale_down_idle_ms
                 ),
-                key=lambda item: (item.last_used_at_ms, item.instance_id),
+                key=lambda item: (
+                    self.router.affinity_count(
+                        item.instance_id, item.generation
+                    )
+                    > 0,
+                    item.last_used_at_ms,
+                    item.instance_id,
+                ),
             )
             selected = candidates[:excess]
             for instance in selected:
@@ -275,7 +360,9 @@ class ReplicaController:
                     payload={
                         "reason": "idle_capacity",
                         "target_replicas": desired,
+                        "actual_replicas": len(ready),
                         "drained": len(selected),
+                        "cooldown_until_ms": now + spec.scale_cooldown_ms,
                     },
                 )
 
@@ -285,6 +372,9 @@ class ReplicaController:
                 {ModelInstanceState.DRAINING, ModelInstanceState.FAILED}
             ),
         ):
+            self.instances.check_cleanup_timeout(
+                instance.instance_id, instance.generation
+            )
             self._schedule_stop(instance.instance_id, instance.generation)
 
     def _schedule_start(self, instance_id: str) -> bool:
@@ -297,6 +387,15 @@ class ReplicaController:
             )
             return True
 
+    def _active_start_count(self, model_id: str) -> int:
+        with self._lock:
+            return sum(
+                not task.done()
+                and self.instances.spec_for_instance(instance_id).model_id
+                == model_id
+                for instance_id, task in self._start_tasks.items()
+            )
+
     async def _start_instance(self, instance_id: str) -> None:
         try:
             await self.instances.start_instance(instance_id)
@@ -305,6 +404,8 @@ class ReplicaController:
                 current = self._start_tasks.get(instance_id)
                 if current is asyncio.current_task():
                     del self._start_tasks[instance_id]
+            if self.instances.snapshot(instance_id).state is ModelInstanceState.READY:
+                self._wake.set()
 
     def _schedule_stop(self, instance_id: str, generation: int) -> bool:
         with self._lock:
@@ -324,6 +425,11 @@ class ReplicaController:
                 current = self._stop_tasks.get(instance_id)
                 if current is asyncio.current_task():
                     del self._stop_tasks[instance_id]
+            if (
+                self.instances.snapshot(instance_id).state
+                is ModelInstanceState.STOPPED
+            ):
+                self._wake.set()
 
     def _emit(
         self,

@@ -4,7 +4,12 @@ from pathlib import Path
 
 from ascend_maze.control import InMemoryController
 from ascend_maze.core.clock import Clock
-from ascend_maze.inference import InferenceCoordinator, ModelCatalog, ModelSpec
+from ascend_maze.inference import (
+    InferenceCoordinator,
+    ModelCatalog,
+    ModelSpec,
+    PortLeaseManager,
+)
 from ascend_maze.inference.adapters.fake import FakeInferenceEngineAdapter
 from ascend_maze.placement import NodeCapacity, NpuCapacity, PlacementManager
 
@@ -102,6 +107,8 @@ def make_inference(
     placement: PlacementManager | None = None,
     adapter: FakeInferenceEngineAdapter | None = None,
     clock: Clock | None = None,
+    port_leases: PortLeaseManager | None = None,
+    reconcile_interval_ms: int = 100,
 ) -> tuple[InferenceCoordinator, PlacementManager, FakeInferenceEngineAdapter]:
     resolved_placement = placement or PlacementManager()
     resolved_adapter = adapter or FakeInferenceEngineAdapter()
@@ -116,6 +123,8 @@ def make_inference(
         placement=resolved_placement,
         service_backend=resolved_adapter,
         clock=clock,
+        port_leases=port_leases,
+        reconcile_interval_ms=reconcile_interval_ms,
     )
     return inference, resolved_placement, resolved_adapter
 

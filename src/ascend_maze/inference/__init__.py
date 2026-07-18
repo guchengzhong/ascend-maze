@@ -21,6 +21,7 @@ from ascend_maze.inference.contracts import (
     ModelRouteLeaseStatus,
     ModelSpec,
     PortLease,
+    PortLeaseManager,
     ServiceHandle,
     ServiceLaunchRequest,
     ServiceProcessBackend,
@@ -28,6 +29,7 @@ from ascend_maze.inference.contracts import (
     WarmupResult,
 )
 from ascend_maze.inference.coordinator import InferenceCoordinator
+from ascend_maze.inference.ports import InMemoryPortLeaseManager
 
 __all__ = [
     "AttemptInferenceSummary",
@@ -38,6 +40,7 @@ __all__ = [
     "InferenceCallError",
     "InferenceCoordinator",
     "InferenceEngineAdapter",
+    "InMemoryPortLeaseManager",
     "InferenceRequestRecord",
     "ModelCatalog",
     "ModelControlEvent",
@@ -50,6 +53,7 @@ __all__ = [
     "ModelRouteLeaseStatus",
     "ModelSpec",
     "PortLease",
+    "PortLeaseManager",
     "ServiceHandle",
     "ServiceLaunchRequest",
     "ServiceProcessBackend",

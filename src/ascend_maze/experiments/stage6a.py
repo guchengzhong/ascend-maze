@@ -12,6 +12,7 @@ from ascend_maze.inference import ModelCatalog
 
 @dataclass(frozen=True, slots=True)
 class Stage6AConfig:
+    reconcile_interval_ms: int = 100
     affinity_ttl_ms: int = 300_000
     affinity_capacity: int = 10_000
     dispatch_timeout_ms: int = 5_000
@@ -24,6 +25,7 @@ class Stage6AConfig:
 
     def __post_init__(self) -> None:
         for name in (
+            "reconcile_interval_ms",
             "affinity_ttl_ms",
             "affinity_capacity",
             "dispatch_timeout_ms",
@@ -95,6 +97,7 @@ def create_stage6a_config_snapshot(
             "models": tuple(spec.canonical_payload() for spec in catalog.specs),
             "affinity_ttl_ms": config.affinity_ttl_ms,
             "affinity_capacity": config.affinity_capacity,
+            "reconcile_interval_ms": config.reconcile_interval_ms,
         },
     }
     return ConfigSnapshot.create(

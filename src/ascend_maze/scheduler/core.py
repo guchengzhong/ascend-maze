@@ -156,6 +156,13 @@ class _WakeCommand:
 @dataclass(frozen=True, slots=True)
 class _ResourceChanged:
     reason: str
+    model_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelRouteFailed:
+    lease: ModelRouteLease
+    reason: str
 
 
 class SchedulerRuntimeBackend(RuntimeBackend, Protocol):
@@ -259,6 +266,7 @@ class SchedulerCore:
         await self.runtime.start()
         if self.inference is not None:
             self.inference.set_capacity_sink(self.post_resource_changed)
+            self.inference.set_route_failure_sink(self.post_model_route_failure)
             await self.inference.start()
         self._running = True
         self._runner = asyncio.create_task(self._run_loop())
@@ -308,14 +316,36 @@ class SchedulerCore:
         await self._queue.put(_WakeCommand(future))
         await future
 
-    def post_resource_changed(self, reason: str) -> bool:
+    def post_resource_changed(
+        self,
+        reason: str,
+        model_id: str | None = None,
+    ) -> bool:
         """Wake queued placement after an authoritative cluster resource change."""
 
         if not reason:
             raise ValueError("resource change reason is required")
         if self._loop is None or not self._running:
             return False
-        event = _ResourceChanged(reason)
+        event = _ResourceChanged(reason, model_id)
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is self._loop:
+            self._queue.put_nowait(event)
+        else:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, event)
+        return True
+
+    def post_model_route_failure(
+        self,
+        lease: ModelRouteLease,
+        reason: str,
+    ) -> bool:
+        if not reason or self._loop is None or not self._running:
+            return False
+        event = _ModelRouteFailed(lease, reason)
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -431,17 +461,34 @@ class SchedulerCore:
             elif isinstance(item, _WakeCommand):
                 item.future.set_result(None)
             elif isinstance(item, _ResourceChanged):
-                for run_id in sorted({key.run_id for key in self._queued}):
+                if self.inference is not None:
+                    self.inference.replicas.wake()
+                affected_run_ids: set[str] = set()
+                for key in self._queued:
+                    anchor = self._runs[key.run_id].compiled.tasks[
+                        key.task_id
+                    ].model_anchor
+                    if item.model_id is None or (
+                        anchor is not None and anchor.model == item.model_id
+                    ):
+                        affected_run_ids.add(key.run_id)
+                for run_id in sorted(affected_run_ids):
                     self._record(
                         run_id,
                         "resource_changed",
-                        payload={"reason": item.reason},
+                        payload={
+                            "reason": item.reason,
+                            "model_id": item.model_id,
+                        },
                     )
+            elif isinstance(item, _ModelRouteFailed):
+                await self._handle_model_route_failure(item)
             elif isinstance(item, _ShutdownCommand):
                 await self._shutdown_active_runs()
                 if self.inference is not None:
                     await self.inference.close()
                     self.inference.set_capacity_sink(None)
+                    self.inference.set_route_failure_sink(None)
                 self._running = False
                 item.future.set_result(None)
             elif isinstance(item, RuntimeEvent):
@@ -934,6 +981,77 @@ class SchedulerCore:
                 expected_route_lease_id=event.route_lease_id,
                 record_inference=True,
             )
+
+    async def _handle_model_route_failure(self, event: _ModelRouteFailed) -> None:
+        lease = event.lease
+        if lease.run_id not in self._runs:
+            return
+        expected = self._attempt_routes.get(
+            (lease.run_id, lease.task_id, lease.attempt)
+        )
+        if expected is None or expected.route_lease_id != lease.route_lease_id:
+            return
+        task = self.state.snapshot(lease.run_id).task(lease.task_id)
+        attempt = next(
+            (
+                item
+                for item in task.attempts
+                if item.attempt == lease.attempt
+                and self.state.matches_active_attempt(
+                    run_id=lease.run_id,
+                    task_id=lease.task_id,
+                    attempt=item.attempt,
+                    dispatch_id=item.dispatch_id,
+                )
+            ),
+            None,
+        )
+        if attempt is None:
+            return
+        assert self.inference is not None
+        instance = self.inference.instances.snapshot(lease.instance_id)
+        self._record(
+            lease.run_id,
+            "model_instance_unhealthy",
+            task_id=lease.task_id,
+            attempt=lease.attempt,
+            route_lease_id=lease.route_lease_id,
+            model_instance_id=lease.instance_id,
+            payload={
+                "model_id": lease.model_id,
+                "instance_generation": lease.instance_generation,
+                "instance_placement_lease_id": instance.placement_lease_id,
+                "node_id": instance.node_id,
+                "npu_device_id": instance.npu_device_id,
+                "reason": event.reason,
+            },
+        )
+        await self._cancel_dispatch(attempt.dispatch_id, "model_instance_unhealthy")
+        error = self._error(
+            run_id=lease.run_id,
+            task_id=lease.task_id,
+            attempt=lease.attempt,
+            dispatch_id=attempt.dispatch_id,
+            lease_id=attempt.lease_id,
+            error_code="model_instance_failed",
+            category="model_service",
+            origin="inference",
+            phase="executing",
+            message=event.reason,
+            route_lease_id=lease.route_lease_id,
+            model_instance_id=lease.instance_id,
+        )
+        await self._handle_attempt_failure(
+            run_id=lease.run_id,
+            task_id=lease.task_id,
+            attempt=lease.attempt,
+            dispatch_id=attempt.dispatch_id,
+            lease_id=attempt.lease_id,
+            error=error,
+            attempt_status=AttemptStatus.FAILED,
+            dispatch_handle=self._dispatches.get(attempt.dispatch_id),
+            expected_route_lease_id=lease.route_lease_id,
+        )
 
     async def _worker_started(self, event: RuntimeEvent) -> None:
         if not self.state.matches_active_attempt(
@@ -1939,17 +2057,28 @@ class SchedulerCore:
             )
             return False
         for request in self.inference.request_records(route.route_lease_id):
+            attempt_snapshot = next(
+                item
+                for item in self.state.snapshot(request.run_id)
+                .task(request.task_id)
+                .attempts
+                if item.attempt == request.attempt
+            )
             self._record(
                 request.run_id,
                 "inference_request",
                 task_id=request.task_id,
                 attempt=request.attempt,
+                lease_id=attempt_snapshot.lease_id,
                 route_lease_id=request.route_lease_id,
                 model_instance_id=request.instance_id,
                 payload={
                     "call_index": request.call_index,
                     "model_id": request.model_id,
                     "instance_generation": request.instance_generation,
+                    "instance_placement_lease_id": (
+                        request.instance_placement_lease_id
+                    ),
                     "started_at_ms": request.started_at_ms,
                     "duration_ms": request.duration_ms,
                     "status": request.status,
@@ -1957,6 +2086,7 @@ class SchedulerCore:
                     "output_tokens": request.output_tokens,
                     "engine_queue_depth": request.engine_queue_depth,
                     "prefix_cache_hit": request.prefix_cache_hit,
+                    "ttft_ms": request.ttft_ms,
                     "error_code": request.error_code,
                 },
             )

@@ -413,6 +413,7 @@ class InferenceRequestRecord:
     model_id: str
     instance_id: str
     instance_generation: int
+    instance_placement_lease_id: str
     started_at_ms: int
     duration_ms: int
     status: str
@@ -420,6 +421,7 @@ class InferenceRequestRecord:
     output_tokens: int | None
     engine_queue_depth: int | None
     prefix_cache_hit: bool | None
+    ttft_ms: int | None
     error_code: str | None
 
     def __post_init__(self) -> None:
@@ -429,13 +431,19 @@ class InferenceRequestRecord:
             "task_id",
             "model_id",
             "instance_id",
+            "instance_placement_lease_id",
         ):
             _required_string(name, getattr(self, name))
         for name in ("call_index", "attempt", "instance_generation"):
             _positive_int(name, getattr(self, name))
         for name in ("started_at_ms", "duration_ms"):
             _non_negative_int(name, getattr(self, name))
-        for name in ("input_tokens", "output_tokens", "engine_queue_depth"):
+        for name in (
+            "input_tokens",
+            "output_tokens",
+            "engine_queue_depth",
+            "ttft_ms",
+        ):
             value = getattr(self, name)
             if value is not None:
                 _non_negative_int(name, value)
@@ -672,6 +680,22 @@ class InferenceEngineAdapter(Protocol):
     async def read_metrics(
         self, handle: ServiceHandle
     ) -> EngineMetrics: ...
+
+
+@runtime_checkable
+class PortLeaseManager(Protocol):
+    async def acquire(
+        self,
+        *,
+        node_id: str,
+        boot_id: str,
+        owner_instance_id: str,
+        generation: int,
+    ) -> PortLease: ...
+
+    async def release(self, lease: PortLease) -> bool: ...
+
+    def active_count(self) -> int: ...
 
 
 @runtime_checkable

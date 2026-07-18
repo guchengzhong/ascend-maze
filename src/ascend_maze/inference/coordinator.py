@@ -8,6 +8,7 @@ from threading import RLock
 from ascend_maze.compiler.ir import CompiledWorkflow
 from ascend_maze.contracts.runtime import ModelRouteLease
 from ascend_maze.core.clock import Clock, SystemClock
+from ascend_maze.core.canonical import FrozenMap, freeze_canonical
 from ascend_maze.inference.catalog import ModelCatalog
 from ascend_maze.inference.context import AttemptInferenceSession
 from ascend_maze.inference.contracts import (
@@ -15,8 +16,10 @@ from ascend_maze.inference.contracts import (
     InferenceRequestRecord,
     ModelControlEvent,
     ModelInstance,
+    ModelInstanceState,
     ModelRouteAcquireResult,
     ModelRouteLeaseSnapshot,
+    PortLeaseManager,
     ServiceProcessBackend,
 )
 from ascend_maze.inference.instance_manager import ModelInstanceManager
@@ -35,13 +38,18 @@ class InferenceCoordinator:
         clock: Clock | None = None,
         affinity_ttl_ms: int = 300_000,
         affinity_capacity: int = 10_000,
+        port_leases: PortLeaseManager | None = None,
+        reconcile_interval_ms: int = 100,
     ) -> None:
         self.catalog = catalog
         self.clock = clock or SystemClock()
         self._events: list[ModelControlEvent] = []
         self._request_records: dict[str, list[InferenceRequestRecord]] = {}
         self._sessions: dict[str, AttemptInferenceSession] = {}
-        self._capacity_sink: Callable[[str], object] | None = None
+        self._capacity_sink: Callable[[str, str | None], object] | None = None
+        self._route_failure_sink: (
+            Callable[[ModelRouteLease, str], object] | None
+        ) = None
         self._lock = RLock()
         self.instances = ModelInstanceManager(
             catalog=catalog,
@@ -49,6 +57,7 @@ class InferenceCoordinator:
             service_backend=service_backend,
             event_sink=self._record_event,
             clock=self.clock,
+            port_leases=port_leases,
         )
         self.router = InferenceRouter(
             instances=self.instances,
@@ -63,13 +72,109 @@ class InferenceCoordinator:
             router=self.router,
             event_sink=self._record_event,
             clock=self.clock,
+            reconcile_interval_ms=reconcile_interval_ms,
         )
 
     async def start(self) -> None:
-        await self.replicas.reconcile()
+        await self.replicas.start()
 
-    def set_capacity_sink(self, sink: Callable[[str], object] | None) -> None:
+    def set_capacity_sink(
+        self,
+        sink: Callable[[str, str | None], object] | None,
+    ) -> None:
         self._capacity_sink = sink
+
+    def set_route_failure_sink(
+        self,
+        sink: Callable[[ModelRouteLease, str], object] | None,
+    ) -> None:
+        self._route_failure_sink = sink
+
+    def report_instance_failure(
+        self,
+        instance_id: str,
+        generation: int,
+        *,
+        reason: str,
+    ) -> tuple[ModelRouteLease, ...]:
+        self.instances.mark_failed(
+            instance_id,
+            generation,
+            reason=reason,
+        )
+        affected = self.router.invalidate_instance(
+            instance_id,
+            generation,
+            reason=reason,
+        )
+        sink = self._route_failure_sink
+        if sink is not None:
+            for lease in affected:
+                sink(lease, reason)
+        self.replicas.wake()
+        self._notify_capacity("model_instance_unhealthy", instance_id=instance_id)
+        return affected
+
+    def report_process_exited(
+        self,
+        instance_id: str,
+        generation: int,
+        *,
+        reason: str,
+    ) -> tuple[ModelRouteLease, ...]:
+        instance = self.instances.snapshot(instance_id)
+        if instance.generation != generation:
+            raise RuntimeError("model process exit generation is stale")
+        payload = freeze_canonical(
+            {
+                "reason": reason,
+                "service_handle_id": instance.service_handle_id,
+                "placement_lease_id": instance.placement_lease_id,
+                "node_id": instance.node_id,
+                "boot_id": instance.boot_id,
+                "npu_device_id": instance.npu_device_id,
+            }
+        )
+        assert isinstance(payload, FrozenMap)
+        self._record_event(
+            ModelControlEvent(
+                event_type="model_process_exited",
+                occurred_at_ms=self.clock.monotonic_ms(),
+                model_id=instance.model_id,
+                instance_id=instance_id,
+                instance_generation=generation,
+                payload=payload,
+            )
+        )
+        return self.report_instance_failure(
+            instance_id,
+            generation,
+            reason=reason,
+        )
+
+    def report_node_generation_lost(
+        self,
+        node_id: str,
+        boot_id: str,
+        *,
+        reason: str = "node_generation_lost",
+    ) -> tuple[ModelRouteLease, ...]:
+        affected: list[ModelRouteLease] = []
+        for instance in self.model_instances():
+            if (
+                instance.node_id == node_id
+                and instance.boot_id == boot_id
+                and instance.state
+                not in {ModelInstanceState.STOPPING, ModelInstanceState.STOPPED}
+            ):
+                affected.extend(
+                    self.report_instance_failure(
+                        instance.instance_id,
+                        instance.generation,
+                        reason=reason,
+                    )
+                )
+        return tuple(affected)
 
     def validate_workflow(self, compiled: CompiledWorkflow) -> None:
         self.catalog.validate_workflow(compiled)
@@ -126,8 +231,31 @@ class InferenceCoordinator:
                 task_id=lease.task_id,
                 model_id=lease.model_id,
             )
-            await self.replicas.reconcile()
-            self._notify_capacity("model_route_released")
+            try:
+                await self.replicas.reconcile()
+            except Exception as exc:
+                payload = freeze_canonical(
+                    {
+                        "exception_type": type(exc).__name__,
+                        "message": str(exc),
+                    }
+                )
+                assert isinstance(payload, FrozenMap)
+                self._record_event(
+                    ModelControlEvent(
+                        event_type="model_reconcile_failed",
+                        occurred_at_ms=self.clock.monotonic_ms(),
+                        model_id=lease.model_id,
+                        instance_id=lease.instance_id,
+                        instance_generation=lease.instance_generation,
+                        route_lease_id=lease.route_lease_id,
+                        run_id=lease.run_id,
+                        task_id=lease.task_id,
+                        attempt=lease.attempt,
+                        payload=payload,
+                    )
+                )
+            self._notify_capacity("model_route_released", lease.model_id)
         return released
 
     def abandon_route(self, lease: ModelRouteLease, *, reason: str) -> bool:
@@ -144,10 +272,17 @@ class InferenceCoordinator:
             if existing is not None:
                 return existing
             adapter = self.catalog.adapter(lease.model_id)
+            instance = self.instances.snapshot(lease.instance_id)
+            if (
+                instance.generation != lease.instance_generation
+                or instance.placement_lease_id is None
+            ):
+                raise RuntimeError("ModelRouteLease instance resources are stale")
             session = AttemptInferenceSession(
                 lease=lease,
                 router=self.router,
                 adapter=adapter,
+                instance_placement_lease_id=instance.placement_lease_id,
                 record_sink=self._record_request,
                 clock=self.clock,
             )
@@ -187,7 +322,7 @@ class InferenceCoordinator:
         await self.replicas.reconcile()
 
     async def close(self) -> None:
-        await self.replicas.wait_for_background()
+        await self.replicas.close()
         if self.router.active_count() != 0:
             raise RuntimeError("cannot close C11 while RouteLeases are active")
         await self.instances.close()
@@ -219,15 +354,22 @@ class InferenceCoordinator:
         if event.event_type in {
             "model_instance_ready",
             "model_instance_stopped",
-            "model_resource_release_blocked",
         }:
-            self._notify_capacity(event.event_type)
+            self._notify_capacity(event.event_type, event.model_id)
 
     def _record_request(self, record: InferenceRequestRecord) -> None:
         with self._lock:
             self._request_records.setdefault(record.route_lease_id, []).append(record)
 
-    def _notify_capacity(self, reason: str) -> None:
+    def _notify_capacity(
+        self,
+        reason: str,
+        model_id: str | None = None,
+        *,
+        instance_id: str | None = None,
+    ) -> None:
+        if model_id is None and instance_id is not None:
+            model_id = self.instances.spec_for_instance(instance_id).model_id
         sink = self._capacity_sink
         if sink is not None:
-            sink(reason)
+            sink(reason, model_id)

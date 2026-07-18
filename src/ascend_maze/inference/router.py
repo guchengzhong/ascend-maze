@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from threading import RLock
+from time import perf_counter_ns
 from typing import Callable
 
 from ascend_maze.contracts.runtime import ModelRouteLease
@@ -30,6 +31,7 @@ class _RouteRecord:
     finished_at_ms: int | None = None
     finish_reason: str | None = None
     request_inflight: bool = False
+    invalidation_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +73,7 @@ class InferenceRouter:
         session_key_hash: str | None,
         dispatch_deadline_ms: int,
     ) -> ModelRouteAcquireResult:
+        started_ns = perf_counter_ns()
         if not run_id or not task_id or not model_id or attempt < 1:
             raise ContractValidationError("route Attempt identity is invalid")
         now = self.clock.monotonic_ms()
@@ -95,12 +98,18 @@ class InferenceRouter:
                     ModelRouteLeaseStatus.ACTIVE,
                 }:
                     return ModelRouteAcquireResult(existing.lease, None, False)
-                return ModelRouteAcquireResult(None, "attempt_route_already_terminal", False)
-            candidates = list(
-                self.instances.instances(
+                self._emit_rejection(
+                    run_id=run_id,
+                    task_id=task_id,
+                    attempt=attempt,
                     model_id=model_id,
-                    states=frozenset({ModelInstanceState.READY}),
+                    reason="attempt_route_already_terminal",
+                    started_ns=started_ns,
                 )
+                return ModelRouteAcquireResult(None, "attempt_route_already_terminal", False)
+            spec = self.instances.catalog.get(model_id)
+            candidates = list(
+                self.instances.ready_instances(model_id, spec.catalog_revision)
             )
             candidates = [
                 instance
@@ -110,6 +119,14 @@ class InferenceRouter:
                 < self.instances.spec_for_instance(instance.instance_id).request_capacity
             ]
             if not candidates:
+                self._emit_rejection(
+                    run_id=run_id,
+                    task_id=task_id,
+                    attempt=attempt,
+                    model_id=model_id,
+                    reason="model_route_unavailable",
+                    started_ns=started_ns,
+                )
                 return ModelRouteAcquireResult(None, "model_route_unavailable", False)
             affinity_hit = False
             selected = None
@@ -175,7 +192,19 @@ class InferenceRouter:
             self._affinity.move_to_end(affinity_hash)
             while len(self._affinity) > self.affinity_capacity:
                 self._affinity.popitem(last=False)
-            self._emit(lease, "model_route_reserved", {"affinity_hit": affinity_hit})
+            self._emit(
+                lease,
+                "model_route_reserved",
+                {
+                    "affinity_hit": affinity_hit,
+                    "acquire_duration_ms": (
+                        perf_counter_ns() - started_ns
+                    )
+                    // 1_000_000,
+                    "route_occupancy": selected.route_occupancy + 1,
+                    "request_capacity": spec.request_capacity,
+                },
+            )
             return ModelRouteAcquireResult(lease, None, affinity_hit)
 
     def activate(self, route_lease_id: str, *, now_ms: int | None = None) -> bool:
@@ -291,6 +320,13 @@ class InferenceRouter:
                 record.lease.instance_id, record.lease.instance_generation
             )
             record.request_inflight = False
+            if record.invalidation_reason is not None:
+                self._finish(
+                    record,
+                    ModelRouteLeaseStatus.INVALIDATED,
+                    self.clock.monotonic_ms(),
+                    record.invalidation_reason,
+                )
 
     def forget_instance_affinity(self, instance_id: str, generation: int) -> int:
         with self._lock:
@@ -303,6 +339,14 @@ class InferenceRouter:
             for key in keys:
                 del self._affinity[key]
             return len(keys)
+
+    def affinity_count(self, instance_id: str, generation: int) -> int:
+        with self._lock:
+            return sum(
+                entry.instance_id == instance_id
+                and entry.instance_generation == generation
+                for entry in self._affinity.values()
+            )
 
     def invalidate_instance(
         self, instance_id: str, generation: int, *, reason: str
@@ -318,14 +362,21 @@ class InferenceRouter:
                         ModelRouteLeaseStatus.RESERVED,
                         ModelRouteLeaseStatus.ACTIVE,
                     }
-                    and not record.request_inflight
                 ):
-                    self._finish(
-                        record,
-                        ModelRouteLeaseStatus.INVALIDATED,
-                        self.clock.monotonic_ms(),
-                        reason,
-                    )
+                    if record.request_inflight:
+                        record.invalidation_reason = reason
+                        self._emit(
+                            record.lease,
+                            "model_route_invalidation_pending",
+                            {"reason": reason},
+                        )
+                    else:
+                        self._finish(
+                            record,
+                            ModelRouteLeaseStatus.INVALIDATED,
+                            self.clock.monotonic_ms(),
+                            reason,
+                        )
                     invalidated.append(record.lease)
             for key, entry in tuple(self._affinity.items()):
                 if (
@@ -460,6 +511,38 @@ class InferenceRouter:
                 task_id=lease.task_id,
                 attempt=lease.attempt,
                 payload=self._event_payload(payload),
+            )
+        )
+
+    def _emit_rejection(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        attempt: int,
+        model_id: str,
+        reason: str,
+        started_ns: int,
+    ) -> None:
+        if self.event_sink is None:
+            return
+        self.event_sink(
+            ModelControlEvent(
+                event_type="model_route_rejected",
+                occurred_at_ms=self.clock.monotonic_ms(),
+                model_id=model_id,
+                run_id=run_id,
+                task_id=task_id,
+                attempt=attempt,
+                payload=self._event_payload(
+                    {
+                        "reason": reason,
+                        "acquire_duration_ms": (
+                            perf_counter_ns() - started_ns
+                        )
+                        // 1_000_000,
+                    }
+                ),
             )
         )
 

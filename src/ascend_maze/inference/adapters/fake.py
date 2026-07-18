@@ -33,13 +33,16 @@ class FakeAdapterPlan:
     warmup_delay_ms: int = 0
     invoke_delay_ms: int = 0
     stop_delay_ms: int = 0
+    fail_build_launch: str | None = None
     fail_launch: str | None = None
+    fail_attach: str | None = None
     fail_probe: str | None = None
     fail_warmup: str | None = None
     fail_invoke: str | None = None
     process_hbm_mb: int | None = None
     wrong_model_id: str | None = None
     wrong_device_id: str | None = None
+    wrong_service_handle_field: str | None = None
     stop_process_exited: bool = True
     stop_port_released: bool = True
     stop_hbm_recovered: bool = True
@@ -55,6 +58,16 @@ class FakeAdapterPlan:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ContractValidationError(f"{name} must be non-negative")
+        if self.wrong_service_handle_field not in {
+            None,
+            "instance_id",
+            "generation",
+            "endpoint_id",
+            "node_id",
+            "boot_id",
+            "npu_device_id",
+        }:
+            raise ContractValidationError("unsupported ServiceHandle fault field")
 
 
 class FakeInferenceEngineAdapter:
@@ -95,6 +108,9 @@ class FakeInferenceEngineAdapter:
         lease: PlacementLease,
         port_lease: PortLease,
     ) -> ServiceLaunchRequest:
+        plan = self._plan(spec.model_id)
+        if plan.fail_build_launch is not None:
+            raise RuntimeError(plan.fail_build_launch)
         if lease.npu_device_id is None:
             raise ContractValidationError("model instance lease requires a physical NPU")
         return ServiceLaunchRequest(
@@ -119,14 +135,29 @@ class FakeInferenceEngineAdapter:
             raise RuntimeError(plan.fail_launch)
         with self._lock:
             self._next_pid += 1
+            wrong = plan.wrong_service_handle_field
             handle = ServiceHandle(
                 service_handle_id=new_id("service"),
-                instance_id=request.instance_id,
-                generation=request.generation,
-                endpoint_id=request.endpoint_id,
-                node_id=lease.node_id,
-                boot_id=lease.boot_id,
-                npu_device_id=lease.npu_device_id or "",
+                instance_id=(
+                    "wrong_instance" if wrong == "instance_id" else request.instance_id
+                ),
+                generation=(
+                    request.generation + 1
+                    if wrong == "generation"
+                    else request.generation
+                ),
+                endpoint_id=(
+                    f"{request.endpoint_id}/wrong"
+                    if wrong == "endpoint_id"
+                    else request.endpoint_id
+                ),
+                node_id="wrong_node" if wrong == "node_id" else lease.node_id,
+                boot_id="wrong_boot" if wrong == "boot_id" else lease.boot_id,
+                npu_device_id=(
+                    "wrong_device"
+                    if wrong == "npu_device_id"
+                    else lease.npu_device_id or ""
+                ),
                 process_id=self._next_pid,
             )
             self._handles[handle.service_handle_id] = handle
@@ -134,6 +165,9 @@ class FakeInferenceEngineAdapter:
             return handle
 
     def attach_spec(self, handle: ServiceHandle, spec: ModelSpec) -> None:
+        plan = self._plan(spec.model_id)
+        if plan.fail_attach is not None:
+            raise RuntimeError(plan.fail_attach)
         with self._lock:
             self._specs_by_endpoint[handle.endpoint_id] = spec
             self._inflight_by_endpoint.setdefault(handle.endpoint_id, 0)
@@ -235,6 +269,32 @@ class FakeInferenceEngineAdapter:
                 self._inflight_by_endpoint.pop(handle.endpoint_id, None)
                 self._stop_count += 1
         return result
+
+    def crash_instance(self, instance_id: str, generation: int) -> ServiceHandle:
+        with self._lock:
+            handle = next(
+                (
+                    item
+                    for item in self._handles.values()
+                    if item.instance_id == instance_id
+                    and item.generation == generation
+                ),
+                None,
+            )
+            if handle is None:
+                raise KeyError("fake service instance is not running")
+            del self._handles[handle.service_handle_id]
+            self._specs_by_endpoint.pop(handle.endpoint_id, None)
+            self._inflight_by_endpoint.pop(handle.endpoint_id, None)
+            return handle
+
+    def is_process_alive(self, instance_id: str, generation: int) -> bool:
+        with self._lock:
+            return any(
+                handle.instance_id == instance_id
+                and handle.generation == generation
+                for handle in self._handles.values()
+            )
 
     @property
     def launch_count(self) -> int:
