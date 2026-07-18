@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-import importlib
 from threading import RLock
 from typing import Callable
 
-from ascend_maze.compiler.analyzer import analyse_callable
 from ascend_maze.contracts.errors import ErrorInfo
 from ascend_maze.contracts.resources import PlacementLease
 from ascend_maze.contracts.runtime import (
@@ -22,7 +20,10 @@ from ascend_maze.core.identifiers import stable_id
 from ascend_maze.core.time import monotonic_time_ms
 from ascend_maze.data.in_memory import InMemoryDataStore
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
-from ascend_maze.runtime.serialization import deserialize_callable
+from ascend_maze.runtime.code_loader import (
+    load_code_package,
+    validate_loaded_callable,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +269,11 @@ class FakeRuntimeBackend:
         record = self._dispatches.get(dispatch_id)
         return record is None or record.terminal
 
-    def release_run(self, run_id: str) -> int:
+    def producer_for_lease(self, lease: PlacementLease) -> str | None:
+        del lease
+        return None
+
+    async def release_run(self, run_id: str) -> int:
         self._retired_runs.add(run_id)
         dispatch_ids = [
             dispatch_id
@@ -473,31 +478,11 @@ class FakeRuntimeBackend:
         cls,
         package: CodePackage,
     ) -> Callable[..., object]:
-        if "<locals>" not in package.qualname:
-            try:
-                module = importlib.import_module(package.module)
-                value: object = module
-                for part in package.qualname.split("."):
-                    value = getattr(value, part)
-                if callable(value):
-                    cls._validate_callable(value, package)
-                    return value
-            except (ImportError, AttributeError, ContractValidationError):
-                pass
-        if package.serialized_fallback is None:
-            raise ContractValidationError(
-                "callable is not importable and CodePackage has no fallback"
-            )
-        value = deserialize_callable(package.serialized_fallback)
-        if not callable(value):
-            raise ContractValidationError("serialized fallback is not callable")
-        return value
+        return load_code_package(package)
 
     @staticmethod
     def _validate_callable(
         func: Callable[..., object],
         package: CodePackage,
     ) -> None:
-        analysis = analyse_callable(func)
-        if analysis.code_hash != package.code_hash:
-            raise ContractValidationError("loaded callable code hash mismatch")
+        validate_loaded_callable(func, package)

@@ -233,6 +233,36 @@ class DispatchHandle:
             raise ContractValidationError("attempt must be a positive integer")
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeNodeBinding:
+    node_id: str
+    boot_id: str
+    ray_node_id: str
+    runtime_generation: int
+    agent_generation: str
+    agent_endpoint: str
+    producer_id: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "node_id",
+            "boot_id",
+            "ray_node_id",
+            "agent_generation",
+            "agent_endpoint",
+            "producer_id",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ContractValidationError(f"{name} is required")
+        if (
+            isinstance(self.runtime_generation, bool)
+            or not isinstance(self.runtime_generation, int)
+            or self.runtime_generation < 1
+        ):
+            raise ContractValidationError("runtime_generation must be positive")
+
+
 @runtime_checkable
 class RuntimeBackend(Protocol):
     async def start(self) -> None: ...

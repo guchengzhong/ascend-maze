@@ -50,8 +50,16 @@ def test_public_import_does_not_load_runtime_heavy_dependencies() -> None:
 
 def test_common_modules_do_not_import_runtime_heavy_dependencies() -> None:
     forbidden = {"ray", "torch_npu", "vllm"}
+    allowed_ray_modules = {
+        "src/ascend_maze/data/ray_store.py",
+        "src/ascend_maze/runtime/ray_backend.py",
+        "src/ascend_maze/runtime/ray_cluster.py",
+        "src/ascend_maze/runtime/ray_node_registry.py",
+        "src/ascend_maze/runtime/ray_worker.py",
+    }
     violations: list[tuple[str, str]] = []
     for path in (ROOT / "src" / "ascend_maze").rglob("*.py"):
+        relative_path = str(path.relative_to(ROOT))
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -61,6 +69,8 @@ def test_common_modules_do_not_import_runtime_heavy_dependencies() -> None:
             else:
                 continue
             for name in names:
-                if name in forbidden:
-                    violations.append((str(path.relative_to(ROOT)), name))
+                if name in forbidden and not (
+                    name == "ray" and relative_path in allowed_ray_modules
+                ):
+                    violations.append((relative_path, name))
     assert violations == []

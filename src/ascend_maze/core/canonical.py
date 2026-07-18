@@ -58,6 +58,9 @@ class FrozenMap(Mapping[K, V], Generic[K, V]):
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("FrozenMap is immutable")
 
+    def __reduce__(self) -> tuple[object, tuple[tuple[tuple[K, V], ...]]]:
+        return (type(self), (self._items,))
+
     def items_tuple(self) -> tuple[tuple[K, V], ...]:
         return self._items
 

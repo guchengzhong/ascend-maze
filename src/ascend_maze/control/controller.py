@@ -7,8 +7,8 @@ from dataclasses import dataclass
 import hashlib
 
 from ascend_maze.compiler.ir import CompiledWorkflow
-from ascend_maze.contracts.data import DataHandle
-from ascend_maze.contracts.recording import RunRecordingContext
+from ascend_maze.contracts.data import DataHandle, DataStore
+from ascend_maze.contracts.recording import ExecutionRecorder, RunRecordingContext
 from ascend_maze.contracts.runtime import CodePackage
 from ascend_maze.contracts.runtime import CodeHandle
 from ascend_maze.contracts.submission import (
@@ -32,6 +32,7 @@ from ascend_maze.scheduler import (
     HeterogeneousPartitioner,
     SchedulerCore,
 )
+from ascend_maze.scheduler.core import SchedulerRuntimeBackend
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,13 +76,16 @@ class InMemoryController:
         node_capacities: tuple[NodeCapacity, ...],
         controller_generation: str | None = None,
         clock: Clock | None = None,
+        data_store: DataStore | None = None,
+        recorder: ExecutionRecorder | None = None,
+        runtime: SchedulerRuntimeBackend | None = None,
     ) -> None:
         self.config_fingerprint = config_fingerprint
         self.environment_fingerprint = environment_fingerprint
         self.build_revision = build_revision
         self.controller_generation = controller_generation or new_id("controller")
         self.clock = clock or SystemClock()
-        self.data_store = InMemoryDataStore()
+        self.data_store: DataStore = data_store or InMemoryDataStore()
         self.indexes = RunDataIndexRegistry(
             controller_generation=self.controller_generation,
             data_store=self.data_store,
@@ -94,12 +98,16 @@ class InMemoryController:
         self.placement = PlacementManager()
         for capacity in node_capacities:
             self.placement.register_node(capacity)
-        self.recorder = InMemoryRecorder()
-        self.runtime = FakeRuntimeBackend(
-            data_store=self.data_store,
-            owner_generation=self.controller_generation,
-            environment_fingerprint=environment_fingerprint,
-        )
+        self.recorder: ExecutionRecorder = recorder or InMemoryRecorder()
+        if runtime is None:
+            if not isinstance(self.data_store, InMemoryDataStore):
+                raise TypeError("default FakeRuntime requires InMemoryDataStore")
+            runtime = FakeRuntimeBackend(
+                data_store=self.data_store,
+                owner_generation=self.controller_generation,
+                environment_fingerprint=environment_fingerprint,
+            )
+        self.runtime: SchedulerRuntimeBackend = runtime
         self.core = SchedulerCore(
             state=self.state,
             deadlines=self.deadlines,

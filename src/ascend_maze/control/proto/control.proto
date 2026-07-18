@@ -1,0 +1,172 @@
+syntax = "proto3";
+
+package ascend_maze.control.v1;
+
+message AgentMeta {
+  uint32 schema_version = 1;
+  string cluster_id = 2;
+  string node_id = 3;
+  string boot_id = 4;
+  string agent_generation = 5;
+  uint64 sequence = 6;
+  string message_id = 7;
+  int64 sent_at_ms = 8;
+}
+
+message DataHandleMessage {
+  string owner_generation = 1;
+  string staged_handle_id = 2;
+  string stable_digest = 3;
+  bool has_stable_digest = 4;
+  int64 size_bytes = 5;
+  bool has_size_bytes = 6;
+  string backend = 7;
+  string source_node_id = 8;
+  string source_boot_id = 9;
+  uint64 source_runtime_generation = 10;
+}
+
+message NamedDataHandle {
+  string name = 1;
+  DataHandleMessage handle = 2;
+}
+
+message ErrorMessage {
+  uint32 schema_version = 1;
+  string error_code = 2;
+  string category = 3;
+  string origin = 4;
+  string message = 5;
+  bool retryable_hint = 6;
+  string classification_confidence = 7;
+  string execution_phase = 8;
+  string run_id = 9;
+  string task_id = 10;
+  uint32 attempt = 11;
+  string dispatch_id = 12;
+  string lease_id = 13;
+  string route_lease_id = 14;
+  string node_id = 15;
+  string boot_id = 16;
+  string worker_id = 17;
+  string exception_type = 18;
+  int64 occurred_at_ms = 19;
+}
+
+message RuntimeEventMessage {
+  string event_id = 1;
+  string kind = 2;
+  string dispatch_id = 3;
+  string run_id = 4;
+  string task_id = 5;
+  uint32 attempt = 6;
+  string lease_id = 7;
+  string route_lease_id = 8;
+  int64 occurred_at_ms = 9;
+  repeated NamedDataHandle output_handles = 10;
+  ErrorMessage error = 11;
+  bool has_error = 12;
+}
+
+message RegisterNode {
+  AgentMeta meta = 1;
+  string ray_node_id = 2;
+  string agent_endpoint = 3;
+  string producer_id = 4;
+  string environment_fingerprint = 5;
+  bytes authorization_token = 6;
+}
+
+message NodeHeartbeat {
+  AgentMeta meta = 1;
+}
+
+message NodeRuntimeEvent {
+  AgentMeta meta = 1;
+  RuntimeEventMessage event = 2;
+  uint64 producer_sequence = 3;
+}
+
+message AgentStreamMessage {
+  oneof body {
+    RegisterNode register = 1;
+    NodeHeartbeat heartbeat = 2;
+    NodeRuntimeEvent runtime_event = 3;
+  }
+}
+
+message RegistrationAccepted {
+  string request_id = 1;
+  string controller_generation = 2;
+  uint64 runtime_generation = 3;
+  string status_code = 4;
+  string message = 5;
+}
+
+message NodeMessageAck {
+  string message_id = 1;
+  string controller_generation = 2;
+  string status_code = 3;
+  string message = 4;
+}
+
+message NodeCommand {
+  string request_id = 1;
+  string command = 2;
+  uint64 target_runtime_generation = 3;
+  int64 deadline_ms = 4;
+}
+
+message ControllerStreamMessage {
+  oneof body {
+    RegistrationAccepted registration = 1;
+    NodeMessageAck ack = 2;
+    NodeCommand command = 3;
+  }
+}
+
+message WorkerEventRequest {
+  uint32 schema_version = 1;
+  string cluster_id = 2;
+  string node_id = 3;
+  string boot_id = 4;
+  string agent_generation = 5;
+  RuntimeEventMessage event = 6;
+}
+
+message WorkerEventAck {
+  string event_id = 1;
+  bool accepted = 2;
+  string error_code = 3;
+  string message = 4;
+}
+
+message GetControllerStatusRequest {
+  uint32 schema_version = 1;
+  string request_id = 2;
+  string client_version = 3;
+  int64 deadline_ms = 4;
+}
+
+message GetControllerStatusResponse {
+  string request_id = 1;
+  string controller_generation = 2;
+  string status_code = 3;
+  string message = 4;
+  string build_revision = 5;
+  string environment_fingerprint = 6;
+  uint64 healthy_node_count = 7;
+}
+
+service NodeControl {
+  rpc Connect(stream AgentStreamMessage) returns (stream ControllerStreamMessage);
+}
+
+service WorkerEventSink {
+  rpc Report(WorkerEventRequest) returns (WorkerEventAck);
+}
+
+service LocalControl {
+  rpc GetControllerStatus(GetControllerStatusRequest)
+      returns (GetControllerStatusResponse);
+}

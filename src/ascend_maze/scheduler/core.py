@@ -1,10 +1,11 @@
-"""Serial C3-C9 coordination for the stage-two FakeRuntime closure."""
+"""Serial C3-C9 coordination shared by Fake and distributed runtimes."""
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Protocol
 
 from ascend_maze.compiler.ir import (
     CompiledWorkflow,
@@ -16,12 +17,18 @@ from ascend_maze.compiler.ir import (
 )
 from ascend_maze.contracts.data import DataHandle
 from ascend_maze.contracts.errors import ErrorInfo
-from ascend_maze.contracts.recording import ExecutionEvent, FlushResult
+from ascend_maze.contracts.recording import (
+    ExecutionEvent,
+    ExecutionRecorder,
+    FlushResult,
+)
+from ascend_maze.contracts.resources import PlacementLease
 from ascend_maze.contracts.runtime import (
     CodeHandle,
     DispatchHandle,
     ExecutionRequest,
     RuntimeArgument,
+    RuntimeBackend,
 )
 from ascend_maze.core.clock import Clock, SystemClock
 from ascend_maze.core.canonical import FrozenMap, freeze_canonical
@@ -47,10 +54,8 @@ from ascend_maze.lifecycle.state import (
     TaskStatus,
 )
 from ascend_maze.placement.manager import LeaseStatus, PlacementManager
-from ascend_maze.recording.in_memory import InMemoryRecorder, NoopRecorder
 from ascend_maze.resources.anchors import DeclaredOnlyAnchorProvider
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
-from ascend_maze.runtime.fake import FakeRuntimeBackend
 from ascend_maze.scheduler.contracts import (
     QueueToken,
     SchedulableTaskView,
@@ -126,6 +131,20 @@ class _WakeCommand:
     future: asyncio.Future[None]
 
 
+class SchedulerRuntimeBackend(RuntimeBackend, Protocol):
+    environment_fingerprint: str
+
+    def set_event_sink(self, sink: Callable[[RuntimeEvent], None]) -> None: ...
+
+    def dispatch_invalidated(self, dispatch_id: str) -> bool: ...
+
+    def worker_released(self, dispatch_id: str) -> bool: ...
+
+    def producer_for_lease(self, lease: PlacementLease) -> str | None: ...
+
+    async def release_run(self, run_id: str) -> int: ...
+
+
 class SchedulerCore:
     """One event-loop authority for lifecycle, deadlines, queues and leases."""
 
@@ -137,8 +156,8 @@ class SchedulerCore:
         indexes: RunDataIndexRegistry,
         anchors: DeclaredOnlyAnchorProvider,
         placement: PlacementManager,
-        runtime: FakeRuntimeBackend,
-        recorder: InMemoryRecorder | NoopRecorder,
+        runtime: SchedulerRuntimeBackend,
+        recorder: ExecutionRecorder,
         policy: SchedulingPolicy,
         partitioner: HeterogeneousPartitioner,
         clock: Clock | None = None,
@@ -320,7 +339,7 @@ class SchedulerCore:
     async def _process_item(self, item: object) -> None:
         try:
             if isinstance(item, _CommitCommand):
-                commit_result = self._commit(item)
+                commit_result = await self._commit(item)
                 item.future.set_result(commit_result)
                 self._activate_run(item.run_id)
             elif isinstance(item, _CancelCommand):
@@ -350,7 +369,7 @@ class SchedulerCore:
             else:
                 raise
 
-    def _commit(self, command: _CommitCommand) -> RunDataIndexRef:
+    async def _commit(self, command: _CommitCommand) -> RunDataIndexRef:
         if command.run_id in self._runs:
             raise RuntimeError(f"run already committed: {command.run_id}")
         self.state.create_run(
@@ -361,7 +380,8 @@ class SchedulerCore:
             deadline_at_ms=command.deadline_at_ms,
         )
         try:
-            index = self.indexes.create_and_adopt(
+            index = await asyncio.to_thread(
+                self.indexes.create_and_adopt,
                 run_id=command.run_id,
                 workflow_inputs=command.workflow_inputs,
             )
@@ -471,6 +491,7 @@ class SchedulerCore:
                         )
                         continue
                     assert placement.lease is not None
+                    self._expect_runtime_producer(key.run_id, placement.lease)
                     dispatch_id = new_id("dispatch")
                     attempt = self.state.create_attempt(
                         run_id=key.run_id,
@@ -606,7 +627,7 @@ class SchedulerCore:
             return
         self._seen_runtime_events[event.event_id] = event.run_id
         if event.run_id not in self._runs:
-            self._release_event_outputs(event)
+            await self._release_event_outputs(event)
             return
         if event.kind is RuntimeEventKind.WORKER_STARTED:
             await self._worker_started(event)
@@ -688,7 +709,7 @@ class SchedulerCore:
             dispatch_id=event.dispatch_id,
         ):
             if not self._matches_published_result(event):
-                self._release_event_outputs(event)
+                await self._release_event_outputs(event)
             self._release_event_lease(event, "late_result")
             return
         execution = self._runs[event.run_id]
@@ -696,7 +717,8 @@ class SchedulerCore:
         output_handles = dict(event.output_handles)
         try:
             index = self.indexes.get(event.run_id)
-            index.publish_outputs(
+            await asyncio.to_thread(
+                index.publish_outputs,
                 task_id=event.task_id,
                 output_handles=output_handles,
                 expected_output_names=definition.output_names,
@@ -704,7 +726,7 @@ class SchedulerCore:
                 index_generation=execution.index_ref.index_generation,
             )
         except Exception as exc:
-            self._release_event_outputs(event)
+            await self._release_event_outputs(event)
             error = self._error(
                 run_id=event.run_id,
                 task_id=event.task_id,
@@ -756,7 +778,7 @@ class SchedulerCore:
             now_ms=self.clock.monotonic_ms(),
         )
         if not result.accepted:
-            self._release_event_outputs(event)
+            await self._release_event_outputs(event)
             return
         self._record(
             event.run_id,
@@ -1083,7 +1105,8 @@ class SchedulerCore:
             raise RuntimeError("recording is incomplete; force is required")
         if self.placement.active_lease_count(run_id) != 0:
             raise RuntimeError("run still owns placement leases")
-        tombstone = self.indexes.destroy(
+        tombstone = await asyncio.to_thread(
+            self.indexes.destroy,
             run_id,
             completed_at_ms=self.clock.monotonic_ms(),
         )
@@ -1093,7 +1116,7 @@ class SchedulerCore:
         await self.runtime.release_code(execution.code_handles)
         execution.code_handles = ()
         execution.code_by_definition.clear()
-        self.runtime.release_run(run_id)
+        await self.runtime.release_run(run_id)
         dispatch_ids = [
             dispatch_id
             for dispatch_id, record in self._dispatches.items()
@@ -1193,12 +1216,15 @@ class SchedulerCore:
             dispatch_handle=self._dispatches.get(dispatch_id),
         )
 
-    def _release_event_outputs(self, event: RuntimeEvent) -> None:
-        for _, handle in event.output_handles:
-            try:
-                self.indexes.data_store.release(handle)
-            except Exception:
-                pass
+    async def _release_event_outputs(self, event: RuntimeEvent) -> None:
+        def release() -> None:
+            for _, handle in event.output_handles:
+                try:
+                    self.indexes.data_store.release(handle)
+                except Exception:
+                    pass
+
+        await asyncio.to_thread(release)
 
     def _release_event_lease(self, event: RuntimeEvent, reason: str) -> bool:
         return self._release_attempt_lease(
@@ -1249,7 +1275,7 @@ class SchedulerCore:
         event: RuntimeEvent,
         exc: Exception,
     ) -> None:
-        self._release_event_outputs(event)
+        await self._release_event_outputs(event)
         if not self.state.matches_active_attempt(
             run_id=event.run_id,
             task_id=event.task_id,
@@ -1284,6 +1310,21 @@ class SchedulerCore:
         execution = self._runs[run_id]
         definition_id = execution.compiled.tasks[task_id].definition_id
         return execution.compiled.definitions[definition_id]
+
+    def _expect_runtime_producer(self, run_id: str, lease: PlacementLease) -> None:
+        producer_id = self.runtime.producer_for_lease(lease)
+        if producer_id is None:
+            return
+        try:
+            self.recorder.expect_producer(run_id, producer_id)
+        except Exception as exc:
+            try:
+                self.recorder.record_writer_error(
+                    run_id,
+                    f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
 
     def _record(
         self,

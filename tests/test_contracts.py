@@ -198,6 +198,12 @@ def test_protocols_are_runtime_checkable() -> None:
         def release(self, handle):
             return None
 
+        def release_many(self, handles):
+            return None
+
+        def state_of(self, handle):
+            return "staged"
+
     class Sink:
         def emit(self, event):
             return True

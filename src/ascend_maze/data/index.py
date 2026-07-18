@@ -7,9 +7,8 @@ from enum import Enum
 from threading import Condition, RLock
 from typing import Mapping
 
-from ascend_maze.contracts.data import DataHandle, DataOwner
+from ascend_maze.contracts.data import DataHandle, DataOwner, DataStore
 from ascend_maze.core.errors import RunDataIndexError
-from ascend_maze.data.in_memory import InMemoryDataStore
 
 
 class RunDataState(str, Enum):
@@ -43,7 +42,7 @@ class RunDataIndex:
         self,
         *,
         reference: RunDataIndexRef,
-        data_store: InMemoryDataStore,
+        data_store: DataStore,
         workflow_inputs: Mapping[str, DataHandle],
     ) -> None:
         self.reference = reference
@@ -254,7 +253,7 @@ class RunDataIndexRegistry:
         self,
         *,
         controller_generation: str,
-        data_store: InMemoryDataStore,
+        data_store: DataStore,
     ) -> None:
         if not controller_generation:
             raise ValueError("controller_generation is required")

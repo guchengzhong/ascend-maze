@@ -31,11 +31,15 @@ test = [
     "pytest>=8.3,<9",
 ]
 dev = [
+    "grpcio-tools==1.82.1",
     "mypy>=1.14,<2",
     "pytest>=8.3,<9",
     "ruff>=0.9,<1",
 ]
 ray-host = [
+    "cloudpickle==3.1.2",
+    "grpcio>=1.82.1,<2",
+    "protobuf>=7.35,<8",
     "ray[default]==2.55.1",
 ]
 
@@ -47,7 +51,7 @@ where = ["src"]
 include = ["ascend_maze*"]
 
 [tool.setuptools.package-data]
-ascend_maze = ["py.typed"]
+ascend_maze = ["py.typed", "control/proto/*.proto"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
@@ -59,5 +63,20 @@ check_untyped_defs = true
 disallow_untyped_defs = true
 files = ["src/ascend_maze"]
 
+[[tool.mypy.overrides]]
+module = ["ray", "ray.*", "grpc", "grpc.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "ascend_maze.control.proto.control_pb2",
+    "ascend_maze.control.proto.control_pb2_grpc",
+]
+ignore_errors = true
+
 [tool.ruff]
 target-version = "py310"
+extend-exclude = [
+    "src/ascend_maze/control/proto/control_pb2.py",
+    "src/ascend_maze/control/proto/control_pb2_grpc.py",
+]

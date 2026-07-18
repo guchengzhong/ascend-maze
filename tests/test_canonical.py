@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import pickle
 
 import pytest
 
@@ -54,6 +55,15 @@ def test_freezing_does_not_trust_a_prebuilt_frozen_map() -> None:
     frozen = freeze_canonical(unsafe)
     nested.append(3)
     assert frozen["nested"] == (1, 2)
+
+
+def test_frozen_map_round_trips_through_pickle_without_losing_immutability() -> None:
+    original = freeze_canonical({"nested": ["value"], "count": 2})
+    restored = pickle.loads(pickle.dumps(original))
+    assert restored == original
+    assert isinstance(restored, FrozenMap)
+    with pytest.raises(AttributeError, match="immutable"):
+        restored._items = ()
 
 
 def test_custom_non_finite_and_recursive_values_are_rejected() -> None:
