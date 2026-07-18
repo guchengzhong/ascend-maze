@@ -51,7 +51,7 @@ class _RunState:
     context: RunRecordingContext
     expected_producers: set[str]
     seen_producers: set[str] = field(default_factory=set)
-    event_ids: set[str] = field(default_factory=set)
+    events_by_id: dict[str, ExecutionEvent] = field(default_factory=dict)
     dropped_control: int = 0
     dropped_telemetry: int = 0
     sequence_gaps: int = 0
@@ -64,6 +64,7 @@ class _RunState:
     committed_files: list[str] = field(default_factory=list)
     producer_flushes: dict[str, FlushResult] = field(default_factory=dict)
     shard_sequences: dict[tuple[str, str, str], int] = field(default_factory=dict)
+    flush_in_progress: bool = False
     flushed: FlushResult | None = None
 
 
@@ -89,6 +90,7 @@ class ParquetRecorder:
         )
         self._runs: dict[str, _RunState] = {}
         self._aborted_runs: set[str] = set()
+        self._event_owners: dict[str, str] = {}
         self._last_sequence: dict[str, int] = {}
         self._closed = False
         self._fail_next_write = False
@@ -111,6 +113,8 @@ class ParquetRecorder:
         with self._lock:
             if self._closed:
                 raise RuntimeError("recorder is closed")
+            if context.run_id in self._aborted_runs:
+                raise RuntimeError("run recording was aborted")
             existing = self._runs.get(context.run_id)
             if existing is not None:
                 if existing.context != context:
@@ -129,19 +133,20 @@ class ParquetRecorder:
             if state is None:
                 self._aborted_runs.add(run_id)
                 return False
+            if state.flushed is not None:
+                raise RuntimeError("cannot abort a flushed recording")
             state.accepting = False
             state.aborted = True
             self._aborted_runs.add(run_id)
             files = tuple(state.committed_files)
+            self._retire_aborted_run_if_idle(run_id, state)
+            self._condition.notify_all()
         for path in files:
-            try:
-                Path(path).unlink()
-            except FileNotFoundError:
-                pass
+            self._discard_committed_file(Path(path))
         return True
 
     def expect_producer(self, run_id: str, producer_id: str) -> None:
-        if not producer_id:
+        if not isinstance(producer_id, str) or not producer_id:
             raise ContractValidationError("producer_id is required")
         with self._lock:
             state = self._require_run(run_id)
@@ -162,9 +167,25 @@ class ParquetRecorder:
         )
         with self._condition:
             state = self._runs.get(event.run_id)
-            if state is None or not state.accepting or state.flushed is not None:
+            if (
+                self._closed
+                or state is None
+                or not state.accepting
+                or state.flushed is not None
+            ):
                 return False
-            if event.event_id in state.event_ids:
+            if event.experiment_id != state.context.experiment_id:
+                raise ContractValidationError(
+                    "event experiment_id does not match RunRecordingContext"
+                )
+            if event.producer_id not in state.expected_producers:
+                raise ContractValidationError("event producer is not expected for run")
+            owner = self._event_owners.get(event.event_id)
+            if owner is not None:
+                existing_state = self._runs[owner]
+                existing = existing_state.events_by_id[event.event_id]
+                if existing != event:
+                    raise ContractValidationError("event_id identifies conflicting events")
                 return True
             previous = self._last_sequence.get(event.producer_id)
             if previous is not None and event.producer_sequence != previous + 1:
@@ -179,7 +200,8 @@ class ParquetRecorder:
                 return False
             self._last_sequence[event.producer_id] = event.producer_sequence
             state.seen_producers.add(event.producer_id)
-            state.event_ids.add(event.event_id)
+            state.events_by_id[event.event_id] = event
+            self._event_owners[event.event_id] = event.run_id
             state.pending_events += 1
             self._condition.notify_all()
             return True
@@ -198,7 +220,7 @@ class ParquetRecorder:
         producer_id: str,
         result: FlushResult,
     ) -> None:
-        if not producer_id:
+        if not isinstance(producer_id, str) or not producer_id:
             raise ContractValidationError("producer_id is required")
         if result.run_id != run_id:
             raise ContractValidationError("producer FlushResult run_id mismatch")
@@ -206,6 +228,21 @@ class ParquetRecorder:
             state = self._require_run(run_id)
             if state.flushed is not None:
                 raise RuntimeError("run recording is already flushed")
+            if state.aborted or not state.accepting:
+                raise RuntimeError("run recording no longer accepts producer flushes")
+            if producer_id not in state.expected_producers:
+                raise ContractValidationError("producer FlushResult is not expected for run")
+            existing = state.producer_flushes.get(producer_id)
+            if existing is not None and existing != result:
+                raise ContractValidationError("producer FlushResult conflict")
+        for path in result.committed_files:
+            self._validate_remote_committed_file(path)
+        with self._lock:
+            state = self._require_run(run_id)
+            if state.flushed is not None:
+                raise RuntimeError("run recording is already flushed")
+            if state.aborted or not state.accepting:
+                raise RuntimeError("run recording no longer accepts producer flushes")
             existing = state.producer_flushes.get(producer_id)
             if existing is not None and existing != result:
                 raise ContractValidationError("producer FlushResult conflict")
@@ -221,26 +258,34 @@ class ParquetRecorder:
             raise ValueError("timeout_ms must be positive")
         started = monotonic_time_ms()
         with self._lock:
+            self._closed = True
             run_ids = tuple(
                 run_id
                 for run_id, state in self._runs.items()
                 if not state.aborted and state.flushed is None
             )
-        for run_id in run_ids:
-            remaining = timeout_ms - (monotonic_time_ms() - started)
-            if remaining <= 0:
-                break
-            await self.flush_run(run_id, remaining)
-        with self._lock:
-            self._closed = True
-        self._stop.set()
-        remaining_seconds = max(
-            0.001,
-            (timeout_ms - (monotonic_time_ms() - started)) / 1_000,
-        )
-        await asyncio.to_thread(self._writer.join, remaining_seconds)
+        flush_errors: list[str] = []
+        try:
+            for run_id in run_ids:
+                remaining = timeout_ms - (monotonic_time_ms() - started)
+                if remaining <= 0:
+                    flush_errors.append("recorder close deadline expired before flush")
+                    break
+                try:
+                    await self.flush_run(run_id, remaining)
+                except Exception as exc:
+                    flush_errors.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            self._stop.set()
+            remaining_seconds = max(
+                0.001,
+                (timeout_ms - (monotonic_time_ms() - started)) / 1_000,
+            )
+            await asyncio.to_thread(self._writer.join, remaining_seconds)
         if self._writer.is_alive():
             raise TimeoutError("Parquet recorder writer did not stop before deadline")
+        if flush_errors:
+            raise RuntimeError("; ".join(flush_errors))
 
     def get_run_events(
         self,
@@ -362,10 +407,11 @@ class ParquetRecorder:
     ) -> None:
         run_id, channel, producer_id, node_id = key
         final_path: Path | None = None
+        keep_file = False
         try:
             with self._lock:
                 state = self._runs.get(run_id)
-                if state is None or state.aborted:
+                if state is None or state.aborted or state.flushed is not None:
                     return
                 shard_key = (producer_id, node_id, channel)
                 sequence = state.shard_sequences.get(shard_key, 0) + 1
@@ -385,68 +431,118 @@ class ParquetRecorder:
             self._write_rows_atomic(final_path, rows, self._event_schema())
             with self._lock:
                 state = self._runs.get(run_id)
-                if state is not None and not state.aborted:
+                if (
+                    state is not None
+                    and not state.aborted
+                    and state.flushed is None
+                ):
                     path = str(final_path)
                     state.event_files.append(path)
                     state.committed_files.append(path)
+                    keep_file = True
         except Exception as exc:
             with self._lock:
                 state = self._runs.get(run_id)
                 if state is not None:
                     state.writer_errors.append(f"{type(exc).__name__}: {exc}")
         finally:
+            if final_path is not None and not keep_file and final_path.exists():
+                self._discard_committed_file(final_path)
             with self._condition:
                 state = self._runs.get(run_id)
                 if state is not None:
                     state.pending_events = max(0, state.pending_events - len(events))
+                    self._retire_aborted_run_if_idle(run_id, state)
                 self._condition.notify_all()
 
     def _flush_blocking(self, run_id: str, timeout_ms: int) -> FlushResult:
         started = monotonic_time_ms()
         deadline = started + timeout_ms
-        with self._condition:
-            state = self._require_run(run_id)
-            if state.flushed is not None:
-                return state.flushed
-            if state.aborted:
-                raise RuntimeError("cannot flush an aborted recording")
-            state.accepting = False
-            while state.pending_events > 0:
-                remaining = deadline - monotonic_time_ms()
-                if remaining <= 0:
-                    state.writer_errors.append("recorder flush deadline expired")
-                    break
-                self._condition.wait(remaining / 1_000)
-        with self._lock:
-            state = self._require_run(run_id)
-            needs_context = state.context_file is None
-            context = state.context
-        if needs_context and monotonic_time_ms() < deadline:
-            try:
-                path = self._context_path(context)
-                self._write_rows_atomic(
-                    path,
-                    [self._context_to_row(context)],
-                    self._context_schema(),
+        owns_flush = False
+        try:
+            # One caller owns finalization; concurrent callers reuse its immutable result.
+            with self._condition:
+                state = self._require_run(run_id)
+                while state.flush_in_progress and state.flushed is None:
+                    remaining = deadline - monotonic_time_ms()
+                    if remaining <= 0:
+                        raise TimeoutError("concurrent recorder flush did not finish")
+                    self._condition.wait(remaining / 1_000)
+                if state.flushed is not None:
+                    return state.flushed
+                if state.aborted:
+                    raise RuntimeError("cannot flush an aborted recording")
+                state.flush_in_progress = True
+                owns_flush = True
+                state.accepting = False
+                while state.pending_events > 0:
+                    remaining = deadline - monotonic_time_ms()
+                    if remaining <= 0:
+                        self._append_writer_error(
+                            state, "recorder flush deadline expired"
+                        )
+                        break
+                    self._condition.wait(remaining / 1_000)
+                if state.aborted:
+                    raise RuntimeError("cannot flush an aborted recording")
+                needs_context = state.context_file is None
+                context = state.context
+
+            if needs_context:
+                if monotonic_time_ms() >= deadline:
+                    with self._lock:
+                        self._append_writer_error(
+                            self._require_run(run_id),
+                            "recorder flush deadline expired before context commit",
+                        )
+                else:
+                    path = self._context_path(context)
+                    keep_context = False
+                    try:
+                        self._write_rows_atomic(
+                            path,
+                            [self._context_to_row(context)],
+                            self._context_schema(),
+                        )
+                        with self._lock:
+                            state = self._require_run(run_id)
+                            # Abort may race after rename, so adoption is decided under the lock.
+                            if not state.aborted and state.flushed is None:
+                                state.context_file = str(path)
+                                state.committed_files.append(str(path))
+                                keep_context = True
+                    except Exception as exc:
+                        with self._lock:
+                            self._append_writer_error(
+                                self._require_run(run_id),
+                                f"{type(exc).__name__}: {exc}",
+                            )
+                    finally:
+                        if not keep_context and path.exists():
+                            self._discard_committed_file(path)
+
+            with self._condition:
+                state = self._require_run(run_id)
+                if state.aborted:
+                    raise RuntimeError("cannot flush an aborted recording")
+                result = self._build_flush_result(
+                    run_id,
+                    state,
+                    max(0, monotonic_time_ms() - started),
                 )
-                with self._lock:
-                    state = self._require_run(run_id)
-                    state.context_file = str(path)
-                    state.committed_files.append(str(path))
-            except Exception as exc:
-                with self._lock:
-                    self._require_run(run_id).writer_errors.append(
-                        f"{type(exc).__name__}: {exc}"
-                    )
-        with self._lock:
-            state = self._require_run(run_id)
-            result = self._build_flush_result(
-                run_id,
-                state,
-                max(0, monotonic_time_ms() - started),
-            )
-            state.flushed = result
-            return result
+                state.flushed = result
+                state.flush_in_progress = False
+                owns_flush = False
+                self._condition.notify_all()
+                return result
+        finally:
+            if owns_flush:
+                with self._condition:
+                    remaining_state = self._runs.get(run_id)
+                    if remaining_state is not None:
+                        remaining_state.flush_in_progress = False
+                        self._retire_aborted_run_if_idle(run_id, remaining_state)
+                    self._condition.notify_all()
 
     def _build_flush_result(
         self,
@@ -499,6 +595,54 @@ class ParquetRecorder:
             recording_complete=complete,
             flush_duration_ms=duration_ms,
         )
+
+    @staticmethod
+    def _append_writer_error(state: _RunState, message: str) -> None:
+        if message not in state.writer_errors:
+            state.writer_errors.append(message)
+
+    def _retire_aborted_run_if_idle(self, run_id: str, state: _RunState) -> None:
+        if not state.aborted or state.pending_events > 0 or state.flush_in_progress:
+            return
+        for event_id in state.events_by_id:
+            if self._event_owners.get(event_id) == run_id:
+                del self._event_owners[event_id]
+        if self._runs.get(run_id) is state:
+            del self._runs[run_id]
+
+    def _validate_remote_committed_file(self, path: str) -> None:
+        candidate = Path(path)
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (FileNotFoundError, OSError) as exc:
+            raise ContractValidationError(
+                f"producer committed file is unavailable: {path}"
+            ) from exc
+        if not resolved.is_file() or resolved.suffix != ".parquet":
+            raise ContractValidationError(
+                f"producer committed file is not a Parquet file: {path}"
+            )
+        try:
+            resolved.relative_to(self.root)
+        except ValueError as exc:
+            raise ContractValidationError(
+                "producer committed file is outside Recorder root_directory"
+            ) from exc
+
+    @staticmethod
+    def _discard_committed_file(path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        try:
+            directory = os.open(path.parent, os.O_RDONLY)
+        except FileNotFoundError:
+            return
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
     def _event_path(
         self,

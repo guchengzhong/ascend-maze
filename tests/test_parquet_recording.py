@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 
@@ -227,18 +228,27 @@ def test_remote_producer_flush_is_merged_without_directory_scanning(
 ) -> None:
     async def scenario() -> None:
         recorder = ParquetRecorder(_config(tmp_path))
+        remote = ParquetRecorder(_config(tmp_path))
         recorder.open_run(_context(expected=("controller", "node_agent:a")))
+        remote.open_run(_context(expected=("node_agent:a",)))
         assert recorder.emit(_event(1))
-        remote_file = str(tmp_path / "remote" / "node.control.00000001.parquet")
+        assert remote.emit(_event(2, producer_id="node_agent:a"))
+        remote_result = await remote.flush_run("run_1", 5_000)
         recorder.merge_producer_flush(
             "run_1",
             "node_agent:a",
-            FlushResult("run_1", (remote_file,), 0, 0, 0, 0, (), True, 3),
+            remote_result,
         )
         result = await recorder.flush_run("run_1", 5_000)
         assert result.recording_complete
-        assert remote_file in result.committed_files
+        assert set(remote_result.committed_files) < set(result.committed_files)
         assert result.missing_producer_count == 0
+        page = recorder.get_run_events("run_1", limit=10)
+        assert {event.producer_id for event in page.events} == {
+            "controller",
+            "node_agent:a",
+        }
+        await remote.close(5_000)
         await recorder.close(5_000)
 
         missing = ParquetRecorder(_config(tmp_path / "missing"))
@@ -248,6 +258,158 @@ def test_remote_producer_flush_is_merged_without_directory_scanning(
         assert not incomplete.recording_complete
         assert incomplete.missing_producer_count == 1
         await missing.close(5_000)
+
+    asyncio.run(scenario())
+
+
+def test_recorder_rejects_conflicting_event_identity_and_context(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        recorder = ParquetRecorder(_config(tmp_path))
+        recorder.open_run(_context(expected=("controller", "node_agent:a")))
+        event = _event(1)
+
+        with pytest.raises(ContractValidationError, match="experiment_id"):
+            recorder.emit(replace(event, experiment_id="another_experiment"))
+        with pytest.raises(ContractValidationError, match="not expected"):
+            recorder.emit(_event(2, producer_id="unexpected"))
+
+        assert recorder.emit(event)
+        assert recorder.emit(event)
+        with pytest.raises(ContractValidationError, match="conflicting"):
+            recorder.emit(replace(event, payload={"conflict": True}))
+
+        recorder.open_run(_context("run_2"))
+        with pytest.raises(ContractValidationError, match="conflicting"):
+            recorder.emit(
+                replace(
+                    event,
+                    experiment_id="experiment_run_2",
+                    run_id="run_2",
+                )
+            )
+        recorder.abort_run("run_2")
+        result = await recorder.flush_run("run_1", 5_000)
+        assert not result.recording_complete
+        assert result.missing_producer_count == 1
+        await recorder.close(5_000)
+
+    asyncio.run(scenario())
+
+
+def test_remote_flush_requires_expected_producer_and_committed_shared_file(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        recorder = ParquetRecorder(_config(tmp_path))
+        recorder.open_run(_context(expected=("controller", "node_agent:a")))
+        assert recorder.emit(_event(1))
+        empty = FlushResult("run_1", (), 0, 0, 0, 0, (), True, 1)
+        with pytest.raises(ContractValidationError, match="not expected"):
+            recorder.merge_producer_flush("run_1", "node_agent:other", empty)
+
+        unavailable = str(tmp_path / "missing" / "node.control.00000001.parquet")
+        with pytest.raises(ContractValidationError, match="unavailable"):
+            recorder.merge_producer_flush(
+                "run_1",
+                "node_agent:a",
+                replace(empty, committed_files=(unavailable,)),
+            )
+        result = await recorder.flush_run("run_1", 5_000)
+        assert not result.recording_complete
+        assert result.missing_producer_count == 1
+        await recorder.close(5_000)
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_flush_uses_one_context_commit(tmp_path: Path) -> None:
+    class BlockingContextRecorder(ParquetRecorder):
+        def __init__(self, config: ParquetRecorderConfig) -> None:
+            self.context_write_entered = Event()
+            self.release_context_write = Event()
+            self.context_write_count = 0
+            super().__init__(config)
+
+        def _write_rows_atomic(self, path, rows, schema) -> None:
+            if ".context." in path.name:
+                self.context_write_count += 1
+                self.context_write_entered.set()
+                assert self.release_context_write.wait(5)
+            super()._write_rows_atomic(path, rows, schema)
+
+    async def scenario() -> None:
+        recorder = BlockingContextRecorder(_config(tmp_path))
+        recorder.open_run(_context(expected=()))
+        first_task = asyncio.create_task(recorder.flush_run("run_1", 5_000))
+        assert await asyncio.to_thread(recorder.context_write_entered.wait, 5)
+        second_task = asyncio.create_task(recorder.flush_run("run_1", 5_000))
+        await asyncio.sleep(0)
+        recorder.release_context_write.set()
+        first, second = await asyncio.gather(first_task, second_task)
+        assert first is second
+        assert first.recording_complete
+        assert recorder.context_write_count == 1
+        await recorder.close(5_000)
+
+    asyncio.run(scenario())
+
+
+def test_abort_discards_writer_commit_that_finishes_late(tmp_path: Path) -> None:
+    class BlockingEventRecorder(ParquetRecorder):
+        def __init__(self, config: ParquetRecorderConfig) -> None:
+            self.event_write_entered = Event()
+            self.release_event_write = Event()
+            super().__init__(config)
+
+        def _write_rows_atomic(self, path, rows, schema) -> None:
+            if ".control." in path.name:
+                self.event_write_entered.set()
+                assert self.release_event_write.wait(5)
+            super()._write_rows_atomic(path, rows, schema)
+
+    async def scenario() -> None:
+        recorder = BlockingEventRecorder(_config(tmp_path, batch_size=1))
+        recorder.open_run(_context())
+        assert recorder.emit(_event(1))
+        assert await asyncio.to_thread(recorder.event_write_entered.wait, 5)
+        assert recorder.abort_run("run_1")
+        with pytest.raises(RuntimeError, match="was aborted"):
+            recorder.open_run(_context())
+        recorder.release_event_write.set()
+        await recorder.close(5_000)
+        assert recorder.active_run_count == 0
+        assert not tuple(tmp_path.rglob("*.parquet"))
+        assert not tuple(tmp_path.rglob("*.tmp"))
+
+    asyncio.run(scenario())
+
+
+def test_flush_timeout_discards_late_uncommitted_shard(tmp_path: Path) -> None:
+    class BlockingEventRecorder(ParquetRecorder):
+        def __init__(self, config: ParquetRecorderConfig) -> None:
+            self.event_write_entered = Event()
+            self.release_event_write = Event()
+            super().__init__(config)
+
+        def _write_rows_atomic(self, path, rows, schema) -> None:
+            if ".control." in path.name:
+                self.event_write_entered.set()
+                assert self.release_event_write.wait(5)
+            super()._write_rows_atomic(path, rows, schema)
+
+    async def scenario() -> None:
+        recorder = BlockingEventRecorder(_config(tmp_path, batch_size=1))
+        recorder.open_run(_context())
+        assert recorder.emit(_event(1))
+        assert await asyncio.to_thread(recorder.event_write_entered.wait, 5)
+        result = await recorder.flush_run("run_1", 10)
+        assert not result.recording_complete
+        assert result.writer_errors
+        recorder.release_event_write.set()
+        await recorder.close(5_000)
+        committed_on_disk = {str(path) for path in tmp_path.rglob("*.parquet")}
+        assert committed_on_disk == set(result.committed_files)
+        assert not tuple(tmp_path.rglob("*.tmp"))
 
     asyncio.run(scenario())
 

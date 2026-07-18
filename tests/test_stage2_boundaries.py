@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+
+import pytest
 
 from ascend_maze import Workflow
 from ascend_maze.contracts.recording import ExecutionEvent, RunRecordingContext
@@ -11,6 +14,7 @@ from ascend_maze.contracts.resources import (
 )
 from ascend_maze.contracts.runtime import ExecutionRequest, RuntimeArgument
 from ascend_maze.data import InMemoryDataStore
+from ascend_maze.core.errors import ContractValidationError
 from ascend_maze.recording import InMemoryRecorder
 from ascend_maze.resources import DeclaredOnlyAnchorProvider
 from ascend_maze.runtime import (
@@ -265,10 +269,19 @@ def test_in_memory_recorder_tracks_sequences_missing_producers_and_flush() -> No
         )
         assert recorder.emit(event)
         assert recorder.emit(event)
+        with pytest.raises(ContractValidationError, match="conflicting"):
+            recorder.emit(replace(event, payload={"conflict": True}))
+        with pytest.raises(ContractValidationError, match="experiment_id"):
+            recorder.emit(replace(event, experiment_id="other"))
         result = await recorder.flush_run("run_1", 100)
         assert not result.recording_complete
         assert result.missing_producer_count == 1
         assert len(recorder.events("run_1")) == 1
+        assert not recorder.emit(
+            replace(event, event_id="event_after_flush", producer_sequence=2)
+        )
+        with pytest.raises(RuntimeError, match="no longer accepts"):
+            recorder.expect_producer("run_1", "node_b")
 
     asyncio.run(scenario())
 
