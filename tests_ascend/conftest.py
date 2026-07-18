@@ -17,6 +17,7 @@ from ascend_maze.ascend import (
     discover_ascend_environment,
 )
 from ascend_maze.contracts.config import ConfigSnapshot
+from ascend_maze.runtime.ray_cluster import ManagedRayCluster, RayClusterConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,21 +82,23 @@ def ascend_ray(ascend_admission: AscendAdmission) -> Iterator[str]:
     namespace = f"ascend-maze-stage4-{uuid4().hex}"
     variable = "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"
     previous = os.environ.get(variable)
-    os.environ[variable] = "0"
-    ray.init(
-        address="local",
-        namespace=namespace,
-        include_dashboard=False,
-        num_cpus=4,
-        object_store_memory=256 * 1024 * 1024,
-        resources={"NPU": 0},
-        log_to_driver=False,
+    cluster = ManagedRayCluster(
+        RayClusterConfig(
+            namespace=namespace,
+            include_dashboard=False,
+            local_num_cpus=4,
+            local_object_store_memory=256 * 1024 * 1024,
+            disable_ray_npu_resource=True,
+        )
     )
+    cluster.start()
     try:
+        assert os.environ[variable] == "0"
+        assert ray.cluster_resources().get("NPU", 0) == 0
         yield namespace
     finally:
-        ray.shutdown()
+        cluster.close()
         if previous is None:
-            os.environ.pop(variable, None)
+            assert variable not in os.environ
         else:
-            os.environ[variable] = previous
+            assert os.environ[variable] == previous

@@ -50,8 +50,9 @@ class _DispatchRecord:
     binding: RuntimeNodeBinding
     worker_lease: WorkerLease
     handle: DispatchHandle
-    object_ref: Any
+    object_ref: Any | None
     monitor: asyncio.Task[None] | None
+    worker_started_event: RuntimeEvent | None = None
     cancel_requested: bool = False
     invalidated: bool = False
     terminal: bool = False
@@ -100,6 +101,15 @@ class RayRuntimeBackend:
 
     def post_node_event(self, event: RuntimeEvent) -> None:
         record = self._dispatches.get(event.dispatch_id)
+        if (
+            event.kind is RuntimeEventKind.WORKER_STARTED
+            and record is not None
+            and not record.terminal
+        ):
+            if record.worker_started_event is None:
+                record.worker_started_event = event
+            self._emit(event)
+            return
         if (
             event.kind is not RuntimeEventKind.WORKER_STARTED
             and record is not None
@@ -247,8 +257,19 @@ class RayRuntimeBackend:
             environment_fingerprint=self.environment_fingerprint,
             producer_id=binding.producer_id,
         )
+        record = _DispatchRecord(
+            request=request,
+            lease=lease,
+            binding=binding,
+            worker_lease=worker_lease,
+            handle=handle,
+            object_ref=None,
+            monitor=None,
+        )
+        self._dispatches[request.dispatch_id] = record
+        self._attempt_dispatches[attempt_key] = request.dispatch_id
         try:
-            object_ref = RAY_ONE_SHOT_WORKER.options(
+            record.object_ref = RAY_ONE_SHOT_WORKER.options(
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     binding.ray_node_id, soft=False
                 ),
@@ -265,21 +286,11 @@ class RayRuntimeBackend:
                 device_binding=device_binding,
             )
         except Exception:
+            self._drop_dispatch(request.dispatch_id)
             self.worker_broker.release(
                 worker_lease.worker_lease_id, disposition="discard"
             )
             raise
-        record = _DispatchRecord(
-            request=request,
-            lease=lease,
-            binding=binding,
-            worker_lease=worker_lease,
-            handle=handle,
-            object_ref=object_ref,
-            monitor=None,
-        )
-        self._dispatches[request.dispatch_id] = record
-        self._attempt_dispatches[attempt_key] = request.dispatch_id
         record.monitor = asyncio.create_task(self._monitor(record))
         return handle
 
@@ -294,7 +305,8 @@ class RayRuntimeBackend:
             return
         record.cancel_requested = True
         if not record.terminal:
-            ray.cancel(record.object_ref, force=True, recursive=True)
+            if record.object_ref is not None:
+                ray.cancel(record.object_ref, force=True, recursive=True)
             if record.monitor is not None:
                 await asyncio.gather(record.monitor, return_exceptions=True)
         elif record.outcome is not None:
@@ -322,7 +334,8 @@ class RayRuntimeBackend:
         for record in self._dispatches.values():
             if not record.terminal:
                 record.cancel_requested = True
-                ray.cancel(record.object_ref, force=True, recursive=True)
+                if record.object_ref is not None:
+                    ray.cancel(record.object_ref, force=True, recursive=True)
         monitors = [
             record.monitor
             for record in self._dispatches.values()
@@ -405,7 +418,8 @@ class RayRuntimeBackend:
                     record.request.run_id,
                     "NodeAgent binding disconnected during an active Attempt",
                 )
-                ray.cancel(record.object_ref, force=True, recursive=True)
+                if record.object_ref is not None:
+                    ray.cancel(record.object_ref, force=True, recursive=True)
 
     def active_dispatch_count(self, run_id: str | None = None) -> int:
         return sum(
@@ -420,9 +434,15 @@ class RayRuntimeBackend:
         record = self._dispatches.get(dispatch_id)
         return None if record is None else record.outcome
 
+    def worker_started_event(self, dispatch_id: str) -> RuntimeEvent | None:
+        record = self._dispatches.get(dispatch_id)
+        return None if record is None else record.worker_started_event
+
     async def _monitor(self, record: _DispatchRecord) -> None:
         terminal_to_publish: RuntimeEvent | None = None
         try:
+            if record.object_ref is None:
+                raise RuntimeError("Ray dispatch has no ObjectRef")
             outcome = await asyncio.to_thread(ray.get, record.object_ref)
             if not isinstance(outcome, RayWorkerOutcome):
                 raise TypeError("Ray Worker returned an invalid control outcome")

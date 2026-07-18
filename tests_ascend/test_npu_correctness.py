@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+import os
 import time
 
 import pytest
@@ -16,6 +17,7 @@ from ascend_maze.control.client import InMemoryRuntimeClient
 from ascend_maze.control.node_rpc import NodeAgent, NodeAgentIdentity
 from ascend_maze.control.node_rpc import report_worker_event
 from ascend_maze.control.ray_controller import RayHostController
+from ascend_maze.data.index import RunDataState
 from ascend_maze.lifecycle import AttemptStatus, RunStatus
 from ascend_maze.core.errors import DataHandleInvalidError
 from ascend_maze.placement import NpuCapacity, PlacementManager
@@ -24,12 +26,14 @@ from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 from tests_ascend.conftest import AscendAdmission
 from tests_ascend.task_fixtures import (
     cpu_visible_device,
+    impossible_multi_card_npu,
     npu_add,
     npu_long_running,
     npu_oom,
     npu_sync_device_error,
     npu_tensor_output,
     npu_timeout,
+    npu_user_error,
 )
 
 
@@ -38,6 +42,7 @@ async def _start_controller(
     ray_namespace: str,
     *,
     device_id: str | None = None,
+    use_all_devices: bool = False,
 ) -> tuple[RayHostController, NodeAgent]:
     environment = admission.environment
     capacity = build_ascend_node_capacity(
@@ -49,8 +54,11 @@ async def _start_controller(
         config=admission.config,
     )
     selected_id = admission.device.physical_device_id if device_id is None else device_id
-    if device_id is None:
+    if use_all_devices:
+        selected_ids = frozenset(item.device_id for item in capacity.npus)
+    elif device_id is None:
         selected = next(item for item in capacity.npus if item.device_id == selected_id)
+        selected_ids = frozenset((selected.device_id,))
     else:
         selected = NpuCapacity(
             device_id=device_id,
@@ -60,7 +68,9 @@ async def _start_controller(
             task_slots_total=1,
             observed_free_hbm_mb=admission.device.free_hbm_mb,
         )
-    capacity = replace(capacity, npus=(selected,))
+        selected_ids = frozenset((selected.device_id,))
+    if not use_all_devices:
+        capacity = replace(capacity, npus=(selected,))
     placement = PlacementManager(
         host_mem_headroom_mb=admission.config.host_mem_headroom_mb,
         npu_hbm_headroom_mb=admission.config.npu_hbm_headroom_mb,
@@ -103,7 +113,7 @@ async def _start_controller(
         return replace(
             observation,
             npus=tuple(
-                item for item in observation.npus if item.device_id == selected_id
+                item for item in observation.npus if item.device_id in selected_ids
             ),
         )
 
@@ -124,6 +134,23 @@ async def _start_controller(
     return controller, agent
 
 
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _worker_pid(controller: RayHostController, dispatch_id: str) -> int:
+    event = controller.ray_runtime.worker_started_event(dispatch_id)
+    assert event is not None
+    assert event.worker_pid is not None
+    return event.worker_pid
+
+
 async def _wait_hbm_recovery(
     admission: AscendAdmission,
     baseline_used_mb: int,
@@ -135,16 +162,58 @@ async def _wait_hbm_recovery(
     while time.monotonic() < deadline:
         last = admission.adapter.device(admission.device.physical_device_id)
         pids = {item.pid for item in last.processes}
+        live_worker_pids = {pid for pid in worker_pids if _pid_exists(pid)}
         if (
             last.used_hbm_mb
             <= baseline_used_mb + admission.config.hbm_recovery_tolerance_mb
             and not pids.intersection(worker_pids)
+            and not live_worker_pids
         ):
             return
         await asyncio.sleep(0.1)
     raise AssertionError(
-        f"NPU HBM did not recover: baseline={baseline_used_mb}, last={last}"
+        "NPU Worker/HBM did not recover: "
+        f"baseline={baseline_used_mb}, last={last}, "
+        f"live_worker_pids={[pid for pid in worker_pids if _pid_exists(pid)]}"
     )
+
+
+def _assert_run_terminal_checkpoint(
+    controller: RayHostController,
+    run_id: str,
+    *,
+    expected_handle_count: int,
+) -> None:
+    assert controller.placement.active_lease_count(run_id) == 0
+    assert controller.worker_broker.active_count() == 0
+    assert controller.deadlines.count_for_run(run_id) == 0
+    assert controller.ray_runtime.active_dispatch_count(run_id) == 0
+    assert controller.ray_data_store.staged_count == 0
+    index = controller.indexes.get(run_id)
+    assert index.state is RunDataState.ACTIVE
+    assert index.handle_count() == expected_handle_count
+
+
+async def _destroy_and_assert(
+    controller: RayHostController,
+    run_id: str,
+    *,
+    force: bool = False,
+) -> None:
+    handle_count = controller.indexes.get(run_id).handle_count()
+    destroyed = await controller.destroy_run(run_id, force=force)
+    repeated = await controller.destroy_run(run_id, force=force)
+    assert repeated == destroyed
+    assert destroyed.tombstone.destroy_succeeded
+    assert destroyed.tombstone.released_handle_count == handle_count
+    assert destroyed.code_handles_released > 0
+    assert controller.indexes.get(run_id).state is RunDataState.DESTROYED
+    assert controller.placement.active_lease_count(run_id) == 0
+    assert controller.placement.lease_record_count(run_id) == 0
+    assert controller.deadlines.count_for_run(run_id) == 0
+    assert controller.anchors.count_for_run(run_id) == 0
+    assert controller.ray_runtime.active_dispatch_count(run_id) == 0
+    assert controller.ray_data_store.staged_count == 0
 
 
 def test_real_dcmi_inventory_and_frozen_environment(
@@ -173,6 +242,8 @@ def test_real_npu_worker_binding_result_and_cpu_isolation(
         controller, agent = await _start_controller(admission, ascend_ray)
         try:
             assert controller.core.dispatch_timeout_ms == 30_000
+            assert controller.core.policy.name == "fcfs"
+            assert controller.anchors.strategy == "declared_only"
             assert controller.config_fingerprint == (
                 admission.config_snapshot.config_fingerprint
             )
@@ -210,8 +281,15 @@ def test_real_npu_worker_binding_result_and_cpu_isolation(
                 "visible": None
             }
             npu_attempt = terminal.task(npu_node.task_id).attempts[0]
+            npu_lease = controller.placement.lease_snapshot(
+                npu_attempt.lease_id
+            ).lease
+            assert npu_lease.npu_device_id == admission.device.physical_device_id
+            assert npu_lease.resources.npu_hbm_mb == 1_024
+            assert npu_lease.resources.npu_slots == 1
             worker = controller.ray_runtime.worker_outcome(npu_attempt.dispatch_id)
             assert worker is not None
+            assert worker.ray_node_id == ray.get_runtime_context().get_node_id()
             assert worker.physical_device_id == admission.device.physical_device_id
             assert worker.binding_verified
             observation = worker.terminal_event.resource_observation
@@ -228,7 +306,12 @@ def test_real_npu_worker_binding_result_and_cpu_isolation(
             await _wait_hbm_recovery(
                 admission, baseline, worker_pids=(worker.worker_pid,)
             )
-            await controller.destroy_run(outcome.run_id)
+            _assert_run_terminal_checkpoint(
+                controller,
+                outcome.run_id,
+                expected_handle_count=2,
+            )
+            await _destroy_and_assert(controller, outcome.run_id)
         finally:
             await agent.close(grace_seconds=0)
             await controller.close()
@@ -241,9 +324,10 @@ def test_real_npu_worker_binding_result_and_cpu_isolation(
     [
         (npu_tensor_output, "invalid_task_output"),
         (npu_sync_device_error, "npu_async_error"),
+        (npu_user_error, "user_code_failed"),
     ],
 )
-def test_real_npu_output_and_device_errors_are_structured(
+def test_real_npu_failures_are_structured(
     ascend_admission: AscendAdmission,
     ascend_ray: str,
     task_func,
@@ -267,14 +351,25 @@ def test_real_npu_output_and_device_errors_are_structured(
             task = terminal.task(node.task_id)
             assert task.last_error is not None
             assert task.last_error.error_code == error_code
+            if error_code == "npu_async_error":
+                assert task.last_error.execution_phase == "npu_synchronize"
+                assert task.last_error.platform_error_code == "107001"
+            elif error_code == "user_code_failed":
+                assert task.last_error.execution_phase == "user_code"
+                assert task.last_error.exception_type == "RuntimeError"
+                assert task.last_error.platform_error_code is None
             attempt = task.attempts[0]
             worker = controller.ray_runtime.worker_outcome(attempt.dispatch_id)
             assert worker is not None
             await _wait_hbm_recovery(
                 admission, baseline, worker_pids=(worker.worker_pid,)
             )
-            assert controller.placement.active_lease_count(outcome.run_id) == 0
-            await controller.destroy_run(outcome.run_id)
+            _assert_run_terminal_checkpoint(
+                controller,
+                outcome.run_id,
+                expected_handle_count=0,
+            )
+            await _destroy_and_assert(controller, outcome.run_id)
         finally:
             await agent.close(grace_seconds=0)
             await controller.close()
@@ -288,6 +383,7 @@ def test_wrong_physical_device_binding_is_rejected_without_fallback(
 ) -> None:
     async def scenario() -> None:
         admission = ascend_admission
+        baseline = admission.adapter.device(admission.device.physical_device_id).used_hbm_mb
         controller, agent = await _start_controller(
             admission, ascend_ray, device_id="999"
         )
@@ -307,8 +403,73 @@ def test_wrong_physical_device_binding_is_rejected_without_fallback(
             assert task.last_error.error_code == "device_bind_failed"
             assert task.attempt_count == 1
             assert task.attempts[0].device_ids == ("999",)
-            assert controller.placement.active_lease_count(outcome.run_id) == 0
-            await controller.destroy_run(outcome.run_id)
+            worker = controller.ray_runtime.worker_outcome(
+                task.attempts[0].dispatch_id
+            )
+            assert worker is not None
+            assert worker.physical_device_id == "999"
+            assert not worker.binding_verified
+            await _wait_hbm_recovery(
+                admission,
+                baseline,
+                worker_pids=(worker.worker_pid,),
+            )
+            _assert_run_terminal_checkpoint(
+                controller,
+                outcome.run_id,
+                expected_handle_count=0,
+            )
+            await _destroy_and_assert(controller, outcome.run_id)
+        finally:
+            await agent.close(grace_seconds=0)
+            await controller.close()
+
+    asyncio.run(scenario())
+
+
+def test_multi_card_hbm_is_not_aggregated_for_one_task(
+    ascend_admission: AscendAdmission,
+    ascend_ray: str,
+) -> None:
+    async def scenario() -> None:
+        admission = ascend_admission
+        controller, agent = await _start_controller(
+            admission,
+            ascend_ray,
+            use_all_devices=True,
+        )
+        try:
+            placement_node = controller.placement.snapshot().nodes[0]
+            assert len(placement_node.capacity.npus) == 8
+            assert sum(
+                item.total_hbm_mb for item in placement_node.capacity.npus
+            ) > 70_000
+
+            workflow = Workflow("stage4-multi-card-not-aggregated")
+            node = workflow.add_task(impossible_multi_card_npu, inputs={})
+            outcome = await InMemoryRuntimeClient(controller).submit(
+                workflow,
+                inputs={},
+                submission_id="stage4_multi_card_not_aggregated",
+            )
+            assert outcome.run_id is not None
+            terminal = await controller.wait_run(outcome.run_id, timeout_seconds=10)
+            task = terminal.task(node.task_id)
+            assert terminal.status is RunStatus.FAILED
+            assert task.attempt_count == 0
+            assert task.last_error is not None
+            assert task.last_error.error_code == "resource_request_unsatisfiable"
+            assert all(
+                controller.ray_runtime.worker_started_event(attempt.dispatch_id)
+                is None
+                for attempt in task.attempts
+            )
+            _assert_run_terminal_checkpoint(
+                controller,
+                outcome.run_id,
+                expected_handle_count=0,
+            )
+            await _destroy_and_assert(controller, outcome.run_id)
         finally:
             await agent.close(grace_seconds=0)
             await controller.close()
@@ -339,15 +500,25 @@ def test_real_npu_timeout_kills_worker_and_recovers_hbm(
             assert task.last_error is not None
             assert task.last_error.error_code == "task_timeout"
             assert task.attempts[0].status is AttemptStatus.TIMED_OUT
+            worker_pid = _worker_pid(
+                controller,
+                task.attempts[0].dispatch_id,
+            )
             worker = controller.ray_runtime.worker_outcome(
                 task.attempts[0].dispatch_id
             )
             assert worker is None or worker.physical_device_id == admission.device.physical_device_id
-            worker_pids = () if worker is None else (worker.worker_pid,)
-            await _wait_hbm_recovery(admission, baseline, worker_pids=worker_pids)
-            assert controller.placement.active_lease_count(outcome.run_id) == 0
-            assert controller.worker_broker.active_count() == 0
-            await controller.destroy_run(outcome.run_id)
+            await _wait_hbm_recovery(
+                admission,
+                baseline,
+                worker_pids=(worker_pid,),
+            )
+            _assert_run_terminal_checkpoint(
+                controller,
+                outcome.run_id,
+                expected_handle_count=0,
+            )
+            await _destroy_and_assert(controller, outcome.run_id)
         finally:
             await agent.close(grace_seconds=0)
             await controller.close()
@@ -380,6 +551,7 @@ def test_real_npu_cancel_releases_late_output_and_hbm(
                     break
                 await asyncio.sleep(0.01)
             assert attempt is not None
+            worker_pid = _worker_pid(controller, attempt.dispatch_id)
             cancelled = await controller.cancel_run(outcome.run_id)
             assert cancelled.status is RunStatus.CANCELLED
             assert controller.placement.active_lease_count(outcome.run_id) == 0
@@ -420,12 +592,17 @@ def test_real_npu_cancel_releases_late_output_and_hbm(
                 await asyncio.sleep(0.01)
             with pytest.raises(DataHandleInvalidError):
                 controller.ray_data_store.get(late_handle)
-            worker = controller.ray_runtime.worker_outcome(attempt.dispatch_id)
-            worker_pids = () if worker is None else (worker.worker_pid,)
             await _wait_hbm_recovery(
-                admission, baseline, worker_pids=worker_pids
+                admission,
+                baseline,
+                worker_pids=(worker_pid,),
             )
-            await controller.destroy_run(outcome.run_id)
+            _assert_run_terminal_checkpoint(
+                controller,
+                outcome.run_id,
+                expected_handle_count=0,
+            )
+            await _destroy_and_assert(controller, outcome.run_id)
         finally:
             await agent.close(grace_seconds=0)
             await controller.close()
@@ -458,6 +635,7 @@ def test_real_npu_nodeagent_loss_invalidates_worker_and_device_lease(
                     break
                 await asyncio.sleep(0.01)
             assert attempt is not None
+            worker_pid = _worker_pid(controller, attempt.dispatch_id)
             await agent.close(grace_seconds=0)
             terminal = await controller.wait_run(outcome.run_id, timeout_seconds=60)
             task = terminal.task(node.task_id)
@@ -466,12 +644,17 @@ def test_real_npu_nodeagent_loss_invalidates_worker_and_device_lease(
             assert task.last_error.error_code == "worker_lost"
             assert controller.placement.active_lease_count(outcome.run_id) == 0
             assert controller.worker_broker.active_count() == 0
-            worker = controller.ray_runtime.worker_outcome(attempt.dispatch_id)
-            worker_pids = () if worker is None else (worker.worker_pid,)
             await _wait_hbm_recovery(
-                admission, baseline, worker_pids=worker_pids
+                admission,
+                baseline,
+                worker_pids=(worker_pid,),
             )
-            await controller.destroy_run(outcome.run_id, force=True)
+            _assert_run_terminal_checkpoint(
+                controller,
+                outcome.run_id,
+                expected_handle_count=0,
+            )
+            await _destroy_and_assert(controller, outcome.run_id, force=True)
         finally:
             await agent.close(grace_seconds=0)
             await controller.close()
@@ -519,6 +702,7 @@ def test_real_npu_oom_creates_exactly_one_reanchored_attempt(
             assert tuple(item.anchor_revision for item in task.attempts) == (1, 2)
             assert task.last_error is not None
             assert task.last_error.error_code == "npu_oom"
+            assert task.last_error.classification_confidence == "fallback"
             anchor = controller.anchors.resolve(
                 run_id=outcome.run_id,
                 compiled=controller.state.compiled(outcome.run_id),
@@ -533,21 +717,19 @@ def test_real_npu_oom_creates_exactly_one_reanchored_attempt(
             assert len(anchor_events) == 2
             assert sum(bool(event.payload["created"]) for event in anchor_events) == 1
             worker_pids = tuple(
-                worker.worker_pid
+                _worker_pid(controller, attempt.dispatch_id)
                 for attempt in task.attempts
-                if (
-                    worker := controller.ray_runtime.worker_outcome(
-                        attempt.dispatch_id
-                    )
-                )
-                is not None
             )
+            assert len(set(worker_pids)) == 2
             await _wait_hbm_recovery(
                 admission, baseline, worker_pids=worker_pids
             )
-            assert controller.placement.active_lease_count(outcome.run_id) == 0
-            assert controller.worker_broker.active_count() == 0
-            await controller.destroy_run(outcome.run_id)
+            _assert_run_terminal_checkpoint(
+                controller,
+                outcome.run_id,
+                expected_handle_count=0,
+            )
+            await _destroy_and_assert(controller, outcome.run_id)
         finally:
             await agent.close(grace_seconds=0)
             await controller.close()

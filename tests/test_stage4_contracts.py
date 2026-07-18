@@ -45,6 +45,7 @@ from ascend_maze.runtime.fake import FakeExecutionPlan
 from stage4_task_fixtures import (
     impossible_npu,
     no_retry_npu,
+    statically_inferred_npu,
     statically_npu,
     statically_parallel,
 )
@@ -197,6 +198,26 @@ def test_static_anchor_and_one_oom_revision_are_deterministic() -> None:
     assert anchor.strategy == "static"
     assert anchor.effective.cpu_num == 4
 
+    inferred_workflow = Workflow("stage4-inferred-npu")
+    inferred_node = inferred_workflow.add_task(
+        statically_inferred_npu,
+        inputs={"value": 1},
+        model_anchor={"model": "stage4-placeholder", "mode": "local_worker"},
+    )
+    inferred_compiled = compile_workflow(inferred_workflow)
+    inferred_definition = inferred_compiled.definitions[
+        inferred_compiled.tasks[inferred_node.task_id].definition_id
+    ]
+    assert inferred_definition.task_kind == "npu"
+    assert "npu:torch_npu" in inferred_definition.static_signals
+    inferred_anchor = provider.resolve(
+        run_id="run_inferred_npu",
+        compiled=inferred_compiled,
+        task_id=inferred_node.task_id,
+    )
+    assert inferred_anchor.task_kind == "npu"
+    assert inferred_anchor.strategy == "static"
+
     npu_workflow = Workflow("stage4-oom")
     npu_node = npu_workflow.add_task(statically_npu, inputs={"value": 1})
     npu_compiled = compile_workflow(npu_workflow)
@@ -221,6 +242,56 @@ def test_static_anchor_and_one_oom_revision_are_deterministic() -> None:
     assert reanchored.anchor.effective.npu_mem_mb == 2_200
     assert not repeated.created
     assert repeated.anchor.revision == 2
+
+
+def test_static_anchor_config_drives_end_to_end_reservation() -> None:
+    async def scenario() -> None:
+        environment = AscendEnvironmentSnapshot.create(
+            machine="aarch64",
+            chip_types=("910B3",),
+            versions={"cann": "9.0", "torch_npu": "2.7.1"},
+        )
+        snapshot = create_ascend_correctness_config_snapshot(
+            AscendCorrectnessConfig(anchor_strategy="static"),
+            environment,
+            source_path="/etc/ascend-maze/correctness.toml",
+            build_revision="stage4-static-test",
+            created_at_ms=1,
+        )
+        anchors = StaticAnchorProvider(
+            environment_fingerprint=environment.environment_fingerprint
+        )
+        controller = InMemoryController(
+            config_fingerprint=snapshot.config_fingerprint,
+            environment_fingerprint=environment.environment_fingerprint,
+            build_revision="test",
+            node_capacities=(
+                _npu_node(environment=environment.environment_fingerprint),
+            ),
+            anchors=anchors,
+        )
+        await controller.start()
+        try:
+            workflow = Workflow("stage4-static-e2e")
+            node = workflow.add_task(statically_parallel, inputs={"value": -1})
+            outcome = await InMemoryRuntimeClient(controller).submit(
+                workflow,
+                inputs={},
+                submission_id="stage4_static_e2e",
+            )
+            assert outcome.run_id is not None
+            terminal = await controller.wait_run(outcome.run_id, timeout_seconds=2)
+            assert terminal.status is RunStatus.SUCCEEDED
+            assert controller.config_fingerprint == snapshot.config_fingerprint
+            attempt = terminal.task(node.task_id).attempts[0]
+            lease = controller.placement.lease_snapshot(attempt.lease_id).lease
+            assert lease.resources.cpu_num == 4
+            assert controller.result(outcome.run_id, node.task_id) == {"result": 1}
+            await controller.destroy_run(outcome.run_id)
+        finally:
+            await controller.close()
+
+    asyncio.run(scenario())
 
 
 def test_placement_enforces_environment_observations_and_permanent_single_card_limit() -> None:

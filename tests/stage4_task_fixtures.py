@@ -20,6 +20,14 @@ def statically_npu(value: int):
     return {"result": int(tensor.cpu()[0])}
 
 
+@task
+def statically_inferred_npu(value: int):
+    import torch_npu
+
+    assert torch_npu is not None
+    return {"result": value}
+
+
 @task(task_kind="npu", resources={"npu_mem": 70_000}, max_retries=0)
 def impossible_npu(value: int):
     return {"result": value}

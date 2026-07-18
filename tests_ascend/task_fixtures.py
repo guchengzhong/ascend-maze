@@ -94,5 +94,36 @@ def npu_sync_device_error():
 
     assert torch_npu is not None
     torch.ones(1, device="npu:0")
-    torch.npu.synchronize(1)
+    real_synchronize = torch.npu.synchronize
+
+    def fail_at_mandatory_synchronize(device=0):
+        del device
+        return real_synchronize(1)
+
+    torch.npu.synchronize = fail_at_mandatory_synchronize
+    return {"result": 1}
+
+
+@task(
+    task_kind="npu",
+    resources={"cpu_num": 1, "mem": 256, "npu_mem": 1024},
+    max_retries=0,
+)
+def npu_user_error(should_fail: bool = True):
+    import torch
+    import torch_npu
+
+    assert torch_npu is not None
+    torch.ones(1, device="npu:0")
+    if should_fail:
+        raise RuntimeError("stage4 user failure")
+    return {"result": 1}
+
+
+@task(
+    task_kind="npu",
+    resources={"cpu_num": 1, "mem": 256, "npu_mem": 70_000},
+    max_retries=0,
+)
+def impossible_multi_card_npu():
     return {"result": 1}

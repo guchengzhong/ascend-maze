@@ -164,6 +164,9 @@ def test_ray_backend_executes_one_shot_worker_on_hard_bound_node(
         outcome = backend.worker_outcome("dispatch_1")
         assert outcome is not None
         assert outcome.ray_node_id == identity.ray_node_id
+        started = backend.worker_started_event("dispatch_1")
+        assert started is not None
+        assert started.worker_pid == outcome.worker_pid
         for _ in range(1_000):
             try:
                 os.kill(outcome.worker_pid, 0)

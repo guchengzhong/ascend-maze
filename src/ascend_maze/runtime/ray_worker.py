@@ -363,7 +363,7 @@ def _run_user_code(
                 kind=RuntimeEventKind.TASK_FAILED,
                 error_code="npu_async_error",
                 category="node_device",
-                phase="user_code",
+                phase="npu_synchronize",
                 message=f"{type(exc).__name__}: {exc}",
                 exception=exc,
                 classification_confidence="mapped",

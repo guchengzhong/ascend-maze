@@ -325,3 +325,67 @@ def test_node_observation_heartbeat_updates_dynamic_capacity_monotonically() -> 
             await controller.close(grace_seconds=0)
 
     asyncio.run(scenario())
+
+
+def test_observation_failure_degrades_without_publishing_zero_metrics() -> None:
+    async def scenario() -> None:
+        identity = _identity()
+        recorder = InMemoryRecorder()
+        recorder.open_run(
+            RunRecordingContext(
+                schema_version=1,
+                experiment_id="run_1",
+                run_id="run_1",
+                workflow_fingerprint="w" * 64,
+                config_fingerprint="c" * 64,
+                environment_fingerprint=ENVIRONMENT,
+                build_revision="test",
+                started_wall_time_ms=1,
+                initial_expected_producer_ids=(identity.producer_id,),
+            )
+        )
+        registry = RayNodeRegistry()
+        observations: list[NodeObservation] = []
+        received = asyncio.Event()
+
+        def fail_observation(sequence: int, now_ms: int) -> NodeObservation:
+            del sequence, now_ms
+            raise RuntimeError("injected DCMI sampling failure")
+
+        controller = NodeControlServer(
+            cluster_id=identity.cluster_id,
+            authorization_token=b"test-token",
+            controller_generation="controller_1",
+            environment_fingerprint=ENVIRONMENT,
+            registry=registry,
+            recorder=recorder,
+            event_sink=lambda event: received.set(),
+            on_node_observation=observations.append,
+        )
+        endpoint = await controller.start()
+        agent = NodeAgent(
+            identity=identity,
+            authorization_token=b"test-token",
+            heartbeat_interval_ms=10,
+            node_observation_provider=fail_observation,
+        )
+        try:
+            agent_endpoint = await agent.start(controller_endpoint=endpoint)
+            await asyncio.sleep(0.05)
+            assert observations == []
+            assert registry.status(identity.node_id) is RuntimeNodeStatus.HEALTHY
+
+            await asyncio.to_thread(
+                report_worker_event,
+                endpoint=agent_endpoint,
+                identity=identity,
+                event=_event(),
+                timeout_seconds=2,
+            )
+            await asyncio.wait_for(received.wait(), timeout=2)
+            assert observations == []
+        finally:
+            await agent.close(grace_seconds=0)
+            await controller.close(grace_seconds=0)
+
+    asyncio.run(scenario())
