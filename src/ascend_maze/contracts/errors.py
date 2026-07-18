@@ -10,6 +10,7 @@ from ascend_maze.core.errors import ContractValidationError
 STABLE_ERROR_CODES = frozenset(
     {
         "backend_internal_error",
+        "code_delivery_failed",
         "data_binding_failed",
         "data_handle_invalid",
         "device_bind_failed",
@@ -31,6 +32,7 @@ STABLE_ERROR_CODES = frozenset(
         "run_cancelled",
         "run_deadline_exceeded",
         "runtime_node_unavailable",
+        "runtime_cancel_failed",
         "scheduler_interrupted",
         "serialization_failed",
         "task_cancelled",

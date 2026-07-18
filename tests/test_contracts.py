@@ -6,12 +6,11 @@ from pathlib import Path
 import pytest
 
 from ascend_maze.contracts.config import ConfigSnapshot
-from ascend_maze.contracts.data import DataHandle, DataOwner, DataStore, SharedFileRef
+from ascend_maze.contracts.data import DataHandle, DataStore, SharedFileRef
 from ascend_maze.contracts.errors import ErrorInfo
 from ascend_maze.contracts.recording import ExecutionEvent, RecorderSink
 from ascend_maze.contracts.resources import (
     ExecutionTarget,
-    PlacementLease,
     ReservationVector,
     ResourceDeclaration,
     ResourceSpec,
@@ -234,7 +233,7 @@ def test_runtime_request_enforces_execution_target_boundary() -> None:
             dispatch_id="dispatch",
             run_id="run",
             task_id="task",
-            attempt=0,
+            attempt=1,
             task_kind="npu",
             execution_target=ExecutionTarget.MODEL_SERVICE,
             model_route=None,

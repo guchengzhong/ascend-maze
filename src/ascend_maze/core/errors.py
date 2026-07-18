@@ -31,3 +31,43 @@ class WorkflowFrozenError(AscendMazeError, RuntimeError):
 
 class ContractValidationError(AscendMazeError, ValueError):
     """Raised when a cross-component contract object is invalid."""
+
+
+class StateTransitionError(AscendMazeError, RuntimeError):
+    """Raised when a lifecycle transition violates the state machine."""
+
+
+class DataStoreError(AscendMazeError, RuntimeError):
+    """Base class for data storage and ownership failures."""
+
+
+class DataHandleInvalidError(DataStoreError):
+    """Raised when a data handle is unknown, released or generation-stale."""
+
+
+class DataOwnershipError(DataStoreError):
+    """Raised when an ownership transition is invalid."""
+
+
+class DataStoreWriteError(DataStoreError):
+    """Raised when a staged value cannot be stored."""
+
+
+class RunDataIndexError(DataStoreError):
+    """Raised when a run data index operation is invalid."""
+
+
+class SubmissionConflictError(AscendMazeError, RuntimeError):
+    """Raised when one submission ID is reused with a different payload."""
+
+
+class SubmissionAbortedError(AscendMazeError, RuntimeError):
+    """Raised when submission prepare or commit explicitly aborts."""
+
+
+class ResponseLostError(AscendMazeError, ConnectionError):
+    """Raised after a committed operation loses its response."""
+
+
+class RunNotTerminalError(AscendMazeError, RuntimeError):
+    """Raised when destroy is requested for a non-terminal run."""

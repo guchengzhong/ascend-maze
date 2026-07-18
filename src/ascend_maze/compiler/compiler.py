@@ -21,7 +21,6 @@ from ascend_maze.compiler.ir import (
 )
 from ascend_maze.contracts.resources import ResourceSpec
 from ascend_maze.core.canonical import (
-    CanonicalValue,
     FrozenMap,
     canonical_bytes,
     canonical_digest,
@@ -350,8 +349,10 @@ def compile_workflow(
     definitions_by_id: dict[str, TaskDefinition] = {}
     nodes_by_id: dict[str, TaskNode] = {}
     task_ids = tuple(sorted(workflow._tasks_by_id))
-    predecessors = {task_id: set() for task_id in task_ids}
-    successors = {task_id: set() for task_id in task_ids}
+    predecessors: dict[str, set[str]] = {
+        task_id: set() for task_id in task_ids
+    }
+    successors: dict[str, set[str]] = {task_id: set() for task_id in task_ids}
     literal_total = 0
 
     for draft in workflow._draft_tasks:

@@ -75,6 +75,12 @@ class CodeHandle:
     definition_id: str
     code_hash: str
 
+    def __post_init__(self) -> None:
+        for name in ("code_handle_id", "definition_id", "code_hash"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ContractValidationError(f"{name} is required")
+
 
 @dataclass(frozen=True, slots=True)
 class RuntimeArgument:
@@ -147,6 +153,44 @@ class ExecutionRequest:
     environment_fingerprint: str
 
     def __post_init__(self) -> None:
+        for name in ("dispatch_id", "run_id", "task_id", "environment_fingerprint"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ContractValidationError(f"{name} is required")
+        if (
+            isinstance(self.attempt, bool)
+            or not isinstance(self.attempt, int)
+            or self.attempt < 1
+        ):
+            raise ContractValidationError("attempt must be a positive integer")
+        if self.task_kind not in {"cpu", "npu", "io"}:
+            raise ContractValidationError("unsupported task_kind")
+        if not isinstance(self.execution_target, ExecutionTarget):
+            raise ContractValidationError("execution_target must be ExecutionTarget")
+        if not isinstance(self.code_handle, CodeHandle):
+            raise ContractValidationError("code_handle must be CodeHandle")
+        if not isinstance(self.arguments, tuple) or any(
+            not isinstance(item, RuntimeArgument) for item in self.arguments
+        ):
+            raise ContractValidationError("arguments must be RuntimeArgument tuple")
+        argument_names = [item.name for item in self.arguments]
+        if len(argument_names) != len(set(argument_names)):
+            raise ContractValidationError("runtime argument names must be unique")
+        if (
+            not isinstance(self.expected_outputs, tuple)
+            or any(
+                not isinstance(item, str) or not item
+                for item in self.expected_outputs
+            )
+            or len(self.expected_outputs) != len(set(self.expected_outputs))
+        ):
+            raise ContractValidationError("expected_outputs must contain unique names")
+        if self.timeout_ms is not None and (
+            isinstance(self.timeout_ms, bool)
+            or not isinstance(self.timeout_ms, int)
+            or self.timeout_ms <= 0
+        ):
+            raise ContractValidationError("timeout_ms must be positive or None")
         if self.execution_target is ExecutionTarget.MODEL_SERVICE:
             if self.model_route is None:
                 raise ContractValidationError(
@@ -168,6 +212,25 @@ class DispatchHandle:
     lease_id: str
     route_lease_id: str | None
     worker_endpoint_id: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "dispatch_id",
+            "backend_name",
+            "run_id",
+            "task_id",
+            "lease_id",
+            "worker_endpoint_id",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ContractValidationError(f"{name} is required")
+        if (
+            isinstance(self.attempt, bool)
+            or not isinstance(self.attempt, int)
+            or self.attempt < 1
+        ):
+            raise ContractValidationError("attempt must be a positive integer")
 
 
 @runtime_checkable

@@ -71,3 +71,77 @@ class ExecutionEvent:
 @runtime_checkable
 class RecorderSink(Protocol):
     def emit(self, event: ExecutionEvent) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RunRecordingContext:
+    schema_version: int
+    experiment_id: str
+    run_id: str
+    workflow_fingerprint: str
+    config_fingerprint: str
+    environment_fingerprint: str
+    build_revision: str
+    started_wall_time_ms: int
+    initial_expected_producer_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version < 1
+        ):
+            raise ContractValidationError("schema_version must be a positive integer")
+        for name in (
+            "experiment_id",
+            "run_id",
+            "workflow_fingerprint",
+            "config_fingerprint",
+            "environment_fingerprint",
+            "build_revision",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ContractValidationError(f"{name} is required")
+        if (
+            isinstance(self.started_wall_time_ms, bool)
+            or not isinstance(self.started_wall_time_ms, int)
+            or self.started_wall_time_ms < 0
+        ):
+            raise ContractValidationError("started_wall_time_ms must be non-negative")
+        if (
+            not isinstance(self.initial_expected_producer_ids, tuple)
+            or any(
+                not isinstance(item, str) or not item
+                for item in self.initial_expected_producer_ids
+            )
+            or len(self.initial_expected_producer_ids)
+            != len(set(self.initial_expected_producer_ids))
+        ):
+            raise ContractValidationError(
+                "initial_expected_producer_ids must contain unique producer IDs"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class FlushResult:
+    run_id: str
+    committed_files: tuple[str, ...]
+    dropped_control_event_count: int
+    dropped_telemetry_count: int
+    sequence_gap_count: int
+    missing_producer_count: int
+    writer_errors: tuple[str, ...]
+    recording_complete: bool
+    flush_duration_ms: int
+
+
+@runtime_checkable
+class ExecutionRecorder(RecorderSink, Protocol):
+    def open_run(self, context: RunRecordingContext) -> None: ...
+
+    def expect_producer(self, run_id: str, producer_id: str) -> None: ...
+
+    async def flush_run(self, run_id: str, timeout_ms: int) -> FlushResult: ...
+
+    async def close(self, timeout_ms: int) -> None: ...

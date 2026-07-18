@@ -7,7 +7,7 @@ import pytest
 
 from ascend_maze import task
 from ascend_maze.api.task import get_task_template
-from ascend_maze.core.errors import TaskDefinitionError, TaskOutputInferenceError
+from ascend_maze.core.errors import TaskDefinitionError
 from task_fixtures import barrier, summarize
 
 

@@ -9,6 +9,7 @@ import hashlib
 import inspect
 import textwrap
 from types import FunctionType
+from typing import Protocol
 
 from ascend_maze.core.canonical import canonical_bytes
 from ascend_maze.core.errors import TaskDefinitionError, TaskOutputInferenceError
@@ -29,6 +30,13 @@ class AnalyzedCallable:
 class _Flow:
     return_key_sets: tuple[tuple[str, ...], ...]
     may_fallthrough: bool
+
+
+class _TryStatement(Protocol):
+    body: list[ast.stmt]
+    handlers: list[ast.ExceptHandler]
+    orelse: list[ast.stmt]
+    finalbody: list[ast.stmt]
 
 
 def _find_function_node(source: str, name: str) -> ast.FunctionDef:
@@ -82,7 +90,7 @@ def _analyse_block(statements: list[ast.stmt], task_name: str) -> _Flow:
     return _Flow(tuple(returns), active)
 
 
-def _analyse_try(statement: ast.Try | ast.TryStar, task_name: str) -> _Flow:
+def _analyse_try(statement: _TryStatement, task_name: str) -> _Flow:
     body = _analyse_block(statement.body, task_name)
     returns = list(body.return_key_sets)
 
@@ -158,10 +166,9 @@ def _analyse_statement(statement: ast.stmt, task_name: str) -> _Flow:
         return _Flow(body.return_key_sets + otherwise.return_key_sets, True)
     if isinstance(statement, (ast.With, ast.AsyncWith)):
         return _analyse_block(statement.body, task_name)
-    try_nodes = (ast.Try,)
-    if hasattr(ast, "TryStar"):
-        try_nodes = (ast.Try, ast.TryStar)
-    if isinstance(statement, try_nodes):
+    if isinstance(statement, ast.Try):
+        return _analyse_try(statement, task_name)
+    if hasattr(ast, "TryStar") and isinstance(statement, ast.TryStar):
         return _analyse_try(statement, task_name)
     if isinstance(statement, (ast.Break, ast.Continue)):
         return _Flow((), False)

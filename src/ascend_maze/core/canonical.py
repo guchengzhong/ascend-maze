@@ -20,6 +20,8 @@ class FrozenMap(Mapping[K, V], Generic[K, V]):
     """An insertion-stable immutable mapping backed by immutable items."""
 
     __slots__ = ("_items", "_hash")
+    _items: tuple[tuple[K, V], ...]
+    _hash: int | None
 
     def __init__(self, items: Iterable[tuple[K, V]] = ()) -> None:
         frozen_items = tuple(items)

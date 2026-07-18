@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 import re
-from typing import Mapping
 
 from ascend_maze.contracts.data import DataHandle, SharedFileRef
 from ascend_maze.core.canonical import (

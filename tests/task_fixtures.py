@@ -47,3 +47,15 @@ def local_npu_task(value: str):
 @task(task_kind="npu")
 def unanchored_npu_task(value: str):
     return {"value": value}
+
+
+@task(timeout_seconds=0.02, max_retries=0)
+def timeout_task(value: str):
+    return {"result": value}
+
+
+@task(max_retries=0)
+def user_failure_task(should_fail: bool):
+    if should_fail:
+        raise RuntimeError("requested failure")
+    return {"result": "ok"}

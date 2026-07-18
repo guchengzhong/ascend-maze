@@ -16,6 +16,14 @@ def _non_negative_int(name: str, value: int) -> int:
     return value
 
 
+def _optional_non_negative_int(name: str, value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ContractValidationError(f"{name} must be a non-negative integer")
+    return value
+
+
 class ExecutionTarget(str, Enum):
     LOCAL_WORKER = "local_worker"
     MODEL_SERVICE = "model_service"
@@ -95,10 +103,12 @@ class ResourceDeclaration:
             "io_num": values.get("io_num"),
         }
         return cls(
-            cpu_num=mapped["cpu_num"],
-            mem_mb=mapped["mem_mb"],
-            npu_mem_mb=mapped["npu_mem_mb"],
-            io_num=mapped["io_num"],
+            cpu_num=_optional_non_negative_int("cpu_num", mapped["cpu_num"]),
+            mem_mb=_optional_non_negative_int("mem_mb", mapped["mem_mb"]),
+            npu_mem_mb=_optional_non_negative_int(
+                "npu_mem_mb", mapped["npu_mem_mb"]
+            ),
+            io_num=_optional_non_negative_int("io_num", mapped["io_num"]),
         )
 
 
@@ -144,8 +154,21 @@ class PlacementLease:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ContractValidationError(f"{name} must be a non-empty string or None")
+        if self.reservation_kind not in {
+            "task",
+            "standby_worker",
+            "model_instance",
+            "model_request",
+        }:
+            raise ContractValidationError("unsupported reservation_kind")
+        if not isinstance(self.resources, ReservationVector):
+            raise ContractValidationError("resources must be ReservationVector")
         if self.attempt is not None:
             _non_negative_int("attempt", self.attempt)
         _non_negative_int("snapshot_version", self.snapshot_version)
         _non_negative_int("created_at_ms", self.created_at_ms)
         _non_negative_int("dispatch_deadline_ms", self.dispatch_deadline_ms)
+        if self.dispatch_deadline_ms < self.created_at_ms:
+            raise ContractValidationError(
+                "dispatch_deadline_ms cannot precede created_at_ms"
+            )
