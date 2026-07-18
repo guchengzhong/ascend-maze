@@ -10,8 +10,11 @@ import ray
 
 from ascend_maze import Workflow
 from ascend_maze.ascend import (
+    AscendColocationConfig,
+    AscendCorrectnessConfig,
     build_ascend_node_capacity,
     build_ascend_node_observation,
+    create_ascend_colocation_config_snapshot,
 )
 from ascend_maze.control.client import InMemoryRuntimeClient
 from ascend_maze.control.node_rpc import NodeAgent, NodeAgentIdentity
@@ -29,7 +32,7 @@ from ascend_maze.contracts.worker import (
 from ascend_maze.data.index import RunDataState
 from ascend_maze.lifecycle import AttemptStatus, RunStatus
 from ascend_maze.core.errors import DataHandleInvalidError
-from ascend_maze.placement import NpuCapacity, PlacementManager
+from ascend_maze.placement import LeaseStatus, NpuCapacity, PlacementManager
 from ascend_maze.resources import DeclaredOnlyAnchorProvider
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 from tests_ascend.conftest import AscendAdmission
@@ -37,6 +40,7 @@ from tests_ascend.task_fixtures import (
     cpu_visible_device,
     impossible_multi_card_npu,
     npu_add,
+    npu_colocation_hold,
     npu_long_running,
     npu_oom,
     npu_sync_device_error,
@@ -54,15 +58,17 @@ async def _start_controller(
     use_all_devices: bool = False,
     worker_pool_config: WorkerPoolConfig | None = None,
     config_fingerprint: str | None = None,
+    platform_config: AscendCorrectnessConfig | AscendColocationConfig | None = None,
 ) -> tuple[RayHostController, NodeAgent]:
     environment = admission.environment
+    effective_config = admission.config if platform_config is None else platform_config
     capacity = build_ascend_node_capacity(
         node_id="node_ascend",
         boot_id="boot_stage4",
         node_ip="127.0.0.1",
         adapter=admission.adapter,
         environment=environment,
-        config=admission.config,
+        config=effective_config,
     )
     selected_id = admission.device.physical_device_id if device_id is None else device_id
     if use_all_devices:
@@ -75,16 +81,16 @@ async def _start_controller(
             device_id=device_id,
             chip_type=admission.device.chip_type,
             total_hbm_mb=admission.device.total_hbm_mb,
-            system_reserved_hbm_mb=admission.config.npu_system_reserved_hbm_mb,
-            task_slots_total=1,
+            system_reserved_hbm_mb=effective_config.npu_system_reserved_hbm_mb,
+            task_slots_total=effective_config.task_slots_total,
             observed_free_hbm_mb=admission.device.free_hbm_mb,
         )
         selected_ids = frozenset((selected.device_id,))
     if not use_all_devices:
         capacity = replace(capacity, npus=(selected,))
     placement = PlacementManager(
-        host_mem_headroom_mb=admission.config.host_mem_headroom_mb,
-        npu_hbm_headroom_mb=admission.config.npu_hbm_headroom_mb,
+        host_mem_headroom_mb=effective_config.host_mem_headroom_mb,
+        npu_hbm_headroom_mb=effective_config.npu_hbm_headroom_mb,
         required_environment_fingerprint=environment.environment_fingerprint,
     )
     anchors = DeclaredOnlyAnchorProvider(
@@ -104,7 +110,7 @@ async def _start_controller(
         node_capacities=(capacity,),
         anchors=anchors,
         placement=placement,
-        dispatch_timeout_ms=admission.config.worker_binding_deadline_ms,
+        dispatch_timeout_ms=effective_config.worker_binding_deadline_ms,
         worker_pool_config=worker_pool_config,
     )
     await controller.start()
@@ -165,6 +171,56 @@ def _worker_pid(controller: RayHostController, dispatch_id: str) -> int:
     assert event is not None
     assert event.worker_pid is not None
     return event.worker_pid
+
+
+def _colocation_pool_config(config: AscendColocationConfig) -> WorkerPoolConfig:
+    return WorkerPoolConfig(
+        mode="zero_hbm_standby",
+        profiles=(
+            WorkerPoolProfileConfig(
+                profile=WorkerProfile.NPU_HOST,
+                min_idle=config.standby_min_idle,
+                max_idle=config.standby_min_idle,
+                max_total=config.standby_min_idle,
+                replenish_concurrency=config.standby_min_idle,
+                idle_ttl_ms=60_000,
+                acquire_timeout_ms=30_000,
+                max_tasks_per_worker=config.max_tasks_per_worker,
+                max_worker_lifetime_ms=120_000,
+                max_rss_growth_mb=256,
+                standby_resources=ReservationVector(1, 256, 0, 0, 0),
+                termination_timeout_ms=config.hbm_recovery_deadline_ms,
+                warmup_manifest=WarmupManifest(("json",)),
+            ),
+        ),
+        reconcile_interval_ms=50,
+    )
+
+
+def _colocation_config_snapshot(
+    admission: AscendAdmission,
+    config: AscendColocationConfig,
+    pool_config: WorkerPoolConfig,
+) -> ConfigSnapshot:
+    base_snapshot = create_ascend_colocation_config_snapshot(
+        config,
+        admission.environment,
+        source_path="/etc/ascend-maze/colocation-correctness.toml",
+        build_revision="stage5c-test",
+        created_at_ms=0,
+    )
+    resolved = dict(base_snapshot.resolved.items_tuple())
+    resolved["worker_pool"] = pool_config.canonical_payload()
+    return ConfigSnapshot.create(
+        schema_version=1,
+        project_version="0.1.0",
+        source_path="/etc/ascend-maze/colocation-correctness.toml",
+        resolved=resolved,
+        model_catalog_revision="stage5c-no-model-catalog",
+        build_revision="stage5c-test",
+        runtime_versions=dict(admission.environment.versions.items_tuple()),
+        created_at_ms=0,
+    )
 
 
 async def _wait_hbm_recovery(
@@ -385,6 +441,424 @@ def test_zero_hbm_standby_jit_binds_one_shot_and_replenishes(
         assert controller.placement.active_lease_count() == 0
         if replacement_pid is not None:
             assert not _pid_exists(replacement_pid)
+
+    asyncio.run(scenario())
+
+
+def test_two_processes_share_one_real_npu_with_independent_accounting(
+    ascend_admission: AscendAdmission,
+    ascend_ray: str,
+) -> None:
+    async def scenario() -> None:
+        admission = ascend_admission
+        config = AscendColocationConfig()
+        pool_config = _colocation_pool_config(config)
+        config_snapshot = _colocation_config_snapshot(
+            admission,
+            config,
+            pool_config,
+        )
+        baseline = admission.adapter.device(
+            admission.device.physical_device_id
+        ).used_hbm_mb
+        controller, agent = await _start_controller(
+            admission,
+            ascend_ray,
+            worker_pool_config=pool_config,
+            config_fingerprint=config_snapshot.config_fingerprint,
+            platform_config=config,
+        )
+        original_pids: tuple[int, ...] = ()
+        replacement_pids: tuple[int, ...] = ()
+        try:
+            assert controller.config_fingerprint == config_snapshot.config_fingerprint
+            for _ in range(600):
+                idle = tuple(
+                    worker
+                    for worker in controller.worker_broker.snapshot().workers
+                    if worker.state is StandbyWorkerState.IDLE
+                )
+                if len(idle) == 2:
+                    assert all(worker.zero_hbm_verified for worker in idle)
+                    assert all(worker.npu_context_device_ids == () for worker in idle)
+                    original_pids = tuple(sorted(worker.process_id for worker in idle))
+                    break
+                await asyncio.sleep(0.05)
+            assert len(original_pids) == 2, controller.worker_broker.snapshot()
+            assert len(set(original_pids)) == 2
+
+            workflow = Workflow("stage5c-real-colocation")
+            first = workflow.add_task(
+                npu_colocation_hold,
+                inputs={"hold_seconds": 4.0, "megabytes": 64},
+            )
+            second = workflow.add_task(
+                npu_colocation_hold,
+                inputs={"hold_seconds": 4.0, "megabytes": 96},
+            )
+            outcome = await InMemoryRuntimeClient(controller).submit(
+                workflow,
+                inputs={},
+                submission_id="stage5c_real_colocation",
+            )
+            assert outcome.run_id is not None
+
+            active_pids: tuple[int, ...] = ()
+            for _ in range(800):
+                run = controller.snapshot(outcome.run_id)
+                task_attempts = tuple(
+                    run.task(task_id).attempts
+                    for task_id in (first.task_id, second.task_id)
+                )
+                if all(
+                    attempts and attempts[0].worker_started_at_ms is not None
+                    for attempts in task_attempts
+                ):
+                    active_pids = tuple(
+                        _worker_pid(controller, attempts[0].dispatch_id)
+                        for attempts in task_attempts
+                    )
+                    device = admission.adapter.device(
+                        admission.device.physical_device_id
+                    )
+                    observed_pids = {process.pid for process in device.processes}
+                    node = controller.placement.snapshot().nodes[0]
+                    if (
+                        set(active_pids) <= observed_pids
+                        and node.per_npu_reserved
+                        == ((admission.device.physical_device_id, 2_048, 2),)
+                    ):
+                        break
+                await asyncio.sleep(0.01)
+            assert len(set(active_pids)) == 2
+            assert set(active_pids) == set(original_pids)
+            active_device = admission.adapter.device(
+                admission.device.physical_device_id
+            )
+            assert set(active_pids) <= {
+                process.pid for process in active_device.processes
+            }
+            assert controller.placement.snapshot().nodes[0].per_npu_reserved == (
+                (admission.device.physical_device_id, 2_048, 2),
+            )
+
+            terminal = await controller.wait_run(outcome.run_id, timeout_seconds=90)
+            assert terminal.status is RunStatus.SUCCEEDED, tuple(
+                (
+                    task.task_id,
+                    task.status.value,
+                    None
+                    if task.last_error is None
+                    else (
+                        task.last_error.error_code,
+                        task.last_error.execution_phase,
+                        task.last_error.exception_type,
+                        task.last_error.platform_error_code,
+                        task.last_error.message,
+                    ),
+                    tuple(
+                        (
+                            attempt.status.value,
+                            attempt.dispatch_id,
+                            attempt.worker_started_at_ms,
+                            None
+                            if attempt.error is None
+                            else (
+                                attempt.error.error_code,
+                                attempt.error.execution_phase,
+                                attempt.error.exception_type,
+                                attempt.error.platform_error_code,
+                                attempt.error.message,
+                            ),
+                        )
+                        for attempt in task.attempts
+                    ),
+                )
+                for task in terminal.task_states
+            )
+            results = tuple(
+                controller.result(outcome.run_id, task_id)
+                for task_id in (first.task_id, second.task_id)
+            )
+            assert {result["pid"] for result in results} == set(active_pids)
+            assert all(result["result"] == 1024 for result in results)
+            assert max(result["started_ns"] for result in results) < min(
+                result["ended_ns"] for result in results
+            )
+
+            for task_id in (first.task_id, second.task_id):
+                attempt = terminal.task(task_id).attempts[0]
+                lease = controller.placement.lease_snapshot(attempt.lease_id).lease
+                assert lease.npu_device_id == admission.device.physical_device_id
+                assert lease.resources.npu_hbm_mb == 1_024
+                assert lease.resources.npu_slots == 1
+                worker = controller.ray_runtime.worker_outcome(attempt.dispatch_id)
+                assert worker is not None
+                assert worker.worker_pid in active_pids
+                assert worker.binding_verified
+                observation = worker.terminal_event.resource_observation
+                assert observation is not None
+                assert observation.worker_pid == worker.worker_pid
+                assert observation.device_id == admission.device.physical_device_id
+                assert observation.peak_npu_process_hbm_mb is not None
+                assert observation.peak_npu_process_hbm_mb > 0
+                assert (
+                    observation.npu_metric_source
+                    == "torch_npu_allocator+dcmi_process"
+                )
+
+            assert controller.placement.active_lease_count(outcome.run_id) == 0
+            assert controller.placement.snapshot().nodes[0].per_npu_reserved == (
+                (admission.device.physical_device_id, 0, 0),
+            )
+            await _wait_hbm_recovery(
+                admission,
+                baseline,
+                worker_pids=active_pids,
+            )
+            for _ in range(600):
+                idle = tuple(
+                    worker
+                    for worker in controller.worker_broker.snapshot().workers
+                    if worker.state is StandbyWorkerState.IDLE
+                    and worker.process_id not in active_pids
+                )
+                if len(idle) == 2:
+                    replacement_pids = tuple(
+                        sorted(worker.process_id for worker in idle)
+                    )
+                    assert all(worker.zero_hbm_verified for worker in idle)
+                    break
+                await asyncio.sleep(0.05)
+            assert len(replacement_pids) == 2, controller.worker_broker.snapshot()
+            assert controller.worker_broker.snapshot().standby_hits == 2
+            assert controller.worker_broker.snapshot().cold_starts == 0
+            assert controller.placement.active_lease_count() == 2
+            _assert_run_terminal_checkpoint(
+                controller,
+                outcome.run_id,
+                expected_handle_count=8,
+            )
+            await _destroy_and_assert(controller, outcome.run_id)
+        finally:
+            await agent.close(grace_seconds=0)
+            await controller.close()
+        assert controller.placement.active_lease_count() == 0
+        assert all(not _pid_exists(pid) for pid in replacement_pids)
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_colocated_run_and_late_result_do_not_release_survivor(
+    ascend_admission: AscendAdmission,
+    ascend_ray: str,
+) -> None:
+    async def scenario() -> None:
+        admission = ascend_admission
+        config = AscendColocationConfig()
+        pool_config = _colocation_pool_config(config)
+        config_snapshot = _colocation_config_snapshot(
+            admission,
+            config,
+            pool_config,
+        )
+        baseline = admission.adapter.device(
+            admission.device.physical_device_id
+        ).used_hbm_mb
+        controller, agent = await _start_controller(
+            admission,
+            ascend_ray,
+            worker_pool_config=pool_config,
+            config_fingerprint=config_snapshot.config_fingerprint,
+            platform_config=config,
+        )
+        active_pids: tuple[int, ...] = ()
+        replacement_pids: tuple[int, ...] = ()
+        try:
+            for _ in range(600):
+                idle = tuple(
+                    worker
+                    for worker in controller.worker_broker.snapshot().workers
+                    if worker.state is StandbyWorkerState.IDLE
+                )
+                if len(idle) == 2:
+                    assert all(worker.zero_hbm_verified for worker in idle)
+                    break
+                await asyncio.sleep(0.05)
+            assert len(idle) == 2, controller.worker_broker.snapshot()
+
+            cancelled_workflow = Workflow("stage5c-cancelled-colocated-run")
+            cancelled_node = cancelled_workflow.add_task(npu_long_running, inputs={})
+            survivor_workflow = Workflow("stage5c-surviving-colocated-run")
+            survivor_node = survivor_workflow.add_task(
+                npu_colocation_hold,
+                inputs={"hold_seconds": 8.0, "megabytes": 64},
+            )
+            client = InMemoryRuntimeClient(controller)
+            cancelled_outcome = await client.submit(
+                cancelled_workflow,
+                inputs={},
+                submission_id="stage5c_cancelled_colocated_run",
+            )
+            survivor_outcome = await client.submit(
+                survivor_workflow,
+                inputs={},
+                submission_id="stage5c_surviving_colocated_run",
+            )
+            assert cancelled_outcome.run_id is not None
+            assert survivor_outcome.run_id is not None
+
+            cancelled_attempt = None
+            survivor_attempt = None
+            for _ in range(1_200):
+                cancelled = controller.snapshot(cancelled_outcome.run_id)
+                survivor = controller.snapshot(survivor_outcome.run_id)
+                cancelled_task = cancelled.task(cancelled_node.task_id)
+                survivor_task = survivor.task(survivor_node.task_id)
+                if (
+                    cancelled_task.attempts
+                    and cancelled_task.attempts[0].worker_started_at_ms is not None
+                    and survivor_task.attempts
+                    and survivor_task.attempts[0].worker_started_at_ms is not None
+                ):
+                    cancelled_attempt = cancelled_task.attempts[0]
+                    survivor_attempt = survivor_task.attempts[0]
+                    active_pids = (
+                        _worker_pid(controller, cancelled_attempt.dispatch_id),
+                        _worker_pid(controller, survivor_attempt.dispatch_id),
+                    )
+                    device_pids = {
+                        process.pid
+                        for process in admission.adapter.device(
+                            admission.device.physical_device_id
+                        ).processes
+                    }
+                    if (
+                        set(active_pids) <= device_pids
+                        and controller.placement.snapshot()
+                        .nodes[0]
+                        .per_npu_reserved
+                        == ((admission.device.physical_device_id, 2_048, 2),)
+                    ):
+                        break
+                await asyncio.sleep(0.01)
+            assert cancelled_attempt is not None
+            assert survivor_attempt is not None
+            assert len(set(active_pids)) == 2
+            assert controller.placement.snapshot().nodes[0].per_npu_reserved == (
+                (admission.device.physical_device_id, 2_048, 2),
+            )
+
+            cancelled = await controller.cancel_run(cancelled_outcome.run_id)
+            assert cancelled.status is RunStatus.CANCELLED
+            survivor_running = controller.snapshot(survivor_outcome.run_id)
+            assert survivor_running.status is RunStatus.RUNNING
+            survivor_lease = controller.placement.lease_snapshot(
+                survivor_attempt.lease_id
+            )
+            assert survivor_lease.status is LeaseStatus.BOUND
+            assert controller.placement.active_lease_count(
+                cancelled_outcome.run_id
+            ) == 0
+            assert controller.placement.active_lease_count(survivor_outcome.run_id) == 1
+            assert controller.placement.snapshot().nodes[0].per_npu_reserved == (
+                (admission.device.physical_device_id, 1_024, 1),
+            )
+
+            late_handle = await asyncio.to_thread(
+                controller.ray_data_store.put_staged,
+                "late-colocated-output",
+                controller.controller_generation,
+            )
+            late = RuntimeEvent.create(
+                kind=RuntimeEventKind.TASK_RESULT,
+                dispatch_id=cancelled_attempt.dispatch_id,
+                run_id=cancelled_outcome.run_id,
+                task_id=cancelled_node.task_id,
+                attempt=cancelled_attempt.attempt,
+                lease_id=cancelled_attempt.lease_id,
+                route_lease_id=None,
+                occurred_at_ms=controller.clock.monotonic_ms(),
+                output_handles=(("result", late_handle),),
+                worker_pid=1,
+                device_id=admission.device.physical_device_id,
+                binding_verified=True,
+            )
+            assert agent.endpoint is not None
+            await asyncio.to_thread(
+                report_worker_event,
+                endpoint=agent.endpoint,
+                identity=agent.identity,
+                event=late,
+                timeout_seconds=2,
+            )
+            for _ in range(200):
+                try:
+                    controller.ray_data_store.state_of(late_handle)
+                except DataHandleInvalidError:
+                    break
+                await asyncio.sleep(0.01)
+            with pytest.raises(DataHandleInvalidError):
+                controller.ray_data_store.get(late_handle)
+            assert (
+                controller.placement.lease_snapshot(survivor_attempt.lease_id).status
+                is LeaseStatus.BOUND
+            )
+            assert controller.placement.snapshot().nodes[0].per_npu_reserved == (
+                (admission.device.physical_device_id, 1_024, 1),
+            )
+
+            survivor_terminal = await controller.wait_run(
+                survivor_outcome.run_id,
+                timeout_seconds=120,
+            )
+            assert survivor_terminal.status is RunStatus.SUCCEEDED
+            assert controller.result(
+                survivor_outcome.run_id,
+                survivor_node.task_id,
+            )["result"] == 1024
+            assert controller.placement.active_lease_count(
+                survivor_outcome.run_id
+            ) == 0
+            await _wait_hbm_recovery(
+                admission,
+                baseline,
+                worker_pids=active_pids,
+            )
+
+            for _ in range(600):
+                replacements = tuple(
+                    worker
+                    for worker in controller.worker_broker.snapshot().workers
+                    if worker.state is StandbyWorkerState.IDLE
+                    and worker.process_id not in active_pids
+                )
+                if len(replacements) == 2:
+                    replacement_pids = tuple(
+                        sorted(worker.process_id for worker in replacements)
+                    )
+                    assert all(worker.zero_hbm_verified for worker in replacements)
+                    break
+                await asyncio.sleep(0.05)
+            assert len(replacement_pids) == 2, controller.worker_broker.snapshot()
+            assert controller.worker_broker.snapshot().standby_hits == 2
+            _assert_run_terminal_checkpoint(
+                controller,
+                cancelled_outcome.run_id,
+                expected_handle_count=0,
+            )
+            _assert_run_terminal_checkpoint(
+                controller,
+                survivor_outcome.run_id,
+                expected_handle_count=4,
+            )
+            await _destroy_and_assert(controller, cancelled_outcome.run_id)
+            await _destroy_and_assert(controller, survivor_outcome.run_id)
+        finally:
+            await agent.close(grace_seconds=0)
+            await controller.close()
+        assert controller.placement.active_lease_count() == 0
+        assert all(not _pid_exists(pid) for pid in replacement_pids)
 
     asyncio.run(scenario())
 

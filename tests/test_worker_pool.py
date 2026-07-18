@@ -46,6 +46,7 @@ class _EndpointFactory:
         self.submissions: list[dict[str, object]] = []
         self.fail_starts = fail_starts
         self.fail_terminations = fail_terminations
+        self.termination_timeouts: list[int] = []
 
     async def start(
         self,
@@ -79,9 +80,16 @@ class _EndpointFactory:
         self.submissions.append(kwargs)
         return kwargs
 
-    async def terminate(self, endpoint: Any, *, force: bool = False) -> None:
+    async def terminate(
+        self,
+        endpoint: Any,
+        *,
+        force: bool = False,
+        timeout_ms: int = 10_000,
+    ) -> None:
         del force
         assert isinstance(endpoint, _Endpoint)
+        self.termination_timeouts.append(timeout_ms)
         if self.fail_terminations:
             self.fail_terminations -= 1
             raise RuntimeError("injected endpoint termination failure")
@@ -111,6 +119,7 @@ def _pool_config(profile: WorkerProfile, *, min_idle: int = 1) -> WorkerPoolConf
                 max_worker_lifetime_ms=60_000,
                 max_rss_growth_mb=64,
                 standby_resources=resources,
+                termination_timeout_ms=12_345,
                 warmup_manifest=WarmupManifest(("json",)),
             ),
         ),
@@ -310,6 +319,7 @@ def test_cold_mode_uses_the_same_endpoint_protocol_on_the_leased_node() -> None:
                     max_worker_lifetime_ms=profile_config.max_worker_lifetime_ms,
                     max_rss_growth_mb=profile_config.max_rss_growth_mb,
                     standby_resources=profile_config.standby_resources,
+                    termination_timeout_ms=profile_config.termination_timeout_ms,
                     warmup_manifest=profile_config.warmup_manifest,
                 ),
             ),
@@ -347,6 +357,7 @@ def test_cold_mode_uses_the_same_endpoint_protocol_on_the_leased_node() -> None:
         }
         await broker.release(worker_lease.worker_lease_id, disposition="reuse")
         assert factory.started[0].terminated
+        assert factory.termination_timeouts == [12_345]
         assert broker.snapshot().workers[0].state is StandbyWorkerState.DEAD
         assert placement.release_lease(result.lease.lease_id, now_ms=monotonic_time_ms())
         await broker.close()
@@ -383,6 +394,21 @@ def test_worker_pool_contract_rejects_device_warmup_and_npu_reservation() -> Non
             max_worker_lifetime_ms=1,
             max_rss_growth_mb=1,
             standby_resources=ReservationVector(1, 1, 0, 1, 1),
+        )
+    with pytest.raises(ContractValidationError, match="deadlines must be positive"):
+        WorkerPoolProfileConfig(
+            profile=WorkerProfile.NPU_HOST,
+            min_idle=1,
+            max_idle=1,
+            max_total=1,
+            replenish_concurrency=1,
+            idle_ttl_ms=1,
+            acquire_timeout_ms=1,
+            max_tasks_per_worker=1,
+            max_worker_lifetime_ms=1,
+            max_rss_growth_mb=1,
+            standby_resources=ReservationVector(1, 1, 0, 0, 0),
+            termination_timeout_ms=0,
         )
 
 

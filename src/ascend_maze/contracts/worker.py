@@ -65,6 +65,7 @@ class WorkerPoolProfileConfig:
     max_worker_lifetime_ms: int
     max_rss_growth_mb: int
     standby_resources: ReservationVector
+    termination_timeout_ms: int = 10_000
     warmup_manifest: WarmupManifest = WarmupManifest()
 
     def __post_init__(self) -> None:
@@ -80,6 +81,7 @@ class WorkerPoolProfileConfig:
             "max_tasks_per_worker",
             "max_worker_lifetime_ms",
             "max_rss_growth_mb",
+            "termination_timeout_ms",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -88,9 +90,13 @@ class WorkerPoolProfileConfig:
             raise ContractValidationError(
                 "Worker Pool watermarks must satisfy min_idle <= max_idle <= max_total"
             )
-        if self.replenish_concurrency < 1 or self.acquire_timeout_ms < 1:
+        if (
+            self.replenish_concurrency < 1
+            or self.acquire_timeout_ms < 1
+            or self.termination_timeout_ms < 1
+        ):
             raise ContractValidationError(
-                "replenish_concurrency and acquire_timeout_ms must be positive"
+                "replenish_concurrency and Worker deadlines must be positive"
             )
         if self.max_tasks_per_worker < 1 or self.max_worker_lifetime_ms < 1:
             raise ContractValidationError(
@@ -167,6 +173,7 @@ class WorkerPoolConfig:
                     "max_tasks_per_worker": item.max_tasks_per_worker,
                     "max_worker_lifetime_ms": item.max_worker_lifetime_ms,
                     "max_rss_growth_mb": item.max_rss_growth_mb,
+                    "termination_timeout_ms": item.termination_timeout_ms,
                     "standby_resources": {
                         "cpu_num": item.standby_resources.cpu_num,
                         "host_mem_mb": item.standby_resources.host_mem_mb,

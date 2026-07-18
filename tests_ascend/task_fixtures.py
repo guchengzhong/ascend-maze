@@ -12,6 +12,33 @@ def npu_add(megabytes: int):
     return {"result": int(value[:1024].sum().cpu())}
 
 
+@task(
+    task_kind="npu",
+    resources={"cpu_num": 1, "mem": 256, "npu_mem": 1024},
+    max_retries=0,
+)
+def npu_colocation_hold(megabytes: int, hold_seconds: float):
+    import os
+    import time
+
+    import torch
+    import torch_npu
+
+    assert torch_npu is not None
+    element_count = megabytes * 1024 * 1024 // 4
+    value = torch.ones(element_count, dtype=torch.float32, device="npu:0")
+    torch.npu.synchronize()
+    started_ns = time.monotonic_ns()
+    time.sleep(hold_seconds)
+    ended_ns = time.monotonic_ns()
+    return {
+        "ended_ns": ended_ns,
+        "pid": os.getpid(),
+        "result": int(value[:1024].sum().cpu()),
+        "started_ns": started_ns,
+    }
+
+
 @task
 def cpu_visible_device():
     import os

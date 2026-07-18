@@ -73,7 +73,13 @@ class WorkerEndpointFactory(Protocol):
 
     def submit(self, endpoint: Any, kwargs: dict[str, object]) -> Any: ...
 
-    async def terminate(self, endpoint: Any, *, force: bool = False) -> None: ...
+    async def terminate(
+        self,
+        endpoint: Any,
+        *,
+        force: bool = False,
+        timeout_ms: int = 10_000,
+    ) -> None: ...
 
 
 @dataclass(slots=True)
@@ -656,7 +662,10 @@ class StandbyWorkerBroker:
             termination_failed = False
             if endpoint is not None:
                 try:
-                    await self.endpoint_factory.terminate(endpoint)
+                    await self.endpoint_factory.terminate(
+                        endpoint,
+                        timeout_ms=config.termination_timeout_ms,
+                    )
                 except Exception as terminate_exc:
                     termination_failed = True
                     self._termination_failures += 1
@@ -711,8 +720,15 @@ class StandbyWorkerBroker:
                 )
                 endpoint = worker.endpoint
             if endpoint is not None:
+                profile_config = self._require_profile_config(
+                    worker.descriptor.profile
+                )
                 try:
-                    await self.endpoint_factory.terminate(endpoint, force=force)
+                    await self.endpoint_factory.terminate(
+                        endpoint,
+                        force=force,
+                        timeout_ms=profile_config.termination_timeout_ms,
+                    )
                 except Exception as exc:
                     self._termination_failures += 1
                     self._emit(

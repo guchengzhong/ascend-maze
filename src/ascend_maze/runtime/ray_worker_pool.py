@@ -108,23 +108,32 @@ class RayWorkerEndpointFactory:
             raise TypeError("invalid Ray Worker endpoint")
         return endpoint.actor.execute.remote(**kwargs)
 
-    async def terminate(self, endpoint: Any, *, force: bool = False) -> None:
+    async def terminate(
+        self,
+        endpoint: Any,
+        *,
+        force: bool = False,
+        timeout_ms: int = 10_000,
+    ) -> None:
         if not isinstance(endpoint, _RayWorkerEndpoint):
             raise TypeError("invalid Ray Worker endpoint")
+        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms < 1:
+            raise ValueError("timeout_ms must be a positive integer")
+        deadline = monotonic_time_ms() + timeout_ms
         if force:
             ray.kill(endpoint.actor, no_restart=True)
         else:
             try:
+                remaining = max(0.001, (deadline - monotonic_time_ms()) / 1_000)
                 await asyncio.wait_for(
                     asyncio.to_thread(ray.get, endpoint.actor.shutdown.remote()),
-                    timeout=5,
+                    timeout=min(5.0, remaining),
                 )
             except asyncio.TimeoutError:
                 ray.kill(endpoint.actor, no_restart=True)
             except Exception:
                 # A graceful exit is reported to the caller as ActorDiedError.
                 pass
-        deadline = monotonic_time_ms() + 5_000
         while monotonic_time_ms() < deadline:
             alive = await asyncio.to_thread(
                 ray.get,
@@ -139,5 +148,6 @@ class RayWorkerEndpointFactory:
             await asyncio.sleep(0.05)
         ray.kill(endpoint.actor, no_restart=True)
         raise TimeoutError(
-            f"Ray Worker PID {endpoint.worker_pid} did not exit before cleanup deadline"
+            f"Ray Worker PID {endpoint.worker_pid} did not exit within "
+            f"{timeout_ms} ms cleanup deadline"
         )

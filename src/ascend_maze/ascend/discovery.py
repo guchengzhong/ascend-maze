@@ -10,6 +10,7 @@ import re
 import sys
 
 from ascend_maze.ascend.contracts import (
+    AscendColocationConfig,
     AscendCorrectnessConfig,
     AscendDeviceSnapshot,
     AscendEnvironmentSnapshot,
@@ -133,7 +134,7 @@ def build_ascend_node_capacity(
     node_ip: str,
     adapter: DcmiDeviceAdapter,
     environment: AscendEnvironmentSnapshot,
-    config: AscendCorrectnessConfig,
+    config: AscendCorrectnessConfig | AscendColocationConfig,
     cpu_system_reserved: int = 1,
     mem_system_reserved_mb: int = 2_048,
 ) -> NodeCapacity:

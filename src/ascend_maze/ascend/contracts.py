@@ -154,6 +154,65 @@ class AscendCorrectnessConfig:
                 raise ContractValidationError(f"{name} must be non-negative")
 
 
+@dataclass(frozen=True, slots=True)
+class AscendColocationConfig:
+    """Explicit stage-5C correctness profile for multi-process NPU sharing."""
+
+    anchor_strategy: str = "declared_only"
+    scheduler_policy: str = "fcfs"
+    task_slots_total: int = 2
+    allow_colocation: bool = True
+    max_tasks_per_worker: int = 1
+    standby_min_idle: int = 2
+    npu_system_reserved_hbm_mb: int = 4_096
+    npu_hbm_headroom_mb: int = 1_024
+    host_mem_headroom_mb: int = 1_024
+    io_slots_total: int = 8
+    worker_binding_deadline_ms: int = 30_000
+    hbm_recovery_deadline_ms: int = 30_000
+    hbm_recovery_tolerance_mb: int = 64
+
+    def __post_init__(self) -> None:
+        if self.anchor_strategy not in {"declared_only", "static"}:
+            raise ContractValidationError("unsupported colocation anchor strategy")
+        if self.scheduler_policy not in {"fcfs", "hacs_no_tp"}:
+            raise ContractValidationError("unsupported colocation scheduler policy")
+        if (
+            isinstance(self.task_slots_total, bool)
+            or not isinstance(self.task_slots_total, int)
+            or self.task_slots_total < 2
+        ):
+            raise ContractValidationError(
+                "stage-5C colocation requires at least two task slots per NPU"
+            )
+        if not self.allow_colocation:
+            raise ContractValidationError(
+                "stage-5C colocation must be explicitly enabled"
+            )
+        if self.max_tasks_per_worker != 1:
+            raise ContractValidationError(
+                "NPU colocation requires one Attempt per Worker process"
+            )
+        if (
+            isinstance(self.standby_min_idle, bool)
+            or not isinstance(self.standby_min_idle, int)
+            or self.standby_min_idle < 0
+        ):
+            raise ContractValidationError("standby_min_idle must be non-negative")
+        for name in (
+            "npu_system_reserved_hbm_mb",
+            "npu_hbm_headroom_mb",
+            "host_mem_headroom_mb",
+            "io_slots_total",
+            "worker_binding_deadline_ms",
+            "hbm_recovery_deadline_ms",
+            "hbm_recovery_tolerance_mb",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ContractValidationError(f"{name} must be non-negative")
+
+
 def create_ascend_correctness_config_snapshot(
     config: AscendCorrectnessConfig,
     environment: AscendEnvironmentSnapshot,
@@ -183,6 +242,55 @@ def create_ascend_correctness_config_snapshot(
             "max_tasks_per_worker": config.max_tasks_per_worker,
             "binding_deadline_ms": config.worker_binding_deadline_ms,
             "standby": {"min_idle": config.standby_min_idle},
+        },
+        "cleanup": {
+            "hbm_recovery_deadline_ms": config.hbm_recovery_deadline_ms,
+            "hbm_recovery_tolerance_mb": config.hbm_recovery_tolerance_mb,
+        },
+    }
+    return ConfigSnapshot.create(
+        schema_version=1,
+        project_version=project_version,
+        source_path=source_path,
+        resolved=resolved,
+        model_catalog_revision=model_catalog_revision,
+        build_revision=build_revision,
+        runtime_versions=dict(environment.versions),
+        created_at_ms=created_at_ms,
+    )
+
+
+def create_ascend_colocation_config_snapshot(
+    config: AscendColocationConfig,
+    environment: AscendEnvironmentSnapshot,
+    *,
+    source_path: str,
+    build_revision: str,
+    project_version: str = "0.1.0",
+    model_catalog_revision: str = "stage5c-no-model-catalog",
+    created_at_ms: int | None = None,
+) -> ConfigSnapshot:
+    resolved = {
+        "profile": "colocation_correctness",
+        "environment_fingerprint": environment.environment_fingerprint,
+        "scheduler": {"policy": config.scheduler_policy},
+        "anchor": {"strategy": config.anchor_strategy},
+        "placement": {
+            "task_slots_total": config.task_slots_total,
+            "allow_colocation": config.allow_colocation,
+            "npu_system_reserved_hbm_mb": config.npu_system_reserved_hbm_mb,
+            "npu_hbm_headroom_mb": config.npu_hbm_headroom_mb,
+            "host_mem_headroom_mb": config.host_mem_headroom_mb,
+            "io_slots_total": config.io_slots_total,
+        },
+        "worker": {
+            "max_tasks_per_worker": config.max_tasks_per_worker,
+            "binding_deadline_ms": config.worker_binding_deadline_ms,
+            "standby": {"min_idle": config.standby_min_idle},
+        },
+        "observation": {
+            "device_metrics_attribution": "device_only",
+            "process_hbm_attribution": "attempt",
         },
         "cleanup": {
             "hbm_recovery_deadline_ms": config.hbm_recovery_deadline_ms,
