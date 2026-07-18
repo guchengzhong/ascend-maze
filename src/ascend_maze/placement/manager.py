@@ -39,9 +39,17 @@ class LeaseStatus(str, Enum):
     RELEASED = "released"
     EXPIRED = "expired"
     INVALIDATED = "invalidated"
+    CONVERTED = "converted"
 
 
 ACTIVE_LEASE_STATUSES = frozenset({LeaseStatus.RESERVED, LeaseStatus.BOUND})
+
+
+class StandbyReservationStatus(str, Enum):
+    STARTING = "starting"
+    READY = "ready"
+    CONVERTED = "converted"
+    RETIRED = "retired"
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +172,16 @@ class _LeaseRecord:
 
 
 @dataclass(slots=True)
+class _StandbyReservationRecord:
+    worker_id: str
+    worker_generation: int
+    profile: str
+    lease_id: str
+    status: StandbyReservationStatus
+    converted_task_lease_id: str | None = None
+
+
+@dataclass(slots=True)
 class _RunPlacementRecord:
     run_id: str
     affinity_node_id: str | None = None
@@ -180,6 +198,8 @@ class PlacementResult:
     rejection_reason: str | None
     snapshot_version: int
     affinity_hit: bool
+    standby_worker_id: str | None = None
+    converted_standby_lease_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +235,16 @@ class ClusterSnapshot:
     active_lease_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class StandbyReservationSnapshot:
+    worker_id: str
+    worker_generation: int
+    profile: str
+    lease: PlacementLease
+    status: StandbyReservationStatus
+    converted_task_lease_id: str | None
+
+
 class PlacementManager:
     """Keep capacity, node health and Maze reservations under one lock."""
 
@@ -236,6 +266,7 @@ class PlacementManager:
         self.required_environment_fingerprint = required_environment_fingerprint
         self._nodes: dict[str, _NodeRecord] = {}
         self._leases: dict[str, _LeaseRecord] = {}
+        self._standby: dict[str, _StandbyReservationRecord] = {}
         self._run_contexts: dict[str, _RunPlacementRecord] = {}
         self._snapshot_version = 0
         self._lock = RLock()
@@ -331,8 +362,265 @@ class PlacementManager:
                     now_ms=now_ms,
                     reason="node_offline",
                 )
+            elif status in {
+                NodeStatus.DRAINING,
+                NodeStatus.STALE,
+                NodeStatus.UNSCHEDULABLE,
+            }:
+                invalidated = self._invalidate_standby_leases_locked(
+                    node_id,
+                    record.capacity.boot_id,
+                    now_ms=now_ms,
+                    reason=f"node_{status.value}",
+                )
             self._snapshot_version += 1
             return invalidated
+
+    def reserve_standby(
+        self,
+        *,
+        worker_id: str,
+        worker_generation: int,
+        profile: str,
+        node_id: str,
+        boot_id: str,
+        resources: ReservationVector,
+        now_ms: int,
+        startup_deadline_ms: int,
+    ) -> PlacementLease | None:
+        """Reserve Host capacity before a Standby process is created."""
+
+        if not worker_id or not profile:
+            raise ContractValidationError("Standby Worker identity and profile are required")
+        if worker_generation < 1:
+            raise ContractValidationError("worker_generation must be positive")
+        if resources.npu_hbm_mb or resources.npu_slots:
+            raise ContractValidationError("Standby Worker cannot reserve NPU capacity")
+        with self._lock:
+            existing = self._standby.get(worker_id)
+            if existing is not None:
+                return self._leases[existing.lease_id].lease
+            node = self._nodes.get(node_id)
+            if (
+                node is None
+                or node.capacity.boot_id != boot_id
+                or node.status is not NodeStatus.HEALTHY
+            ):
+                return None
+            _, reason = self._fit(node, resources)
+            if reason is not None:
+                return None
+            lease = PlacementLease(
+                lease_id=new_id("lease"),
+                reservation_kind="standby_worker",
+                run_id=None,
+                task_id=None,
+                attempt=None,
+                node_id=node_id,
+                boot_id=boot_id,
+                npu_device_id=None,
+                resources=resources,
+                snapshot_version=self._snapshot_version,
+                created_at_ms=now_ms,
+                dispatch_deadline_ms=startup_deadline_ms,
+            )
+            self._leases[lease.lease_id] = _LeaseRecord(
+                lease=lease,
+                status=LeaseStatus.RESERVED,
+            )
+            self._standby[worker_id] = _StandbyReservationRecord(
+                worker_id=worker_id,
+                worker_generation=worker_generation,
+                profile=profile,
+                lease_id=lease.lease_id,
+                status=StandbyReservationStatus.STARTING,
+            )
+            self._snapshot_version += 1
+            return lease
+
+    def activate_standby(
+        self,
+        *,
+        worker_id: str,
+        worker_generation: int,
+        lease_id: str,
+        now_ms: int,
+    ) -> bool:
+        """Make a warmed Worker visible to Task placement."""
+
+        with self._lock:
+            standby = self._require_standby(worker_id)
+            if standby.worker_generation != worker_generation or standby.lease_id != lease_id:
+                raise StateTransitionError("Standby Worker generation or lease does not match")
+            if standby.status is StandbyReservationStatus.READY:
+                return False
+            if standby.status is not StandbyReservationStatus.STARTING:
+                return False
+            lease_record = self._require_lease(lease_id)
+            if lease_record.status is not LeaseStatus.RESERVED:
+                return False
+            if lease_record.lease.dispatch_deadline_ms <= now_ms:
+                lease_record.status = LeaseStatus.EXPIRED
+                lease_record.finished_at_ms = now_ms
+                lease_record.finish_reason = "standby_startup_deadline"
+                standby.status = StandbyReservationStatus.RETIRED
+                self._snapshot_version += 1
+                return False
+            node = self._nodes.get(lease_record.lease.node_id)
+            if (
+                node is None
+                or node.capacity.boot_id != lease_record.lease.boot_id
+                or node.status is not NodeStatus.HEALTHY
+            ):
+                lease_record.status = LeaseStatus.INVALIDATED
+                lease_record.finished_at_ms = now_ms
+                lease_record.finish_reason = "standby_node_generation_invalid"
+                standby.status = StandbyReservationStatus.RETIRED
+                self._snapshot_version += 1
+                return False
+            lease_record.status = LeaseStatus.BOUND
+            standby.status = StandbyReservationStatus.READY
+            self._snapshot_version += 1
+            return True
+
+    def retire_standby(
+        self,
+        worker_id: str,
+        *,
+        now_ms: int,
+        reason: str,
+    ) -> bool:
+        with self._lock:
+            standby = self._standby.get(worker_id)
+            if standby is None or standby.status is StandbyReservationStatus.RETIRED:
+                return False
+            lease_record = self._require_lease(standby.lease_id)
+            if lease_record.status in ACTIVE_LEASE_STATUSES:
+                lease_record.status = LeaseStatus.RELEASED
+                lease_record.finished_at_ms = now_ms
+                lease_record.finish_reason = reason
+            standby.status = StandbyReservationStatus.RETIRED
+            self._snapshot_version += 1
+            return True
+
+    def purge_retired_standby(self, worker_id: str) -> bool:
+        """Drop terminal Standby ledger history after its process is confirmed dead."""
+
+        with self._lock:
+            standby = self._standby.get(worker_id)
+            if standby is None:
+                return False
+            if standby.status is not StandbyReservationStatus.RETIRED:
+                raise StateTransitionError("Standby Worker is not retired")
+            lease = self._require_lease(standby.lease_id)
+            if lease.status in ACTIVE_LEASE_STATUSES:
+                raise StateTransitionError("Standby reservation is still active")
+            del self._leases[standby.lease_id]
+            del self._standby[worker_id]
+            self._snapshot_version += 1
+            return True
+
+    def restore_task_to_standby(
+        self,
+        *,
+        task_lease_id: str,
+        worker_id: str,
+        worker_generation: int,
+        profile: str,
+        resources: ReservationVector,
+        now_ms: int,
+        idle_deadline_ms: int,
+    ) -> PlacementLease | None:
+        """Atomically replace a Task reservation after Worker sanitization."""
+
+        if resources.npu_hbm_mb or resources.npu_slots:
+            raise ContractValidationError("Standby Worker cannot reserve NPU capacity")
+        with self._lock:
+            task_record = self._require_lease(task_lease_id)
+            task_lease = task_record.lease
+            if task_record.status not in ACTIVE_LEASE_STATUSES:
+                return None
+            if task_lease.reservation_kind not in {"task", "model_request"}:
+                raise StateTransitionError("only a Task Lease can return to Standby")
+            node = self._nodes.get(task_lease.node_id)
+            if (
+                node is None
+                or node.capacity.boot_id != task_lease.boot_id
+                or node.status is not NodeStatus.HEALTHY
+            ):
+                return None
+            _, reason = self._fit(node, resources, credit_lease_id=task_lease_id)
+            if reason is not None:
+                return None
+            existing = self._standby.get(worker_id)
+            if existing is not None and existing.worker_generation != worker_generation:
+                raise StateTransitionError("Standby Worker generation changed")
+            task_record.status = LeaseStatus.CONVERTED
+            task_record.finished_at_ms = now_ms
+            task_record.finish_reason = "returned_to_standby"
+            self._clear_provisional_affinity_locked(task_lease)
+            standby_lease = PlacementLease(
+                lease_id=new_id("lease"),
+                reservation_kind="standby_worker",
+                run_id=None,
+                task_id=None,
+                attempt=None,
+                node_id=task_lease.node_id,
+                boot_id=task_lease.boot_id,
+                npu_device_id=None,
+                resources=resources,
+                snapshot_version=self._snapshot_version,
+                created_at_ms=now_ms,
+                dispatch_deadline_ms=idle_deadline_ms,
+            )
+            self._leases[standby_lease.lease_id] = _LeaseRecord(
+                lease=standby_lease,
+                status=LeaseStatus.BOUND,
+            )
+            if existing is None:
+                existing = _StandbyReservationRecord(
+                    worker_id=worker_id,
+                    worker_generation=worker_generation,
+                    profile=profile,
+                    lease_id=standby_lease.lease_id,
+                    status=StandbyReservationStatus.READY,
+                )
+                self._standby[worker_id] = existing
+            else:
+                existing.profile = profile
+                existing.lease_id = standby_lease.lease_id
+                existing.status = StandbyReservationStatus.READY
+                existing.converted_task_lease_id = None
+            self._snapshot_version += 1
+            return standby_lease
+
+    def standby_snapshot(self, worker_id: str) -> StandbyReservationSnapshot:
+        with self._lock:
+            record = self._require_standby(worker_id)
+            return StandbyReservationSnapshot(
+                worker_id=record.worker_id,
+                worker_generation=record.worker_generation,
+                profile=record.profile,
+                lease=self._require_lease(record.lease_id).lease,
+                status=record.status,
+                converted_task_lease_id=record.converted_task_lease_id,
+            )
+
+    def ready_standby_count(
+        self,
+        *,
+        node_id: str | None = None,
+        boot_id: str | None = None,
+        profile: str | None = None,
+    ) -> int:
+        with self._lock:
+            return sum(
+                record.status is StandbyReservationStatus.READY
+                and (node_id is None or self._leases[record.lease_id].lease.node_id == node_id)
+                and (boot_id is None or self._leases[record.lease_id].lease.boot_id == boot_id)
+                and (profile is None or record.profile == profile)
+                for record in self._standby.values()
+            )
 
     def try_reserve(
         self,
@@ -353,6 +641,7 @@ class PlacementManager:
                 else "task"
             )
             vector = self._reservation_vector(anchor)
+            worker_profile = self._worker_profile(anchor)
             if self._permanently_unsatisfiable(vector):
                 return PlacementResult(
                     False,
@@ -377,16 +666,37 @@ class PlacementManager:
             affinity_id = context.affinity_node_id
             requested_preference = preferred_node_id or affinity_id
             candidates: list[
-                tuple[tuple[float, str, str], _NodeRecord, str | None, bool]
+                tuple[
+                    tuple[float, str, str, str],
+                    _NodeRecord,
+                    str | None,
+                    bool,
+                    _StandbyReservationRecord | None,
+                ]
             ] = []
             rejection_counts: dict[str, int] = {}
             for record in healthy:
-                device_id, reason = self._fit(record, vector)
+                standby = self._ready_standby_for_node(
+                    record.capacity.node_id,
+                    record.capacity.boot_id,
+                    worker_profile,
+                )
+                credit_lease_id = None if standby is None else standby.lease_id
+                device_id, reason = self._fit(
+                    record,
+                    vector,
+                    credit_lease_id=credit_lease_id,
+                )
                 if reason is not None:
                     rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
                     continue
                 affinity_hit = requested_preference == record.capacity.node_id
-                score = self._pressure_score(record, vector, device_id)
+                score = self._pressure_score(
+                    record,
+                    vector,
+                    device_id,
+                    credit_lease_id=credit_lease_id,
+                )
                 priority = 0.0 if affinity_hit else 1.0 + score
                 candidates.append(
                     (
@@ -394,17 +704,21 @@ class PlacementManager:
                             priority,
                             record.capacity.node_id,
                             "" if device_id is None else device_id,
+                            "" if standby is None else standby.worker_id,
                         ),
                         record,
                         device_id,
                         affinity_hit,
+                        standby,
                     )
                 )
             if not candidates:
                 reason = self._dominant_rejection(rejection_counts)
                 return PlacementResult(False, None, reason, snapshot_version, False)
 
-            _, selected, device_id, affinity_hit = min(candidates, key=lambda item: item[0])
+            _, selected, device_id, affinity_hit, standby = min(
+                candidates, key=lambda item: item[0]
+            )
             lease = PlacementLease(
                 lease_id=new_id("lease"),
                 reservation_kind=reservation_kind,
@@ -418,7 +732,23 @@ class PlacementManager:
                 snapshot_version=snapshot_version,
                 created_at_ms=now_ms,
                 dispatch_deadline_ms=dispatch_deadline_ms,
+                converted_standby_lease_id=(
+                    None if standby is None else standby.lease_id
+                ),
+                standby_worker_id=None if standby is None else standby.worker_id,
             )
+            if standby is not None:
+                standby_lease = self._require_lease(standby.lease_id)
+                if (
+                    standby.status is not StandbyReservationStatus.READY
+                    or standby_lease.status is not LeaseStatus.BOUND
+                ):
+                    raise StateTransitionError("Standby reservation changed during placement")
+                standby_lease.status = LeaseStatus.CONVERTED
+                standby_lease.finished_at_ms = now_ms
+                standby_lease.finish_reason = f"converted_to:{lease.lease_id}"
+                standby.status = StandbyReservationStatus.CONVERTED
+                standby.converted_task_lease_id = lease.lease_id
             self._leases[lease.lease_id] = _LeaseRecord(
                 lease=lease,
                 status=LeaseStatus.RESERVED,
@@ -428,7 +758,15 @@ class PlacementManager:
                 context.affinity_boot_id = lease.boot_id
                 context.provisional_lease_id = lease.lease_id
             self._snapshot_version += 1
-            return PlacementResult(True, lease, None, snapshot_version, affinity_hit)
+            return PlacementResult(
+                True,
+                lease,
+                None,
+                snapshot_version,
+                affinity_hit,
+                None if standby is None else standby.worker_id,
+                None if standby is None else standby.lease_id,
+            )
 
     def bind_lease(self, lease_id: str, *, now_ms: int) -> bool:
         with self._lock:
@@ -547,6 +885,7 @@ class PlacementManager:
                     record.finished_at_ms = now_ms
                     record.finish_reason = "dispatch_deadline"
                     self._clear_provisional_affinity_locked(record.lease)
+                    self._retire_standby_for_lease_locked(record.lease.lease_id)
                     expired.append(record.lease)
             if expired:
                 self._snapshot_version += 1
@@ -651,13 +990,30 @@ class PlacementManager:
             npu_slots=1 if local_npu else 0,
         )
 
+    @staticmethod
+    def _worker_profile(anchor: ResourceAnchor) -> str:
+        if anchor.execution_target is ExecutionTarget.MODEL_SERVICE:
+            return "io"
+        try:
+            return {"cpu": "cpu", "io": "io", "npu": "npu_host"}[
+                anchor.task_kind
+            ]
+        except KeyError as exc:
+            raise ContractValidationError(
+                f"unsupported Task kind for Worker placement: {anchor.task_kind}"
+            ) from exc
+
     def _fit(
         self,
         node: _NodeRecord,
         vector: ReservationVector,
+        *,
+        credit_lease_id: str | None = None,
     ) -> tuple[str | None, str | None]:
         capacity = node.capacity
-        reserved = self._reserved_on_node(capacity)
+        credit = self._credit_vector(credit_lease_id)
+        incremental = vector.positive_difference(credit)
+        reserved = self._reserved_on_node(capacity, exclude_lease_id=credit_lease_id)
         cpu_free = capacity.cpu_total - capacity.cpu_system_reserved - reserved.cpu_num
         if cpu_free < vector.cpu_num:
             return None, "insufficient_cpu"
@@ -671,7 +1027,7 @@ class PlacementManager:
             if capacity.observed_free_mem_mb is None
             else max(0, capacity.observed_free_mem_mb - self.host_mem_headroom_mb)
         )
-        if min(ledger_mem_free, observed_mem) < vector.host_mem_mb:
+        if ledger_mem_free < vector.host_mem_mb or observed_mem < incremental.host_mem_mb:
             return None, "insufficient_host_memory"
         if capacity.io_slots_total - reserved.io_slots < vector.io_slots:
             return None, "io_slots_full"
@@ -687,7 +1043,9 @@ class PlacementManager:
                 continue
             any_healthy = True
             reserved_hbm, reserved_slots = self._reserved_on_npu(
-                capacity.node_id, npu.device_id
+                capacity.node_id,
+                npu.device_id,
+                exclude_lease_id=credit_lease_id,
             )
             ledger_hbm = (
                 npu.total_hbm_mb
@@ -733,9 +1091,13 @@ class PlacementManager:
         node: _NodeRecord,
         vector: ReservationVector,
         device_id: str | None,
+        *,
+        credit_lease_id: str | None = None,
     ) -> float:
         capacity = node.capacity
-        reserved = self._reserved_on_node(capacity)
+        reserved = self._reserved_on_node(
+            capacity, exclude_lease_id=credit_lease_id
+        )
         ratios: list[float] = []
         cpu_allocatable = capacity.cpu_total - capacity.cpu_system_reserved
         if cpu_allocatable > 0 and vector.cpu_num > 0:
@@ -752,6 +1114,12 @@ class PlacementManager:
         if device_id is not None:
             npu = next(item for item in capacity.npus if item.device_id == device_id)
             hbm, slots = self._reserved_on_npu(capacity.node_id, device_id)
+            if credit_lease_id is not None:
+                hbm, slots = self._reserved_on_npu(
+                    capacity.node_id,
+                    device_id,
+                    exclude_lease_id=credit_lease_id,
+                )
             hbm_allocatable = npu.total_hbm_mb - npu.system_reserved_hbm_mb
             if hbm_allocatable > 0:
                 ratios.append((hbm + vector.npu_hbm_mb) / hbm_allocatable)
@@ -759,11 +1127,17 @@ class PlacementManager:
                 ratios.append((slots + vector.npu_slots) / npu.task_slots_total)
         return max(ratios, default=0.0)
 
-    def _reserved_on_node(self, capacity: NodeCapacity) -> ReservationVector:
+    def _reserved_on_node(
+        self,
+        capacity: NodeCapacity,
+        *,
+        exclude_lease_id: str | None = None,
+    ) -> ReservationVector:
         cpu = memory = io = 0
         for record in self._leases.values():
             if (
                 record.status in ACTIVE_LEASE_STATUSES
+                and record.lease.lease_id != exclude_lease_id
                 and record.lease.node_id == capacity.node_id
                 and record.lease.boot_id == capacity.boot_id
             ):
@@ -772,17 +1146,49 @@ class PlacementManager:
                 io += record.lease.resources.io_slots
         return ReservationVector(cpu, memory, io, 0, 0)
 
-    def _reserved_on_npu(self, node_id: str, device_id: str) -> tuple[int, int]:
+    def _reserved_on_npu(
+        self,
+        node_id: str,
+        device_id: str,
+        *,
+        exclude_lease_id: str | None = None,
+    ) -> tuple[int, int]:
         hbm = slots = 0
         for record in self._leases.values():
             if (
                 record.status in ACTIVE_LEASE_STATUSES
+                and record.lease.lease_id != exclude_lease_id
                 and record.lease.node_id == node_id
                 and record.lease.npu_device_id == device_id
             ):
                 hbm += record.lease.resources.npu_hbm_mb
                 slots += record.lease.resources.npu_slots
         return hbm, slots
+
+    def _credit_vector(self, lease_id: str | None) -> ReservationVector:
+        if lease_id is None:
+            return ReservationVector(0, 0, 0, 0, 0)
+        record = self._require_lease(lease_id)
+        if record.status not in ACTIVE_LEASE_STATUSES:
+            raise StateTransitionError("reservation credit is not active")
+        return record.lease.resources
+
+    def _ready_standby_for_node(
+        self,
+        node_id: str,
+        boot_id: str,
+        profile: str,
+    ) -> _StandbyReservationRecord | None:
+        candidates = [
+            record
+            for record in self._standby.values()
+            if record.status is StandbyReservationStatus.READY
+            and record.profile == profile
+            and self._leases[record.lease_id].status is LeaseStatus.BOUND
+            and self._leases[record.lease_id].lease.node_id == node_id
+            and self._leases[record.lease_id].lease.boot_id == boot_id
+        ]
+        return min(candidates, key=lambda item: item.worker_id, default=None)
 
     @staticmethod
     def _dominant_rejection(counts: Mapping[str, int]) -> str:
@@ -818,8 +1224,40 @@ class PlacementManager:
                 record.finished_at_ms = now_ms
                 record.finish_reason = reason
                 self._clear_provisional_affinity_locked(record.lease)
+                self._retire_standby_for_lease_locked(record.lease.lease_id)
                 invalidated.append(record.lease)
         return tuple(invalidated)
+
+    def _invalidate_standby_leases_locked(
+        self,
+        node_id: str,
+        boot_id: str,
+        *,
+        now_ms: int,
+        reason: str,
+    ) -> tuple[PlacementLease, ...]:
+        invalidated: list[PlacementLease] = []
+        for standby in self._standby.values():
+            lease_record = self._leases[standby.lease_id]
+            if (
+                standby.status
+                in {StandbyReservationStatus.STARTING, StandbyReservationStatus.READY}
+                and lease_record.status in ACTIVE_LEASE_STATUSES
+                and lease_record.lease.node_id == node_id
+                and lease_record.lease.boot_id == boot_id
+            ):
+                lease_record.status = LeaseStatus.INVALIDATED
+                lease_record.finished_at_ms = now_ms
+                lease_record.finish_reason = reason
+                standby.status = StandbyReservationStatus.RETIRED
+                invalidated.append(lease_record.lease)
+        return tuple(invalidated)
+
+    def _retire_standby_for_lease_locked(self, lease_id: str) -> None:
+        for standby in self._standby.values():
+            if standby.lease_id == lease_id:
+                standby.status = StandbyReservationStatus.RETIRED
+                return
 
     def _clear_provisional_affinity_locked(self, lease: PlacementLease) -> None:
         context = self._run_contexts.get(lease.run_id or "")
@@ -855,3 +1293,9 @@ class PlacementManager:
             return self._leases[lease_id]
         except KeyError as exc:
             raise KeyError(f"unknown placement lease: {lease_id}") from exc
+
+    def _require_standby(self, worker_id: str) -> _StandbyReservationRecord:
+        try:
+            return self._standby[worker_id]
+        except KeyError as exc:
+            raise KeyError(f"unknown Standby Worker: {worker_id}") from exc

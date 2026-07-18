@@ -12,6 +12,16 @@ from ascend_maze.contracts.resources import (
     ResourceSpec,
 )
 from ascend_maze.contracts.runtime import RuntimeBackend
+from ascend_maze.contracts.worker import (
+    StandbyWorkerDescriptor,
+    StandbyWorkerState,
+    StandbyWarmupReport,
+    WarmupManifest,
+    WorkerLease,
+    WorkerPoolConfig,
+    WorkerPoolProfileConfig,
+    WorkerProfile,
+)
 from ascend_maze.contracts.submission import (
     RunInputIdentity,
     SubmissionContract,
@@ -39,5 +49,13 @@ __all__ = [
     "SubmissionContract",
     "SubmissionOptions",
     "SubmissionState",
+    "StandbyWorkerDescriptor",
+    "StandbyWorkerState",
+    "StandbyWarmupReport",
+    "WarmupManifest",
+    "WorkerLease",
+    "WorkerPoolConfig",
+    "WorkerPoolProfileConfig",
+    "WorkerProfile",
     "hash_session_key",
 ]

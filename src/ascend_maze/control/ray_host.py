@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ascend_maze.core.clock import Clock
+from ascend_maze.contracts.worker import WorkerPoolConfig
 from ascend_maze.placement import NodeCapacity
 from ascend_maze.placement import PlacementManager
 from ascend_maze.resources import ResourceAnchorProvider
@@ -37,6 +38,7 @@ class ManagedRayHost:
         placement_lookahead: int = 8,
         max_bypass_count: int = 8,
         dispatch_timeout_ms: int = 5_000,
+        worker_pool_config: WorkerPoolConfig | None = None,
     ) -> None:
         self.ray_cluster = ManagedRayCluster(ray_config)
         self.cluster_id = cluster_id
@@ -57,6 +59,7 @@ class ManagedRayHost:
         self.placement_lookahead = placement_lookahead
         self.max_bypass_count = max_bypass_count
         self.dispatch_timeout_ms = dispatch_timeout_ms
+        self.worker_pool_config = worker_pool_config
         self.controller: RayHostController | None = None
 
     async def start(self) -> RayHostController:
@@ -84,6 +87,7 @@ class ManagedRayHost:
                 placement_lookahead=self.placement_lookahead,
                 max_bypass_count=self.max_bypass_count,
                 dispatch_timeout_ms=self.dispatch_timeout_ms,
+                worker_pool_config=self.worker_pool_config,
             )
             await controller.start()
         except Exception:

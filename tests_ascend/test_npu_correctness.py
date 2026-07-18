@@ -17,6 +17,15 @@ from ascend_maze.control.client import InMemoryRuntimeClient
 from ascend_maze.control.node_rpc import NodeAgent, NodeAgentIdentity
 from ascend_maze.control.node_rpc import report_worker_event
 from ascend_maze.control.ray_controller import RayHostController
+from ascend_maze.contracts.config import ConfigSnapshot
+from ascend_maze.contracts.resources import ReservationVector
+from ascend_maze.contracts.worker import (
+    StandbyWorkerState,
+    WarmupManifest,
+    WorkerPoolConfig,
+    WorkerPoolProfileConfig,
+    WorkerProfile,
+)
 from ascend_maze.data.index import RunDataState
 from ascend_maze.lifecycle import AttemptStatus, RunStatus
 from ascend_maze.core.errors import DataHandleInvalidError
@@ -43,6 +52,8 @@ async def _start_controller(
     *,
     device_id: str | None = None,
     use_all_devices: bool = False,
+    worker_pool_config: WorkerPoolConfig | None = None,
+    config_fingerprint: str | None = None,
 ) -> tuple[RayHostController, NodeAgent]:
     environment = admission.environment
     capacity = build_ascend_node_capacity(
@@ -83,13 +94,18 @@ async def _start_controller(
         cluster_id="cluster_stage4",
         authorization_token=b"stage4-token",
         ray_namespace=ray_namespace,
-        config_fingerprint=admission.config_snapshot.config_fingerprint,
+        config_fingerprint=(
+            admission.config_snapshot.config_fingerprint
+            if config_fingerprint is None
+            else config_fingerprint
+        ),
         environment_fingerprint=environment.environment_fingerprint,
         build_revision="stage4-test",
         node_capacities=(capacity,),
         anchors=anchors,
         placement=placement,
         dispatch_timeout_ms=admission.config.worker_binding_deadline_ms,
+        worker_pool_config=worker_pool_config,
     )
     await controller.start()
     identity = NodeAgentIdentity(
@@ -230,6 +246,147 @@ def test_real_dcmi_inventory_and_frozen_environment(
     assert not admission.config.allow_colocation
     assert admission.config.max_tasks_per_worker == 1
     assert admission.config.standby_min_idle == 0
+
+
+def test_zero_hbm_standby_jit_binds_one_shot_and_replenishes(
+    ascend_admission: AscendAdmission,
+    ascend_ray: str,
+) -> None:
+    async def scenario() -> None:
+        admission = ascend_admission
+        baseline = {
+            item.physical_device_id: item.used_hbm_mb
+            for item in admission.adapter.devices()
+        }
+        pool_config = WorkerPoolConfig(
+            mode="zero_hbm_standby",
+            profiles=(
+                WorkerPoolProfileConfig(
+                    profile=WorkerProfile.NPU_HOST,
+                    min_idle=1,
+                    max_idle=1,
+                    max_total=1,
+                    replenish_concurrency=1,
+                    idle_ttl_ms=60_000,
+                    acquire_timeout_ms=30_000,
+                    max_tasks_per_worker=1,
+                    max_worker_lifetime_ms=120_000,
+                    max_rss_growth_mb=256,
+                    standby_resources=ReservationVector(1, 256, 0, 0, 0),
+                    warmup_manifest=WarmupManifest(("json",)),
+                ),
+            ),
+            reconcile_interval_ms=50,
+        )
+        resolved = dict(admission.config_snapshot.resolved.items_tuple())
+        resolved["worker_pool"] = pool_config.canonical_payload()
+        config_snapshot = ConfigSnapshot.create(
+            schema_version=1,
+            project_version="0.1.0",
+            source_path="/etc/ascend-maze/stage5b-zero-hbm.toml",
+            resolved=resolved,
+            model_catalog_revision="stage5b-no-model-catalog",
+            build_revision="stage5b-test",
+            runtime_versions=dict(admission.environment.versions.items_tuple()),
+            created_at_ms=0,
+        )
+        controller, agent = await _start_controller(
+            admission,
+            ascend_ray,
+            worker_pool_config=pool_config,
+            config_fingerprint=config_snapshot.config_fingerprint,
+        )
+        standby_pid: int | None = None
+        replacement_pid: int | None = None
+        try:
+            assert controller.config_fingerprint == config_snapshot.config_fingerprint
+            for _ in range(600):
+                workers = controller.worker_broker.snapshot().workers
+                idle = [
+                    worker
+                    for worker in workers
+                    if worker.state is StandbyWorkerState.IDLE
+                ]
+                if idle:
+                    assert idle[0].zero_hbm_verified
+                    assert idle[0].npu_context_device_ids == ()
+                    standby_pid = idle[0].process_id
+                    break
+                await asyncio.sleep(0.05)
+            assert standby_pid is not None, controller.worker_broker.snapshot()
+            for _ in range(10):
+                devices = admission.adapter.devices()
+                assert all(
+                    standby_pid not in {process.pid for process in device.processes}
+                    for device in devices
+                )
+                assert all(
+                    device.used_hbm_mb
+                    <= baseline[device.physical_device_id]
+                    + admission.config.hbm_recovery_tolerance_mb
+                    for device in devices
+                ), (baseline, devices)
+                await asyncio.sleep(0.1)
+            standby_lease = next(
+                worker.standby_lease_id
+                for worker in controller.worker_broker.snapshot().workers
+                if worker.process_id == standby_pid
+            )
+            assert standby_lease is not None
+            reservation = controller.placement.lease_snapshot(standby_lease).lease
+            assert reservation.resources.npu_hbm_mb == 0
+            assert reservation.resources.npu_slots == 0
+
+            workflow = Workflow("stage5b-zero-hbm-standby")
+            node = workflow.add_task(npu_add, inputs={"megabytes": 64})
+            outcome = await InMemoryRuntimeClient(controller).submit(
+                workflow,
+                inputs={},
+                submission_id="stage5b_zero_hbm_standby",
+            )
+            assert outcome.run_id is not None
+            terminal = await controller.wait_run(outcome.run_id, timeout_seconds=90)
+            assert terminal.status is RunStatus.SUCCEEDED
+            attempt = terminal.task(node.task_id).attempts[0]
+            worker = controller.ray_runtime.worker_outcome(attempt.dispatch_id)
+            assert worker is not None
+            assert worker.worker_pid == standby_pid
+            assert worker.binding_verified
+            assert controller.result(outcome.run_id, node.task_id) == {"result": 1024}
+            await _wait_hbm_recovery(
+                admission,
+                baseline[admission.device.physical_device_id],
+                worker_pids=(standby_pid,),
+            )
+            for _ in range(600):
+                idle = [
+                    item
+                    for item in controller.worker_broker.snapshot().workers
+                    if item.state is StandbyWorkerState.IDLE
+                    and item.process_id != standby_pid
+                ]
+                if idle:
+                    replacement_pid = idle[0].process_id
+                    break
+                await asyncio.sleep(0.05)
+            assert replacement_pid is not None, controller.worker_broker.snapshot()
+            assert all(
+                replacement_pid not in {process.pid for process in device.processes}
+                for device in admission.adapter.devices()
+            )
+            assert controller.worker_broker.snapshot().standby_hits == 1
+            assert controller.worker_broker.snapshot().cold_starts == 0
+            assert controller.placement.active_lease_count(outcome.run_id) == 0
+            assert controller.placement.active_lease_count() == 1
+            await _destroy_and_assert(controller, outcome.run_id)
+        finally:
+            await agent.close(grace_seconds=0)
+            await controller.close()
+        assert controller.placement.active_lease_count() == 0
+        if replacement_pid is not None:
+            assert not _pid_exists(replacement_pid)
+
+    asyncio.run(scenario())
 
 
 def test_real_npu_worker_binding_result_and_cpu_isolation(

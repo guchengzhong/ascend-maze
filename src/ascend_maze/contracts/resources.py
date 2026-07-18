@@ -131,6 +131,19 @@ class ReservationVector:
         ):
             _non_negative_int(name, getattr(self, name))
 
+    def positive_difference(self, credit: "ReservationVector") -> "ReservationVector":
+        """Return the additional capacity needed after replacing ``credit``."""
+
+        if not isinstance(credit, ReservationVector):
+            raise ContractValidationError("credit must be ReservationVector")
+        return ReservationVector(
+            cpu_num=max(0, self.cpu_num - credit.cpu_num),
+            host_mem_mb=max(0, self.host_mem_mb - credit.host_mem_mb),
+            io_slots=max(0, self.io_slots - credit.io_slots),
+            npu_hbm_mb=max(0, self.npu_hbm_mb - credit.npu_hbm_mb),
+            npu_slots=max(0, self.npu_slots - credit.npu_slots),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class PlacementLease:
@@ -146,12 +159,18 @@ class PlacementLease:
     snapshot_version: int
     created_at_ms: int
     dispatch_deadline_ms: int
+    converted_standby_lease_id: str | None = None
+    standby_worker_id: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("lease_id", "reservation_kind", "node_id", "boot_id"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ContractValidationError(f"{name} is required")
         for name in ("run_id", "task_id", "npu_device_id"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ContractValidationError(f"{name} must be a non-empty string or None")
+        for name in ("converted_standby_lease_id", "standby_worker_id"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value):
                 raise ContractValidationError(f"{name} must be a non-empty string or None")
@@ -172,6 +191,15 @@ class PlacementLease:
         if self.dispatch_deadline_ms < self.created_at_ms:
             raise ContractValidationError(
                 "dispatch_deadline_ms cannot precede created_at_ms"
+            )
+        converted = self.converted_standby_lease_id is not None
+        if converted != (self.standby_worker_id is not None):
+            raise ContractValidationError(
+                "converted Standby lease and Worker identity must be present together"
+            )
+        if converted and self.reservation_kind not in {"task", "model_request"}:
+            raise ContractValidationError(
+                "only Task reservations can originate from a Standby Worker"
             )
 
 

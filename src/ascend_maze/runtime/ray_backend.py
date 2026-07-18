@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import inspect
 from typing import Any
 
 import ray
@@ -32,6 +33,7 @@ from ascend_maze.runtime.ray_node_registry import RayNodeRegistry
 from ascend_maze.runtime.ray_cluster import validate_ray_version
 from ascend_maze.runtime.ray_worker import RAY_ONE_SHOT_WORKER, RayWorkerOutcome
 from ascend_maze.runtime.worker_broker import ColdWorkerBroker
+from ascend_maze.runtime.worker_pool import StandbyWorkerBroker
 
 from ascend_maze.control.node_rpc import NodeAgentIdentity, report_worker_event
 
@@ -69,7 +71,7 @@ class RayRuntimeBackend:
         *,
         data_store: RayDataStore,
         node_registry: RayNodeRegistry,
-        worker_broker: ColdWorkerBroker,
+        worker_broker: ColdWorkerBroker | StandbyWorkerBroker,
         cluster_id: str,
         owner_generation: str,
         environment_fingerprint: str,
@@ -215,25 +217,31 @@ class RayRuntimeBackend:
         if code is None or code.handle != request.code_handle:
             raise ContractValidationError("CodeHandle is not prepared")
         binding = self.node_registry.resolve_lease(lease)
-        worker_lease = self.worker_broker.acquire(
-            placement_lease=lease,
-            task_kind=request.task_kind,
-            execution_target=request.execution_target,
-            now_ms=monotonic_time_ms(),
+        worker_lease = await self._maybe_await(
+            self.worker_broker.acquire(
+                placement_lease=lease,
+                task_kind=request.task_kind,
+                execution_target=request.execution_target,
+                now_ms=monotonic_time_ms(),
+            )
         )
         device_binding: DeviceBinding | None = None
         if request.task_kind == "npu":
             device_binding = DeviceBinding.from_lease(lease, binding)
             if worker_lease.bound_device_id != device_binding.physical_device_id:
-                self.worker_broker.release(
-                    worker_lease.worker_lease_id, disposition="discard"
+                await self._maybe_await(
+                    self.worker_broker.release(
+                        worker_lease.worker_lease_id, disposition="discard"
+                    )
                 )
                 raise ContractValidationError(
                     "WorkerLease device does not match PlacementLease"
                 )
         elif lease.npu_device_id is not None or lease.resources.npu_slots != 0:
-            self.worker_broker.release(
-                worker_lease.worker_lease_id, disposition="discard"
+            await self._maybe_await(
+                self.worker_broker.release(
+                    worker_lease.worker_lease_id, disposition="discard"
+                )
             )
             raise ContractValidationError(
                 "CPU/I/O Worker cannot receive an NPU PlacementLease"
@@ -269,12 +277,7 @@ class RayRuntimeBackend:
         self._dispatches[request.dispatch_id] = record
         self._attempt_dispatches[attempt_key] = request.dispatch_id
         try:
-            record.object_ref = RAY_ONE_SHOT_WORKER.options(
-                scheduling_strategy=NodeAffinitySchedulingStrategy(
-                    binding.ray_node_id, soft=False
-                ),
-                name=f"maze:{request.dispatch_id}",
-            ).remote(
+            worker_kwargs: dict[str, object] = dict(
                 request=request,
                 placement_lease=lease,
                 worker_lease=worker_lease,
@@ -285,10 +288,24 @@ class RayRuntimeBackend:
                 event_timeout_seconds=self.event_timeout_seconds,
                 device_binding=device_binding,
             )
+            if isinstance(self.worker_broker, StandbyWorkerBroker):
+                record.object_ref = self.worker_broker.submit(
+                    worker_lease.worker_lease_id,
+                    worker_kwargs,
+                )
+            else:
+                record.object_ref = RAY_ONE_SHOT_WORKER.options(
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        binding.ray_node_id, soft=False
+                    ),
+                    name=f"maze:{request.dispatch_id}",
+                ).remote(**worker_kwargs)
         except Exception:
             self._drop_dispatch(request.dispatch_id)
-            self.worker_broker.release(
-                worker_lease.worker_lease_id, disposition="discard"
+            await self._maybe_await(
+                self.worker_broker.release(
+                    worker_lease.worker_lease_id, disposition="discard"
+                )
             )
             raise
         record.monitor = asyncio.create_task(self._monitor(record))
@@ -305,7 +322,11 @@ class RayRuntimeBackend:
             return
         record.cancel_requested = True
         if not record.terminal:
-            if record.object_ref is not None:
+            if isinstance(self.worker_broker, StandbyWorkerBroker):
+                await self.worker_broker.cancel(
+                    record.worker_lease.worker_lease_id
+                )
+            elif record.object_ref is not None:
                 ray.cancel(record.object_ref, force=True, recursive=True)
             if record.monitor is not None:
                 await asyncio.gather(record.monitor, return_exceptions=True)
@@ -334,7 +355,11 @@ class RayRuntimeBackend:
         for record in self._dispatches.values():
             if not record.terminal:
                 record.cancel_requested = True
-                if record.object_ref is not None:
+                if isinstance(self.worker_broker, StandbyWorkerBroker):
+                    await self.worker_broker.cancel(
+                        record.worker_lease.worker_lease_id
+                    )
+                elif record.object_ref is not None:
                     ray.cancel(record.object_ref, force=True, recursive=True)
         monitors = [
             record.monitor
@@ -373,7 +398,12 @@ class RayRuntimeBackend:
 
     def worker_released(self, dispatch_id: str) -> bool:
         record = self._dispatches.get(dispatch_id)
-        return record is None or record.terminal
+        return record is None or (
+            record.terminal
+            and self.worker_broker.is_released(
+                record.worker_lease.worker_lease_id
+            )
+        )
 
     async def release_run(self, run_id: str) -> int:
         self._retired_runs.add(run_id)
@@ -418,7 +448,10 @@ class RayRuntimeBackend:
                     record.request.run_id,
                     "NodeAgent binding disconnected during an active Attempt",
                 )
-                if record.object_ref is not None:
+                if (
+                    not isinstance(self.worker_broker, StandbyWorkerBroker)
+                    and record.object_ref is not None
+                ):
                     ray.cancel(record.object_ref, force=True, recursive=True)
 
     def active_dispatch_count(self, run_id: str | None = None) -> int:
@@ -493,10 +526,48 @@ class RayRuntimeBackend:
                         record.request.run_id,
                         "Controller did not receive the NodeAgent terminal event",
                     )
-            record.terminal = True
-            self.worker_broker.release(
-                record.worker_lease.worker_lease_id, disposition="discard"
+            disposition = (
+                "reuse"
+                if record.worker_lease.profile.value in {"cpu", "io"}
+                and record.outcome is not None
+                and record.outcome.reuse_safe
+                and not record.cancel_requested
+                and not record.invalidated
+                else "discard"
             )
+            if (
+                isinstance(self.worker_broker, StandbyWorkerBroker)
+                and record.outcome is not None
+                and record.outcome.cleanup_reason is not None
+            ):
+                self.worker_broker.record_cleanup_failure(
+                    record.worker_lease.worker_lease_id,
+                    record.outcome.cleanup_reason,
+                )
+            try:
+                await self._maybe_await(
+                    self.worker_broker.release(
+                        record.worker_lease.worker_lease_id,
+                        disposition=disposition,
+                    )
+                )
+            except Exception as exc:
+                if record.outcome is not None:
+                    await self._release_staged_outputs(
+                        record.outcome.terminal_event
+                    )
+                terminal_to_publish = self._worker_cleanup_failed_event(
+                    record,
+                    message=f"{type(exc).__name__}: {exc}",
+                )
+                self._record_delivery_error(
+                    record.request.run_id,
+                    "Worker cleanup did not reach its process-exit barrier",
+                )
+                await self._deliver_synthesized_event(
+                    record, terminal_to_publish
+                )
+            record.terminal = True
             publish = terminal_to_publish or record.node_terminal_event
             if publish is not None:
                 self._emit(publish)
@@ -541,6 +612,44 @@ class RayRuntimeBackend:
             lease_id=record.lease.lease_id,
             route_lease_id=None,
             occurred_at_ms=monotonic_time_ms(),
+            error=error,
+        )
+
+    def _worker_cleanup_failed_event(
+        self,
+        record: _DispatchRecord,
+        *,
+        message: str,
+    ) -> RuntimeEvent:
+        error = ErrorInfo(
+            schema_version=1,
+            error_code="worker_cleanup_failed",
+            category="worker",
+            origin="runtime",
+            message=message,
+            retryable_hint=False,
+            classification_confidence="exact",
+            execution_phase="cleanup",
+            run_id=record.request.run_id,
+            task_id=record.request.task_id,
+            attempt=record.request.attempt,
+            dispatch_id=record.request.dispatch_id,
+            lease_id=record.lease.lease_id,
+            node_id=record.binding.node_id,
+            boot_id=record.binding.boot_id,
+            worker_id=record.worker_lease.worker_id,
+            device_id=record.worker_lease.bound_device_id,
+            occurred_at_ms=monotonic_time_ms(),
+        )
+        return RuntimeEvent.create(
+            kind=RuntimeEventKind.TASK_FAILED,
+            dispatch_id=record.request.dispatch_id,
+            run_id=record.request.run_id,
+            task_id=record.request.task_id,
+            attempt=record.request.attempt,
+            lease_id=record.lease.lease_id,
+            route_lease_id=None,
+            occurred_at_ms=error.occurred_at_ms,
             error=error,
         )
 
@@ -605,6 +714,12 @@ class RayRuntimeBackend:
     def _require_running(self) -> None:
         if not self._started or self._closed:
             raise RuntimeError("runtime backend is not running")
+
+    @staticmethod
+    async def _maybe_await(value: Any) -> Any:
+        if inspect.isawaitable(value):
+            return await value
+        return value
 
     def _agent_identity(self, binding: RuntimeNodeBinding) -> NodeAgentIdentity:
         return NodeAgentIdentity(

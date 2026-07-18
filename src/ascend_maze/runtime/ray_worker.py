@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
 import os
+from pathlib import Path
+import sys
+import threading
 from typing import Any
 
 import ray
@@ -21,7 +25,12 @@ from ascend_maze.contracts.runtime import (
     ExecutionRequest,
     RuntimeNodeBinding,
 )
-from ascend_maze.contracts.worker import WorkerLease
+from ascend_maze.contracts.worker import (
+    StandbyWarmupReport,
+    WarmupManifest,
+    WorkerLease,
+    WorkerProfile,
+)
 from ascend_maze.core.canonical import FrozenMap
 from ascend_maze.core.time import monotonic_time_ms
 from ascend_maze.data.ray_store import RayDataStore, RayDataStoreDescriptor
@@ -34,6 +43,7 @@ from ascend_maze.ascend.torch_runtime import (
     host_peak_rss_mb,
     platform_error_code,
 )
+from ascend_maze.ascend.dcmi import DcmiDeviceAdapter
 
 from ascend_maze.control.node_rpc import (
     NodeAgentIdentity,
@@ -51,6 +61,190 @@ class RayWorkerOutcome:
     terminal_event_delivered: bool
     physical_device_id: str | None = None
     binding_verified: bool = False
+    reuse_safe: bool = False
+    cleanup_reason: str | None = None
+
+
+def _current_rss_mb() -> int:
+    try:
+        fields = Path("/proc/self/statm").read_text(encoding="ascii").split()
+        return int(int(fields[1]) * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024))
+    except (OSError, ValueError, IndexError):
+        return host_peak_rss_mb()
+
+
+def _child_process_ids() -> frozenset[int]:
+    try:
+        text = Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children").read_text(
+            encoding="ascii"
+        )
+        return frozenset(int(value) for value in text.split())
+    except (OSError, ValueError):
+        return frozenset()
+
+
+def _open_file_descriptors() -> frozenset[int]:
+    try:
+        critical: set[int] = set()
+        for item in Path("/proc/self/fd").iterdir():
+            if not item.name.isdigit():
+                continue
+            try:
+                target = os.readlink(item)
+            except OSError:
+                continue
+            if target.startswith(("socket:[", "pipe:[", "anon_inode:")):
+                continue
+            if target == "/dev/null" or target.startswith("/proc/"):
+                continue
+            critical.add(int(item.name))
+        return frozenset(critical)
+    except OSError:
+        return frozenset()
+
+
+class _RayStandbyWorker:
+    """Host-warmed Actor that delegates every Attempt to the common runner."""
+
+    def __init__(
+        self,
+        *,
+        worker_id: str,
+        worker_generation: int,
+        profile: WorkerProfile,
+        warmup_manifest: WarmupManifest,
+        max_tasks_per_worker: int,
+        max_worker_lifetime_ms: int,
+        max_rss_growth_mb: int,
+    ) -> None:
+        started = monotonic_time_ms()
+        self.worker_id = worker_id
+        self.worker_generation = worker_generation
+        self.profile = profile
+        self.max_tasks_per_worker = max_tasks_per_worker
+        self.max_worker_lifetime_ms = max_worker_lifetime_ms
+        self.max_rss_growth_mb = max_rss_growth_mb
+        self._busy = False
+        self._tasks_completed = 0
+        for module in warmup_manifest.modules:
+            importlib.import_module(module)
+        self._created_at_ms = monotonic_time_ms()
+        self._baseline_environment = dict(os.environ)
+        self._baseline_cwd = os.getcwd()
+        self._baseline_threads = frozenset(
+            thread.ident for thread in threading.enumerate() if thread.ident is not None
+        )
+        self._baseline_children = _child_process_ids()
+        self._baseline_fds = _open_file_descriptors()
+        self._baseline_rss_mb = _current_rss_mb()
+        zero_hbm_verified = profile is not WorkerProfile.NPU_HOST
+        zero_hbm_error: str | None = None
+        context_device_ids: tuple[str, ...] = ()
+        npu_used_hbm_mb: tuple[tuple[str, int], ...] = ()
+        if profile is WorkerProfile.NPU_HOST:
+            try:
+                devices = DcmiDeviceAdapter().devices()
+                context_device_ids = tuple(
+                    sorted(
+                        device.physical_device_id
+                        for device in devices
+                        if any(process.pid == os.getpid() for process in device.processes)
+                    )
+                )
+                npu_used_hbm_mb = tuple(
+                    sorted(
+                        (device.physical_device_id, device.used_hbm_mb)
+                        for device in devices
+                    )
+                )
+                zero_hbm_verified = not context_device_ids
+            except Exception as exc:
+                zero_hbm_error = f"{type(exc).__name__}: {exc}"
+        self._warmup_report = StandbyWarmupReport(
+            worker_id=worker_id,
+            worker_generation=worker_generation,
+            ray_node_id=ray.get_runtime_context().get_node_id(),
+            worker_pid=os.getpid(),
+            imported_modules=warmup_manifest.modules,
+            forbidden_device_modules=tuple(
+                name
+                for name in sorted(sys.modules)
+                if name in {"acl", "torch_npu"}
+                or name.startswith(("acl.", "torch_npu."))
+            ),
+            host_rss_mb=self._baseline_rss_mb,
+            host_warmup_ms=max(0, monotonic_time_ms() - started),
+            zero_hbm_verified=zero_hbm_verified,
+            zero_hbm_error=zero_hbm_error,
+            npu_context_device_ids=context_device_ids,
+            npu_used_hbm_mb=npu_used_hbm_mb,
+        )
+
+    def ready(self) -> StandbyWarmupReport:
+        return self._warmup_report
+
+    def execute(self, **kwargs: Any) -> RayWorkerOutcome:
+        worker_lease = kwargs.get("worker_lease")
+        if not isinstance(worker_lease, WorkerLease):
+            raise TypeError("Standby Worker requires a WorkerLease")
+        if (
+            worker_lease.worker_id != self.worker_id
+            or worker_lease.worker_generation != self.worker_generation
+            or worker_lease.profile is not self.profile
+        ):
+            raise RuntimeError("worker_generation_mismatch")
+        if self._busy:
+            raise RuntimeError("Standby Worker already has an active Attempt")
+        self._busy = True
+        try:
+            outcome = _execute_one_shot(**kwargs)
+            self._tasks_completed += 1
+            if self.profile is WorkerProfile.NPU_HOST:
+                return outcome
+            cleanup_reason = self._sanitize()
+            return RayWorkerOutcome(
+                dispatch_id=outcome.dispatch_id,
+                ray_node_id=outcome.ray_node_id,
+                worker_pid=outcome.worker_pid,
+                worker_started_delivered=outcome.worker_started_delivered,
+                terminal_event=outcome.terminal_event,
+                terminal_event_delivered=outcome.terminal_event_delivered,
+                physical_device_id=outcome.physical_device_id,
+                binding_verified=outcome.binding_verified,
+                reuse_safe=cleanup_reason is None,
+                cleanup_reason=cleanup_reason,
+            )
+        finally:
+            self._busy = False
+
+    def shutdown(self) -> None:
+        ray.actor.exit_actor()
+
+    def _sanitize(self) -> str | None:
+        try:
+            os.chdir(self._baseline_cwd)
+            for name in tuple(os.environ):
+                if name not in self._baseline_environment:
+                    del os.environ[name]
+            os.environ.update(self._baseline_environment)
+        except OSError as exc:
+            return f"environment_restore_failed:{type(exc).__name__}"
+        threads = frozenset(
+            thread.ident for thread in threading.enumerate() if thread.ident is not None
+        )
+        if threads - self._baseline_threads:
+            return "background_thread_leaked"
+        if _child_process_ids() - self._baseline_children:
+            return "child_process_leaked"
+        if _open_file_descriptors() - self._baseline_fds:
+            return "file_descriptor_leaked"
+        if _current_rss_mb() - self._baseline_rss_mb > self.max_rss_growth_mb:
+            return "rss_limit_exceeded"
+        if self._tasks_completed >= self.max_tasks_per_worker:
+            return "task_limit_reached"
+        if monotonic_time_ms() - self._created_at_ms >= self.max_worker_lifetime_ms:
+            return "worker_lifetime_exceeded"
+        return None
 
 
 def _execute_one_shot(
@@ -621,3 +815,10 @@ _RAY_REMOTE: Any = ray.remote(
     max_calls=1,
 )
 RAY_ONE_SHOT_WORKER: Any = _RAY_REMOTE(_execute_one_shot)
+
+_RAY_STANDBY_REMOTE: Any = ray.remote(
+    num_cpus=0,
+    max_restarts=0,
+    max_task_retries=0,
+)
+RAY_STANDBY_WORKER: Any = _RAY_STANDBY_REMOTE(_RayStandbyWorker)

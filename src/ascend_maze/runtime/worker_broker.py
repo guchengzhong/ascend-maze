@@ -94,6 +94,11 @@ class ColdWorkerBroker:
                 for record in self._records.values()
             )
 
+    def is_released(self, worker_lease_id: str) -> bool:
+        with self._lock:
+            record = self._records.get(worker_lease_id)
+            return record is None or record.released
+
     def purge_released(self) -> int:
         with self._lock:
             keys = [key for key, record in self._records.items() if record.released]

@@ -12,6 +12,8 @@ from ascend_maze.placement.manager import (
     PlacementManager,
     PlacementResult,
     RunPlacementSnapshot,
+    StandbyReservationSnapshot,
+    StandbyReservationStatus,
     NodeObservation,
 )
 
@@ -28,4 +30,6 @@ __all__ = [
     "PlacementManager",
     "PlacementResult",
     "RunPlacementSnapshot",
+    "StandbyReservationSnapshot",
+    "StandbyReservationStatus",
 ]

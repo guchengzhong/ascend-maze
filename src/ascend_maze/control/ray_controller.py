@@ -8,6 +8,7 @@ from pathlib import Path
 from ascend_maze.core.clock import Clock
 from ascend_maze.core.identifiers import new_id
 from ascend_maze.contracts.runtime import RuntimeNodeBinding
+from ascend_maze.contracts.worker import WorkerPoolConfig
 from ascend_maze.data.ray_store import RayDataStore
 from ascend_maze.placement import NodeCapacity, NodeObservation, NodeStatus
 from ascend_maze.placement import PlacementManager
@@ -18,6 +19,11 @@ from ascend_maze.runtime.ray_node_registry import (
     RuntimeNodeStatus,
 )
 from ascend_maze.runtime.worker_broker import ColdWorkerBroker
+from ascend_maze.runtime.worker_pool import (
+    StandbyWorkerBroker,
+    WorkerPoolEvent,
+)
+from ascend_maze.runtime.ray_worker_pool import RayWorkerEndpointFactory
 from ascend_maze.resources import ResourceAnchorProvider
 from ascend_maze.scheduler import QueuePartitioner, SchedulingPolicy
 
@@ -54,6 +60,7 @@ class RayHostController(InMemoryController):
         placement_lookahead: int = 8,
         max_bypass_count: int = 8,
         dispatch_timeout_ms: int = 5_000,
+        worker_pool_config: WorkerPoolConfig | None = None,
     ) -> None:
         generation = controller_generation or new_id("controller")
         data_store = RayDataStore.start(
@@ -62,10 +69,23 @@ class RayHostController(InMemoryController):
         )
         recorder = InMemoryRecorder()
         node_registry = RayNodeRegistry()
-        worker_broker = ColdWorkerBroker(
-            node_registry=node_registry,
-            environment_fingerprint=environment_fingerprint,
-        )
+        effective_placement = placement or PlacementManager()
+        pool_events: list[WorkerPoolEvent] = []
+        worker_broker: ColdWorkerBroker | StandbyWorkerBroker
+        if worker_pool_config is None:
+            worker_broker = ColdWorkerBroker(
+                node_registry=node_registry,
+                environment_fingerprint=environment_fingerprint,
+            )
+        else:
+            worker_broker = StandbyWorkerBroker(
+                node_registry=node_registry,
+                placement=effective_placement,
+                environment_fingerprint=environment_fingerprint,
+                config=worker_pool_config,
+                endpoint_factory=RayWorkerEndpointFactory(),
+                event_sink=pool_events.append,
+            )
         runtime = RayRuntimeBackend(
             data_store=data_store,
             node_registry=node_registry,
@@ -86,7 +106,7 @@ class RayHostController(InMemoryController):
             recorder=recorder,
             runtime=runtime,
             anchors=anchors,
-            placement=placement,
+            placement=effective_placement,
             policy=policy,
             partitioner=partitioner,
             placement_lookahead=placement_lookahead,
@@ -100,6 +120,8 @@ class RayHostController(InMemoryController):
         self.ray_recorder = recorder
         self.node_registry = node_registry
         self.worker_broker = worker_broker
+        self.worker_pool_config = worker_pool_config
+        self.pool_events = pool_events
         self.ray_runtime = runtime
         self._node_capacities = {
             capacity.node_id: capacity for capacity in node_capacities
@@ -130,6 +152,10 @@ class RayHostController(InMemoryController):
             )
         )
         self._ray_host_closed = False
+        if isinstance(worker_broker, StandbyWorkerBroker):
+            worker_broker.set_resource_changed_sink(
+                lambda reason: self._post_pool_resource_changed(reason)
+            )
 
     @property
     def node_rpc_endpoint(self) -> str:
@@ -149,7 +175,11 @@ class RayHostController(InMemoryController):
             )
             if self.local_rpc is not None:
                 await self.local_rpc.start()
+            if isinstance(self.worker_broker, StandbyWorkerBroker):
+                await self.worker_broker.start()
         except Exception:
+            if isinstance(self.worker_broker, StandbyWorkerBroker):
+                await self.worker_broker.close()
             await super().close()
             self.ray_data_store.close(kill_owner=True)
             raise
@@ -157,12 +187,14 @@ class RayHostController(InMemoryController):
     async def close(self) -> None:
         if self._ray_host_closed:
             return
-        self._ray_host_closed = True
         if self.local_rpc is not None:
             await self.local_rpc.close()
         await self.node_rpc.close()
         await super().close()
+        if isinstance(self.worker_broker, StandbyWorkerBroker):
+            await self.worker_broker.close()
         self.ray_data_store.close(kill_owner=True)
+        self._ray_host_closed = True
 
     def _controller_status(self) -> ControllerStatus:
         return ControllerStatus(
@@ -198,6 +230,8 @@ class RayHostController(InMemoryController):
                 now_ms=self.clock.monotonic_ms(),
             )
         self.core.post_resource_changed(f"node_binding_registered:{binding.node_id}")
+        if isinstance(self.worker_broker, StandbyWorkerBroker):
+            self.worker_broker.notify_changed()
 
     def _validate_node_registration(self, node_id: str) -> None:
         if node_id not in self._node_capacities:
@@ -211,6 +245,8 @@ class RayHostController(InMemoryController):
             now_ms=self.clock.monotonic_ms(),
         )
         self.core.post_resource_changed(f"node_binding_disconnected:{binding.node_id}")
+        if isinstance(self.worker_broker, StandbyWorkerBroker):
+            self.worker_broker.notify_changed()
 
     def _node_observation(self, observation: NodeObservation) -> bool:
         changed = self.placement.update_observation(observation)
@@ -219,3 +255,6 @@ class RayHostController(InMemoryController):
                 f"node_observation:{observation.node_id}:{observation.sequence}"
             )
         return changed
+
+    def _post_pool_resource_changed(self, reason: str) -> None:
+        self.core.post_resource_changed(reason)

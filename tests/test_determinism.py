@@ -56,6 +56,7 @@ def test_common_modules_do_not_import_runtime_heavy_dependencies() -> None:
         "src/ascend_maze/runtime/ray_cluster.py",
         "src/ascend_maze/runtime/ray_node_registry.py",
         "src/ascend_maze/runtime/ray_worker.py",
+        "src/ascend_maze/runtime/ray_worker_pool.py",
     }
     violations: list[tuple[str, str]] = []
     for path in (ROOT / "src" / "ascend_maze").rglob("*.py"):
