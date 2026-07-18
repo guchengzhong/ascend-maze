@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import re
 from typing import Mapping, cast
 
+from ascend_maze.contracts.config import ConfigSnapshot
 from ascend_maze.core.canonical import FrozenMap, canonical_digest, freeze_canonical
 from ascend_maze.core.errors import ContractValidationError
 
@@ -151,3 +152,50 @@ class AscendCorrectnessConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ContractValidationError(f"{name} must be non-negative")
+
+
+def create_ascend_correctness_config_snapshot(
+    config: AscendCorrectnessConfig,
+    environment: AscendEnvironmentSnapshot,
+    *,
+    source_path: str,
+    build_revision: str,
+    project_version: str = "0.1.0",
+    model_catalog_revision: str = "stage4-no-model-catalog",
+    created_at_ms: int | None = None,
+) -> ConfigSnapshot:
+    """Bind every stage-four correctness setting to the formal config identity."""
+
+    resolved = {
+        "profile": "correctness",
+        "environment_fingerprint": environment.environment_fingerprint,
+        "scheduler": {"policy": "fcfs"},
+        "anchor": {"strategy": config.anchor_strategy},
+        "placement": {
+            "task_slots_total": config.task_slots_total,
+            "allow_colocation": config.allow_colocation,
+            "npu_system_reserved_hbm_mb": config.npu_system_reserved_hbm_mb,
+            "npu_hbm_headroom_mb": config.npu_hbm_headroom_mb,
+            "host_mem_headroom_mb": config.host_mem_headroom_mb,
+            "io_slots_total": config.io_slots_total,
+        },
+        "worker": {
+            "max_tasks_per_worker": config.max_tasks_per_worker,
+            "binding_deadline_ms": config.worker_binding_deadline_ms,
+            "standby": {"min_idle": config.standby_min_idle},
+        },
+        "cleanup": {
+            "hbm_recovery_deadline_ms": config.hbm_recovery_deadline_ms,
+            "hbm_recovery_tolerance_mb": config.hbm_recovery_tolerance_mb,
+        },
+    }
+    return ConfigSnapshot.create(
+        schema_version=1,
+        project_version=project_version,
+        source_path=source_path,
+        resolved=resolved,
+        model_catalog_revision=model_catalog_revision,
+        build_revision=build_revision,
+        runtime_versions=dict(environment.versions),
+        created_at_ms=created_at_ms,
+    )

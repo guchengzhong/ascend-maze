@@ -8,6 +8,7 @@ from ascend_maze import Workflow
 from ascend_maze.ascend.contracts import (
     AscendCorrectnessConfig,
     AscendEnvironmentSnapshot,
+    create_ascend_correctness_config_snapshot,
 )
 from ascend_maze.compiler import compile_workflow
 from ascend_maze.control.client import InMemoryRuntimeClient
@@ -94,6 +95,53 @@ def test_environment_fingerprint_covers_versions_and_chip_family() -> None:
     )
     assert first.environment_fingerprint == same.environment_fingerprint
     assert first.environment_fingerprint != changed.environment_fingerprint
+
+
+def test_correctness_config_snapshot_covers_every_stage_four_setting() -> None:
+    environment = AscendEnvironmentSnapshot.create(
+        machine="aarch64",
+        chip_types=("910B3",),
+        versions={"cann": "9.0", "torch_npu": "2.7.1"},
+    )
+    config = AscendCorrectnessConfig()
+    snapshot = create_ascend_correctness_config_snapshot(
+        config,
+        environment,
+        source_path="/etc/ascend-maze/correctness.toml",
+        build_revision="stage4-test-build",
+        created_at_ms=1,
+    )
+    assert snapshot.resolved["profile"] == "correctness"
+    assert snapshot.resolved["scheduler"]["policy"] == "fcfs"
+    assert snapshot.resolved["anchor"]["strategy"] == config.anchor_strategy
+    assert snapshot.resolved["placement"] == FrozenMap(
+        (
+            ("allow_colocation", config.allow_colocation),
+            ("host_mem_headroom_mb", config.host_mem_headroom_mb),
+            ("io_slots_total", config.io_slots_total),
+            ("npu_hbm_headroom_mb", config.npu_hbm_headroom_mb),
+            (
+                "npu_system_reserved_hbm_mb",
+                config.npu_system_reserved_hbm_mb,
+            ),
+            ("task_slots_total", config.task_slots_total),
+        )
+    )
+    assert snapshot.resolved["worker"]["max_tasks_per_worker"] == 1
+    assert snapshot.resolved["worker"]["standby"]["min_idle"] == 0
+    assert snapshot.resolved["cleanup"]["hbm_recovery_deadline_ms"] == 30_000
+    assert snapshot.resolved["environment_fingerprint"] == (
+        environment.environment_fingerprint
+    )
+
+    static_snapshot = create_ascend_correctness_config_snapshot(
+        AscendCorrectnessConfig(anchor_strategy="static"),
+        environment,
+        source_path="/etc/ascend-maze/correctness.toml",
+        build_revision="stage4-test-build",
+        created_at_ms=1,
+    )
+    assert static_snapshot.config_fingerprint != snapshot.config_fingerprint
 
 
 def test_device_binding_is_derived_only_from_one_npu_lease() -> None:

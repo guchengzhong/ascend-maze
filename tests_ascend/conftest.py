@@ -13,8 +13,10 @@ from ascend_maze.ascend import (
     AscendDeviceSnapshot,
     AscendEnvironmentSnapshot,
     DcmiDeviceAdapter,
+    create_ascend_correctness_config_snapshot,
     discover_ascend_environment,
 )
+from ascend_maze.contracts.config import ConfigSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +24,7 @@ class AscendAdmission:
     adapter: DcmiDeviceAdapter
     environment: AscendEnvironmentSnapshot
     config: AscendCorrectnessConfig
+    config_snapshot: ConfigSnapshot
     device: AscendDeviceSnapshot
 
 
@@ -53,10 +56,19 @@ def ascend_admission() -> AscendAdmission:
     }
     if mismatches:
         raise RuntimeError(f"stage 4 environment version mismatch: {mismatches}")
+    config = AscendCorrectnessConfig()
+    config_snapshot = create_ascend_correctness_config_snapshot(
+        config,
+        environment,
+        source_path="/etc/ascend-maze/correctness.toml",
+        build_revision="stage4-test-build",
+        created_at_ms=0,
+    )
     return AscendAdmission(
         adapter=adapter,
         environment=environment,
-        config=AscendCorrectnessConfig(),
+        config=config,
+        config_snapshot=config_snapshot,
         device=eligible[0],
     )
 

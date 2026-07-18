@@ -73,7 +73,7 @@ async def _start_controller(
         cluster_id="cluster_stage4",
         authorization_token=b"stage4-token",
         ray_namespace=ray_namespace,
-        config_fingerprint="c" * 64,
+        config_fingerprint=admission.config_snapshot.config_fingerprint,
         environment_fingerprint=environment.environment_fingerprint,
         build_revision="stage4-test",
         node_capacities=(capacity,),
@@ -173,6 +173,9 @@ def test_real_npu_worker_binding_result_and_cpu_isolation(
         controller, agent = await _start_controller(admission, ascend_ray)
         try:
             assert controller.core.dispatch_timeout_ms == 30_000
+            assert controller.config_fingerprint == (
+                admission.config_snapshot.config_fingerprint
+            )
             workflow = Workflow("stage4-real-success")
             npu_node = workflow.add_task(npu_add, inputs={"megabytes": 64})
             cpu_node = workflow.add_task(cpu_visible_device, inputs={})
