@@ -18,7 +18,7 @@ from ascend_maze.core.errors import (
     ResponseLostError,
     SubmissionConflictError,
 )
-from ascend_maze.lifecycle import RunStatus
+from ascend_maze.lifecycle import RunStatus, TaskStatus
 from ascend_maze.placement import LeaseStatus, NodeCapacity, NodeStatus
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 
@@ -137,6 +137,79 @@ def test_ray_host_controller_completes_submit_result_destroy_closure(
             assert controller.ray_data_store.active_count == 0
             assert controller.ray_runtime.code_reference_count() == 0
             assert controller.indexes.active_count == 0
+        finally:
+            if agent is not None:
+                await agent.close(grace_seconds=0)
+            await controller.close()
+
+    asyncio.run(scenario())
+
+
+def test_node_registration_resource_change_wakes_queued_run(
+    ray_namespace: str,
+) -> None:
+    async def scenario() -> None:
+        @task
+        def echo(value: str):
+            return {"result": value}
+
+        controller = RayHostController(
+            cluster_id="cluster_resource_wakeup",
+            authorization_token=b"test-token",
+            ray_namespace=ray_namespace,
+            config_fingerprint=CONFIG,
+            environment_fingerprint=ENVIRONMENT,
+            build_revision="test_build",
+            node_capacities=(_node(),),
+        )
+        agent: NodeAgent | None = None
+        try:
+            await controller.start()
+            controller.placement.set_node_status(
+                "node_a",
+                NodeStatus.UNSCHEDULABLE,
+                now_ms=controller.clock.monotonic_ms(),
+            )
+            workflow = Workflow("ray-resource-change-wakeup")
+            node = workflow.add_task(echo, inputs={"value": "ready"})
+            outcome = await InMemoryRuntimeClient(controller).submit(
+                workflow,
+                inputs={},
+                submission_id="submission_ray_resource_wakeup",
+            )
+            assert outcome.run_id is not None
+            await controller.core.wake_deadlines()
+            queued = controller.snapshot(outcome.run_id).task(node.task_id)
+            assert queued.status is TaskStatus.QUEUED
+            assert queued.attempt_count == 0
+
+            identity = NodeAgentIdentity(
+                cluster_id="cluster_resource_wakeup",
+                node_id="node_a",
+                boot_id="boot_1",
+                ray_node_id=ray.get_runtime_context().get_node_id(),
+                agent_generation="agent_1",
+                environment_fingerprint=ENVIRONMENT,
+                producer_id="node_agent:node_a:agent_1",
+            )
+            agent = NodeAgent(
+                identity=identity,
+                authorization_token=b"test-token",
+                heartbeat_interval_ms=50,
+            )
+            await agent.start(controller_endpoint=controller.node_rpc_endpoint)
+
+            terminal = await controller.wait_run(outcome.run_id, timeout_seconds=20)
+            assert terminal.status is RunStatus.SUCCEEDED
+            assert controller.result(outcome.run_id, node.task_id) == {"result": "ready"}
+            assert any(
+                event.event_type == "resource_changed"
+                and event.payload["reason"] == "node_binding_registered:node_a"
+                for event in controller.recorder.events(outcome.run_id)
+            )
+            assert controller.placement.active_lease_count(outcome.run_id) == 0
+            destroyed = await controller.destroy_run(outcome.run_id)
+            assert destroyed.flush_result.recording_complete
         finally:
             if agent is not None:
                 await agent.close(grace_seconds=0)

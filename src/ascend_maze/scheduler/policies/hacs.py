@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import heapq
 import math
+from time import perf_counter_ns
 
 from ascend_maze.core.clock import Clock, SystemClock
 from ascend_maze.scheduler.contracts import (
@@ -60,6 +61,8 @@ class HacsGlobalState:
     avg_dct_seconds: float
     completed_run_count: int = 0
     dct_generation: int = 0
+    last_rebuild_ms: float = 0.0
+    last_rebuild_task_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +273,8 @@ class HacsNoTpStaticPolicy:
             avg_dct_seconds=self._global.avg_dct_seconds,
             completed_run_count=self._global.completed_run_count,
             dct_generation=self._global.dct_generation,
+            last_rebuild_ms=self._global.last_rebuild_ms,
+            last_rebuild_task_count=self._global.last_rebuild_task_count,
         )
 
     def active_count(self) -> int:
@@ -317,7 +322,9 @@ class HacsNoTpStaticPolicy:
 
     def _proposal(self, token: QueueToken) -> DispatchProposal:
         queued = self._active[token]
+        started_ns = perf_counter_ns()
         score = self.score_for(queued.view)
+        score_compute_ms = (perf_counter_ns() - started_ns) / 1_000_000
         return DispatchProposal(
             task_key=token.task_key,
             queue_generation=token.queue_generation,
@@ -336,10 +343,14 @@ class HacsNoTpStaticPolicy:
                 ("rank", score.rank),
                 ("priority_generation", score.priority_generation),
                 ("dct_generation", score.dct_generation),
+                ("last_rebuild_ms", self._global.last_rebuild_ms),
+                ("last_rebuild_task_count", self._global.last_rebuild_task_count),
             ),
+            score_compute_ms=score_compute_ms,
         )
 
     def _rebuild_heaps(self) -> None:
+        started_ns = perf_counter_ns()
         rebuilt: dict[str, list[_HeapEntry]] = {}
         for queued in self._active.values():
             rebuilt.setdefault(queued.partition, []).append(
@@ -348,6 +359,8 @@ class HacsNoTpStaticPolicy:
         for heap in rebuilt.values():
             heapq.heapify(heap)
         self._heaps = rebuilt
+        self._global.last_rebuild_ms = (perf_counter_ns() - started_ns) / 1_000_000
+        self._global.last_rebuild_task_count = len(self._active)
 
 
 class LinearScanReferenceQueue(HacsNoTpStaticPolicy):

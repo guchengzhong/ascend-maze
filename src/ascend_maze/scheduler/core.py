@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from collections.abc import Callable
+from time import perf_counter_ns
 from typing import Any, Protocol
 
 from ascend_maze.compiler.ir import (
@@ -140,6 +141,11 @@ class _WakeCommand:
     future: asyncio.Future[None]
 
 
+@dataclass(frozen=True, slots=True)
+class _ResourceChanged:
+    reason: str
+
+
 class SchedulerRuntimeBackend(RuntimeBackend, Protocol):
     environment_fingerprint: str
 
@@ -268,6 +274,24 @@ class SchedulerCore:
         await self._queue.put(_WakeCommand(future))
         await future
 
+    def post_resource_changed(self, reason: str) -> bool:
+        """Wake queued placement after an authoritative cluster resource change."""
+
+        if not reason:
+            raise ValueError("resource change reason is required")
+        if self._loop is None or not self._running:
+            return False
+        event = _ResourceChanged(reason)
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is self._loop:
+            self._queue.put_nowait(event)
+        else:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, event)
+        return True
+
     async def wait_terminal(
         self,
         run_id: str,
@@ -372,6 +396,13 @@ class SchedulerCore:
                 item.future.set_result(destroy_result)
             elif isinstance(item, _WakeCommand):
                 item.future.set_result(None)
+            elif isinstance(item, _ResourceChanged):
+                for run_id in sorted({key.run_id for key in self._queued}):
+                    self._record(
+                        run_id,
+                        "resource_changed",
+                        payload={"reason": item.reason},
+                    )
             elif isinstance(item, _ShutdownCommand):
                 await self._shutdown_active_runs()
                 self._running = False
@@ -494,7 +525,9 @@ class SchedulerCore:
             ] + partitions[: self._partition_cursor % len(partitions)]
             self._partition_cursor = (self._partition_cursor + 1) % len(partitions)
             for partition in ordered:
+                policy_started_ns = perf_counter_ns()
                 proposals = self.policy.propose(partition, self.placement_lookahead)
+                policy_select_ms = (perf_counter_ns() - policy_started_ns) / 1_000_000
                 blocked_before: list[TaskKey] = []
                 for proposal_rank, proposal in enumerate(proposals, start=1):
                     key = proposal.task_key
@@ -520,6 +553,8 @@ class SchedulerCore:
                             proposal_rank=proposal_rank,
                             placement_selected=False,
                             pending_reason=reason,
+                            policy_select_ms=policy_select_ms,
+                            placement_ms=0.0,
                         )
                         blocked_before.append(key)
                         if self._bypass_exhausted(key):
@@ -528,6 +563,7 @@ class SchedulerCore:
                     task_snapshot = self.state.snapshot(key.run_id).task(key.task_id)
                     next_attempt = task_snapshot.attempt_count + 1
                     now = self.clock.monotonic_ms()
+                    placement_started_ns = perf_counter_ns()
                     placement = self.placement.try_reserve(
                         run_id=key.run_id,
                         task_id=key.task_id,
@@ -536,6 +572,7 @@ class SchedulerCore:
                         now_ms=now,
                         dispatch_deadline_ms=now + self.dispatch_timeout_ms,
                     )
+                    placement_ms = (perf_counter_ns() - placement_started_ns) / 1_000_000
                     if not placement.selected:
                         if (
                             placement.rejection_reason
@@ -552,6 +589,8 @@ class SchedulerCore:
                                 proposal_rank=proposal_rank,
                                 placement_selected=False,
                                 pending_reason=placement.rejection_reason,
+                                policy_select_ms=policy_select_ms,
+                                placement_ms=placement_ms,
                             )
                             await self._fail_pre_attempt_unsatisfiable(
                                 key.run_id,
@@ -573,6 +612,8 @@ class SchedulerCore:
                             proposal_rank=proposal_rank,
                             placement_selected=False,
                             pending_reason=reason,
+                            policy_select_ms=policy_select_ms,
+                            placement_ms=placement_ms,
                         )
                         blocked_before.append(key)
                         if self._bypass_exhausted(key):
@@ -587,6 +628,8 @@ class SchedulerCore:
                         proposal_rank=proposal_rank,
                         placement_selected=True,
                         pending_reason=None,
+                        policy_select_ms=policy_select_ms,
+                        placement_ms=placement_ms,
                     )
                     self._expect_runtime_producer(key.run_id, placement.lease)
                     dispatch_id = new_id("dispatch")
@@ -1579,6 +1622,8 @@ class SchedulerCore:
         proposal_rank: int,
         placement_selected: bool,
         pending_reason: str | None,
+        policy_select_ms: float,
+        placement_ms: float,
     ) -> None:
         blocked = self._blocked.get(proposal.task_key)
         try:
@@ -1599,6 +1644,9 @@ class SchedulerCore:
                 "policy_metadata": policy_metadata,
                 "placement_selected": placement_selected,
                 "pending_reason": pending_reason,
+                "score_compute_ms": proposal.score_compute_ms,
+                "policy_select_ms": policy_select_ms,
+                "placement_ms": placement_ms,
                 "queue_length": sum(
                     queued.partition == partition for queued in self._queued.values()
                 ),

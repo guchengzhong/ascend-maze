@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Protocol, runtime_checkable
 
 from ascend_maze.resources.anchors import ResourceAnchor
@@ -45,6 +46,16 @@ class DispatchProposal:
     task_key: TaskKey
     queue_generation: int
     policy_metadata: tuple[tuple[str, object], ...] = ()
+    score_compute_ms: float = 0.0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.score_compute_ms, bool)
+            or not isinstance(self.score_compute_ms, (int, float))
+            or not math.isfinite(self.score_compute_ms)
+            or self.score_compute_ms < 0
+        ):
+            raise ValueError("score_compute_ms must be a finite non-negative number")
 
 
 class QueuePartitioner(Protocol):

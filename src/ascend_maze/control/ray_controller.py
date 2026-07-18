@@ -9,7 +9,7 @@ from ascend_maze.core.clock import Clock
 from ascend_maze.core.identifiers import new_id
 from ascend_maze.contracts.runtime import RuntimeNodeBinding
 from ascend_maze.data.ray_store import RayDataStore
-from ascend_maze.placement import NodeCapacity, NodeStatus
+from ascend_maze.placement import NodeCapacity, NodeObservation, NodeStatus
 from ascend_maze.placement import PlacementManager
 from ascend_maze.recording import InMemoryRecorder
 from ascend_maze.runtime.ray_backend import RayRuntimeBackend
@@ -118,7 +118,7 @@ class RayHostController(InMemoryController):
             on_binding_disconnected=self._binding_disconnected,
             on_binding_registered=self._binding_registered,
             registration_validator=self._validate_node_registration,
-            on_node_observation=self.placement.update_observation,
+            on_node_observation=self._node_observation,
             clock=self.clock,
         )
         self.local_rpc = (
@@ -197,6 +197,7 @@ class RayHostController(InMemoryController):
                 NodeStatus.UNSCHEDULABLE,
                 now_ms=self.clock.monotonic_ms(),
             )
+        self.core.post_resource_changed(f"node_binding_registered:{binding.node_id}")
 
     def _validate_node_registration(self, node_id: str) -> None:
         if node_id not in self._node_capacities:
@@ -209,3 +210,12 @@ class RayHostController(InMemoryController):
             NodeStatus.OFFLINE,
             now_ms=self.clock.monotonic_ms(),
         )
+        self.core.post_resource_changed(f"node_binding_disconnected:{binding.node_id}")
+
+    def _node_observation(self, observation: NodeObservation) -> bool:
+        changed = self.placement.update_observation(observation)
+        if changed:
+            self.core.post_resource_changed(
+                f"node_observation:{observation.node_id}:{observation.sequence}"
+            )
+        return changed

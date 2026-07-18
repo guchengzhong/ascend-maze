@@ -14,6 +14,7 @@ from ascend_maze.placement import LeaseStatus, NodeCapacity, NodeStatus, NpuCapa
 from ascend_maze.resources import ResourceAnchor
 from ascend_maze.runtime import FakeExecutionPlan
 from ascend_maze.scheduler import (
+    FcfsPolicy,
     HacsConfig,
     HacsNoTpStaticPolicy,
     HeterogeneousPartitioner,
@@ -177,6 +178,72 @@ def test_hacs_tie_break_and_partitioners_are_orthogonal() -> None:
     ]
 
 
+@pytest.mark.parametrize("policy_name", ("fcfs", "hacs_no_tp"))
+@pytest.mark.parametrize("partitioner_name", ("heterogeneous", "unified"))
+def test_policy_and_partitioner_combinations_share_the_core_execution_path(
+    policy_name: str,
+    partitioner_name: str,
+) -> None:
+    async def scenario() -> None:
+        clock = ManualClock()
+        policy = (
+            FcfsPolicy()
+            if policy_name == "fcfs"
+            else HacsNoTpStaticPolicy(clock=clock, scheduler_epoch_ms=0)
+        )
+        partitioner = (
+            HeterogeneousPartitioner()
+            if partitioner_name == "heterogeneous"
+            else UnifiedPartitioner()
+        )
+        controller = InMemoryController(
+            config_fingerprint=CONFIG_FINGERPRINT,
+            environment_fingerprint=ENVIRONMENT_FINGERPRINT,
+            build_revision="stage5a_test",
+            node_capacities=(_npu_node(),),
+            clock=clock,
+            policy=policy,
+            partitioner=partitioner,
+        )
+        await controller.start()
+        workflow = Workflow(f"{policy_name}-{partitioner_name}")
+        cpu_node = workflow.add_task(one_cpu_task, inputs={"value": "cpu"})
+        npu_node = workflow.add_task(local_npu_task, inputs={"value": "npu"})
+        outcome = await InMemoryRuntimeClient(controller).submit(
+            workflow,
+            inputs={},
+            submission_id=f"stage5a_{policy_name}_{partitioner_name}",
+        )
+        assert outcome.run_id is not None
+        terminal = await controller.wait_run(outcome.run_id, timeout_seconds=2)
+        assert terminal.status is RunStatus.SUCCEEDED
+        assert controller.result(outcome.run_id, cpu_node.task_id) == {"value": "cpu"}
+        assert controller.result(outcome.run_id, npu_node.task_id) == {"value": "npu"}
+
+        selected = [
+            event
+            for event in controller.recorder.events(outcome.run_id)
+            if event.event_type == "scheduling_decision"
+            and event.payload["placement_selected"] is True
+        ]
+        assert {event.payload["policy_name"] for event in selected} == {policy_name}
+        expected_partitions = (
+            {"cpu", "npu"}
+            if partitioner_name == "heterogeneous"
+            else {"default"}
+        )
+        assert {event.payload["partition"] for event in selected} == expected_partitions
+        assert all(event.payload["queue_length"] >= 1 for event in selected)
+        assert controller.placement.active_lease_count(outcome.run_id) == 0
+        assert controller.deadlines.count_for_run(outcome.run_id) == 0
+        await controller.destroy_run(outcome.run_id)
+        assert controller.data_store.active_count == 0
+        assert controller.runtime.code_reference_count() == 0
+        await controller.close()
+
+    asyncio.run(scenario())
+
+
 def test_hacs_heap_matches_linear_reference_across_lifecycle_events() -> None:
     clock = ManualClock(monotonic_ms=300_000)
     heap = HacsNoTpStaticPolicy(clock=clock, scheduler_epoch_ms=0)
@@ -208,7 +275,11 @@ def test_hacs_heap_matches_linear_reference_across_lifecycle_events() -> None:
 
     def assert_same() -> None:
         for partition in ("npu", "cpu"):
-            assert heap.propose(partition, 10) == reference.propose(partition, 10)
+            heap_proposals = heap.propose(partition, 10)
+            reference_proposals = reference.propose(partition, 10)
+            assert [item.task_key for item in heap_proposals] == [
+                item.task_key for item in reference_proposals
+            ]
 
     assert_same()
     for policy in policies:
@@ -228,6 +299,8 @@ def test_hacs_heap_matches_linear_reference_across_lifecycle_events() -> None:
         )
     assert heap.global_state.avg_dct_seconds == pytest.approx(66.0)
     assert heap.global_state.dct_generation == 1
+    assert heap.global_state.last_rebuild_ms >= 0
+    assert heap.global_state.last_rebuild_task_count == heap.active_count()
     assert heap.heap_record_count() == heap.active_count()
     assert_same()
 
@@ -317,6 +390,28 @@ def test_hacs_fake_runtime_closes_n_val_dct_and_recording_path() -> None:
             controller,
             (chain_outcome.run_id, single_outcome.run_id),
         ) == [only.task_id, first.task_id, second.task_id]
+        decisions = [
+            event
+            for run_id in (chain_outcome.run_id, single_outcome.run_id)
+            for event in controller.recorder.events(run_id)
+            if event.event_type == "scheduling_decision"
+        ]
+        selected_decisions = [
+            event for event in decisions if event.payload["placement_selected"] is True
+        ]
+        assert selected_decisions
+        for event in decisions:
+            for field in ("score_compute_ms", "policy_select_ms", "placement_ms"):
+                value = event.payload[field]
+                assert isinstance(value, float)
+                assert value >= 0
+            metadata = event.payload["policy_metadata"]
+            assert metadata["last_rebuild_ms"] >= 0
+            assert metadata["last_rebuild_task_count"] >= 0
+        assert max(
+            event.payload["policy_metadata"]["last_rebuild_task_count"]
+            for event in selected_decisions
+        ) >= 1
         assert policy.active_count() == 0
         assert policy.global_state.completed_run_count == 2
         assert policy.global_state.dct_generation == 2
@@ -328,6 +423,51 @@ def test_hacs_fake_runtime_closes_n_val_dct_and_recording_path() -> None:
             await controller.destroy_run(run_id)
         assert controller.data_store.active_count == 0
         assert controller.runtime.code_reference_count() == 0
+        await controller.close()
+
+    asyncio.run(scenario())
+
+
+def test_resource_changed_event_wakes_a_blocked_queue() -> None:
+    async def scenario() -> None:
+        controller = InMemoryController(
+            config_fingerprint=CONFIG_FINGERPRINT,
+            environment_fingerprint=ENVIRONMENT_FINGERPRINT,
+            build_revision="stage5a_test",
+            node_capacities=(_host_node(cpu=1),),
+        )
+        controller.placement.set_node_status(
+            "node_a", NodeStatus.UNSCHEDULABLE, now_ms=0
+        )
+        await controller.start()
+        client = InMemoryRuntimeClient(controller)
+        workflow = Workflow("resource-change-wakeup")
+        pending = workflow.add_task(one_cpu_task, inputs={"value": "ready"})
+
+        outcome = await client.submit(
+            workflow,
+            inputs={},
+            submission_id="stage5a_resource_change",
+        )
+        assert outcome.run_id is not None
+        await controller.core.wake_deadlines()
+        assert controller.snapshot(outcome.run_id).task(pending.task_id).status is (
+            TaskStatus.QUEUED
+        )
+
+        controller.placement.set_node_status(
+            "node_a", NodeStatus.HEALTHY, now_ms=controller.clock.monotonic_ms()
+        )
+        assert controller.core.post_resource_changed("node_became_healthy")
+        terminal = await controller.wait_run(outcome.run_id, timeout_seconds=2)
+        assert terminal.status is RunStatus.SUCCEEDED
+        assert any(
+            event.event_type == "resource_changed"
+            and event.payload["reason"] == "node_became_healthy"
+            for event in controller.recorder.events(outcome.run_id)
+        )
+        assert controller.placement.active_lease_count(outcome.run_id) == 0
+        await controller.destroy_run(outcome.run_id)
         await controller.close()
 
     asyncio.run(scenario())
