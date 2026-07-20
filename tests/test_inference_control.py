@@ -55,6 +55,7 @@ def test_instance_route_and_sequential_request_lifecycle(tmp_path) -> None:
         assert inference.instances.ready_instances(
             spec.model_id, spec.catalog_revision
         ) == (instance,)
+        assert instance.route_capacity == spec.request_capacity
         assert instance.route_occupancy == 0
         assert instance.actual_request_inflight == 0
         assert placement.active_lease_count() == 1
@@ -1213,8 +1214,12 @@ def test_ready_process_failure_defers_inflight_route_release_and_reports_timeout
         ]
     ) == 1
     inference.replicas.remove_run("run_1")
-    asyncio.run(inference.reconcile())
-    asyncio.run(inference.replicas.wait_for_background())
+
+    async def reconcile_and_wait() -> None:
+        await inference.reconcile()
+        await inference.replicas.wait_for_background()
+
+    asyncio.run(reconcile_and_wait())
     assert inference.model_instances()[0].state is ModelInstanceState.STOPPED
     assert inference.instances.port_leases.active_count() == 0
     assert placement.active_lease_count() == 0

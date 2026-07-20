@@ -276,6 +276,43 @@ def test_client_placement_failure_abandons_reserved_route(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+def test_model_capacity_wait_does_not_create_attempt_or_consume_retry_budget(
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        spec = make_spec(tmp_path / "model")
+        controller, inference, adapter = make_controller(spec)
+        adapter.set_plan(spec.model_id, FakeAdapterPlan(launch_delay_ms=100))
+        await controller.start()
+        workflow, node = _workflow("service-model-capacity-wait", service_task)
+        outcome = await InMemoryRuntimeClient(controller).submit(
+            workflow,
+            inputs={},
+            submission_id="service_model_capacity_wait",
+        )
+        assert outcome.run_id is not None
+
+        for _ in range(1_000):
+            task = controller.snapshot(outcome.run_id).task(node.task_id)
+            if task.pending_reason == "model_route_unavailable":
+                break
+            await asyncio.sleep(0.001)
+        assert task.status is TaskStatus.QUEUED
+        assert task.attempt_count == 0
+        assert controller.core.recovery.count_for_run(outcome.run_id) == 0
+        assert inference.router.active_count() == 0
+        assert controller.placement.active_lease_count(outcome.run_id) == 0
+
+        terminal = await controller.wait_run(outcome.run_id, timeout_seconds=2)
+        assert terminal.status is RunStatus.SUCCEEDED
+        assert terminal.task(node.task_id).attempt_count == 1
+        assert controller.core.recovery.count_for_run(outcome.run_id) == 0
+        await controller.destroy_run(outcome.run_id)
+        await controller.close()
+
+    asyncio.run(scenario())
+
+
 def test_dispatch_failure_retries_with_new_route_and_late_event_is_idempotent(
     tmp_path,
 ) -> None:
@@ -475,11 +512,16 @@ def test_ready_service_process_exit_invalidates_route_and_fails_active_attempt(
             await asyncio.sleep(0.002)
         instance = inference.model_instances()[0]
         assert instance.actual_request_inflight == 1
+        client_anchor_before = controller.anchors.resolve(
+            run_id=outcome.run_id,
+            compiled=controller.state.compiled(outcome.run_id),
+            task_id=node.task_id,
+        )
         adapter.crash_instance(instance.instance_id, instance.generation)
         affected = inference.report_process_exited(
             instance.instance_id,
             instance.generation,
-            reason="service_process_exited",
+            reason="model_instance_npu_oom",
         )
         assert len(affected) == 1
 
@@ -503,6 +545,19 @@ def test_ready_service_process_exit_invalidates_route_and_fails_active_attempt(
         assert inference.router.active_count() == 0
         assert inference.model_instances()[0].route_occupancy == 0
         assert inference.model_instances()[0].actual_request_inflight == 0
+        client_anchor_after = controller.anchors.resolve(
+            run_id=outcome.run_id,
+            compiled=controller.state.compiled(outcome.run_id),
+            task_id=node.task_id,
+        )
+        assert client_anchor_after == client_anchor_before
+        assert client_anchor_after.effective.npu_mem_mb == 0
+        assert instance.placement_lease_id is not None
+        assert (
+            controller.placement.lease_snapshot(instance.placement_lease_id)
+            .lease.resources.npu_hbm_mb
+            == spec.instance_hbm_mb
+        )
 
         for _ in range(500):
             if inference.model_instances()[0].state is ModelInstanceState.STOPPED:

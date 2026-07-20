@@ -21,6 +21,7 @@ from ascend_maze.inference.contracts import (
     PortLease,
     ServiceHandle,
     ServiceLaunchRequest,
+    ServiceProcessProbe,
     ServiceStopResult,
     WarmupResult,
 )
@@ -119,6 +120,10 @@ class FakeInferenceEngineAdapter:
             model_id=spec.model_id,
             artifact_revision=spec.artifact_revision,
             endpoint_id=f"fake://{lease.node_id}:{port_lease.port}/{port_lease.owner_instance_id}/{port_lease.generation}",
+            port_lease_id=port_lease.port_lease_id,
+            port=port_lease.port,
+            argv=("fake-engine", spec.model_id),
+            working_directory=None,
             environment=FrozenMap(
                 (("ASCEND_RT_VISIBLE_DEVICES", lease.npu_device_id),)
             ),
@@ -159,6 +164,8 @@ class FakeInferenceEngineAdapter:
                     else lease.npu_device_id or ""
                 ),
                 process_id=self._next_pid,
+                port_lease_id=request.port_lease_id,
+                port=request.port,
             )
             self._handles[handle.service_handle_id] = handle
             self._launch_count += 1
@@ -246,6 +253,33 @@ class FakeInferenceEngineAdapter:
         with self._lock:
             inflight = self._inflight_by_endpoint.get(handle.endpoint_id, 0)
         return EngineMetrics(queue_depth=0, actual_request_inflight=inflight)
+
+    async def probe_process(
+        self,
+        handle: ServiceHandle,
+        *,
+        timeout_ms: int,
+    ) -> ServiceProcessProbe:
+        del timeout_ms
+        spec = self._specs_by_endpoint.get(handle.endpoint_id)
+        plan = FakeAdapterPlan() if spec is None else self._plan(spec.model_id)
+        alive = handle.service_handle_id in self._handles
+        return ServiceProcessProbe(
+            process_alive=alive,
+            port_open=alive,
+            binding_verified=alive and plan.wrong_device_id is None,
+            physical_device_id=plan.wrong_device_id or handle.npu_device_id,
+            process_hbm_mb=(
+                None
+                if spec is None
+                else (
+                    spec.weight_hbm_mb
+                    if plan.process_hbm_mb is None
+                    else plan.process_hbm_mb
+                )
+            ),
+            exit_code=None if alive else 1,
+        )
 
     async def stop(
         self,

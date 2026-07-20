@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
+import inspect
 from threading import RLock
 
 from ascend_maze.compiler.ir import CompiledWorkflow
@@ -42,15 +44,18 @@ class InferenceCoordinator:
         reconcile_interval_ms: int = 100,
     ) -> None:
         self.catalog = catalog
+        self.service_backend = service_backend
         self.clock = clock or SystemClock()
         self._events: list[ModelControlEvent] = []
         self._request_records: dict[str, list[InferenceRequestRecord]] = {}
         self._sessions: dict[str, AttemptInferenceSession] = {}
         self._capacity_sink: Callable[[str, str | None], object] | None = None
+        self._state_change_sink: Callable[[], object] | None = None
         self._route_failure_sink: (
             Callable[[ModelRouteLease, str], object] | None
         ) = None
         self._lock = RLock()
+        self._model_changed = asyncio.Event()
         self.instances = ModelInstanceManager(
             catalog=catalog,
             placement=placement,
@@ -83,6 +88,12 @@ class InferenceCoordinator:
         sink: Callable[[str, str | None], object] | None,
     ) -> None:
         self._capacity_sink = sink
+
+    def set_state_change_sink(
+        self,
+        sink: Callable[[], object] | None,
+    ) -> None:
+        self._state_change_sink = sink
 
     def set_route_failure_sink(
         self,
@@ -314,6 +325,42 @@ class InferenceCoordinator:
     def model_instances(self, model_id: str | None = None) -> tuple[ModelInstance, ...]:
         return self.instances.instances(model_id=model_id)
 
+    async def wait_ready(
+        self,
+        model_id: str,
+        *,
+        replicas: int = 1,
+        timeout_seconds: float | None = None,
+    ) -> tuple[ModelInstance, ...]:
+        if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas < 1:
+            raise ValueError("replicas must be positive")
+        spec = self.catalog.get(model_id)
+        demands = self.replicas.demands(model_id)
+        desired = max(
+            spec.min_replicas,
+            (len(demands) + spec.request_capacity - 1) // spec.request_capacity,
+        )
+        if replicas > desired:
+            raise RuntimeError(
+                "requested ready replicas exceed min_replicas and current demand"
+            )
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout_seconds is None else loop.time() + timeout_seconds
+        while True:
+            ready = tuple(
+                item
+                for item in self.model_instances(model_id)
+                if item.state is ModelInstanceState.READY
+            )
+            if len(ready) >= replicas:
+                return ready
+            with self._lock:
+                changed = self._model_changed
+            remaining = None if deadline is None else deadline - loop.time()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("model readiness deadline expired")
+            await asyncio.wait_for(changed.wait(), timeout=remaining)
+
     def events(self) -> tuple[ModelControlEvent, ...]:
         with self._lock:
             return tuple(self._events)
@@ -321,11 +368,66 @@ class InferenceCoordinator:
     async def reconcile(self) -> None:
         await self.replicas.reconcile()
 
+    def begin_node_drain(self, node_id: str, boot_id: str) -> None:
+        self.replicas.begin_node_drain(node_id, boot_id)
+        for instance in self.model_instances():
+            if instance.node_id != node_id or instance.boot_id != boot_id:
+                continue
+            self.router.forget_instance_affinity(
+                instance.instance_id, instance.generation
+            )
+            self.instances.begin_drain(instance.instance_id, instance.generation)
+        self.replicas.wake()
+
+    async def advance_node_drain(self, node_id: str, boot_id: str) -> None:
+        self.begin_node_drain(node_id, boot_id)
+        await self.replicas.reconcile()
+        for instance in self.model_instances():
+            if instance.node_id != node_id or instance.boot_id != boot_id:
+                continue
+            await self.instances.stop_if_drained(
+                instance.instance_id, instance.generation
+            )
+
+    def end_node_drain(self, node_id: str, boot_id: str) -> None:
+        self.replicas.end_node_drain(node_id, boot_id)
+
+    def active_routes_for_node(
+        self, node_id: str, boot_id: str
+    ) -> tuple[ModelRouteLease, ...]:
+        instance_keys = {
+            (instance.instance_id, instance.generation)
+            for instance in self.model_instances()
+            if instance.node_id == node_id and instance.boot_id == boot_id
+        }
+        return tuple(
+            lease
+            for lease in self.router.active_leases()
+            if (lease.instance_id, lease.instance_generation) in instance_keys
+        )
+
     async def close(self) -> None:
         await self.replicas.close()
         if self.router.active_count() != 0:
             raise RuntimeError("cannot close C11 while RouteLeases are active")
         await self.instances.close()
+        for adapter in self.catalog.adapters():
+            close = getattr(adapter, "close", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        close_backend = getattr(self.service_backend, "close", None)
+        if callable(close_backend):
+            result = close_backend()
+            if inspect.isawaitable(result):
+                await result
+
+    async def abandon(self) -> None:
+        await self.replicas.abandon()
+        self._capacity_sink = None
+        self._route_failure_sink = None
+        self._state_change_sink = None
 
     def destroy_run(self, run_id: str) -> int:
         self.replicas.remove_run(run_id)
@@ -351,6 +453,11 @@ class InferenceCoordinator:
     def _record_event(self, event: ModelControlEvent) -> None:
         with self._lock:
             self._events.append(event)
+            changed = self._model_changed
+            self._model_changed = asyncio.Event()
+            changed.set()
+        if self._state_change_sink is not None:
+            self._state_change_sink()
         if event.event_type in {
             "model_instance_ready",
             "model_instance_stopped",

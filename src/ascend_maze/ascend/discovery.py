@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from importlib import metadata
 import os
 from pathlib import Path
@@ -39,7 +40,9 @@ def _version_file(path: Path) -> str:
         return "absent"
     values: list[str] = []
     for line in content.splitlines():
-        match = re.match(r"(?:Version|version|package_version)\s*=\s*[\"']?([^\"']+)", line)
+        match = re.match(
+            r"(?:Version|version|package_version)\s*=\s*[\"']?([^\"']+)", line
+        )
         if match:
             values.append(match.group(1).strip())
     return values[0] if values else "unknown"
@@ -61,20 +64,96 @@ def _cann_version() -> str:
     return "absent"
 
 
+def _atb_version() -> str:
+    candidates: list[Path] = []
+    atb_home = os.environ.get("ATB_HOME_PATH")
+    if atb_home:
+        home = Path(atb_home).expanduser().resolve(strict=False)
+        candidates.extend((home / "version.info", home.parents[1] / "version.info"))
+    candidates.append(Path("/usr/local/Ascend/nnal/atb/latest/version.info"))
+    for candidate in candidates:
+        try:
+            content = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        match = re.search(r"^\s*Ascend-cann-atb\s*:\s*(\S+)\s*$", content, re.MULTILINE)
+        if match:
+            return match.group(1)
+    return "absent"
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atb_library_directory() -> Path | None:
+    candidates: list[Path] = []
+    atb_home = os.environ.get("ATB_HOME_PATH")
+    if atb_home:
+        candidates.append(Path(atb_home).expanduser() / "lib")
+    candidates.extend(
+        Path(item)
+        for item in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+        if item
+    )
+    candidates.append(Path("/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib"))
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        identity = str(resolved)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if (resolved / "libmki.so").is_file() and (
+            resolved / "libtbe_adapter.so"
+        ).is_file():
+            return resolved
+    return None
+
+
+def discover_atb_runtime_library_preloads() -> FrozenMap[str, str]:
+    """Return the exact ATB preload identity required by torch_npu ATB ops."""
+
+    directory = _atb_library_directory()
+    if directory is None:
+        return FrozenMap()
+    library = (directory / "libmki.so").resolve(strict=True)
+    return FrozenMap(((str(library), _file_sha256(library)),))
+
+
 def discover_ascend_environment(
     adapter: DcmiDeviceAdapter,
     devices: tuple[AscendDeviceSnapshot, ...] | None = None,
 ) -> AscendEnvironmentSnapshot:
     inventory = adapter.devices() if devices is None else devices
+    atb_directory = _atb_library_directory()
     versions = {
         "python": platform.python_version(),
         "torch": _distribution_version("torch"),
         "torch_npu": _distribution_version("torch-npu"),
+        "vllm": _distribution_version("vllm"),
+        "vllm_ascend": _distribution_version("vllm-ascend"),
         "ray": _distribution_version("ray"),
         "cloudpickle": _distribution_version("cloudpickle"),
         "driver": _version_file(Path("/usr/local/Ascend/driver/version.info")),
         "firmware": _version_file(Path("/usr/local/Ascend/firmware/version.info")),
         "cann": _cann_version(),
+        "atb": _atb_version(),
+        "atb_library_path": "absent" if atb_directory is None else str(atb_directory),
+        "atb_libmki_sha256": (
+            "absent"
+            if atb_directory is None
+            else _file_sha256(atb_directory / "libmki.so")
+        ),
+        "atb_libtbe_adapter_sha256": (
+            "absent"
+            if atb_directory is None
+            else _file_sha256(atb_directory / "libtbe_adapter.so")
+        ),
         "executable_abi": f"{sys.version_info.major}.{sys.version_info.minor}",
     }
     return AscendEnvironmentSnapshot.create(

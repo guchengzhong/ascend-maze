@@ -238,6 +238,7 @@ class ModelInstance:
     created_at_ms: int
     ready_at_ms: int | None
     state_changed_at_ms: int
+    route_capacity: int
     route_occupancy: int
     actual_request_inflight: int
     last_used_at_ms: int
@@ -261,6 +262,7 @@ class ModelInstance:
             if value is not None:
                 _required_string(name, value)
         _positive_int("generation", self.generation)
+        _positive_int("route_capacity", self.route_capacity)
         for name in (
             "created_at_ms",
             "state_changed_at_ms",
@@ -505,6 +507,10 @@ class ServiceLaunchRequest:
     model_id: str
     artifact_revision: str
     endpoint_id: str
+    port_lease_id: str
+    port: int
+    argv: tuple[str, ...]
+    working_directory: str | None
     environment: FrozenMap[str, str]
 
     def __post_init__(self) -> None:
@@ -513,9 +519,21 @@ class ServiceLaunchRequest:
             "model_id",
             "artifact_revision",
             "endpoint_id",
+            "port_lease_id",
         ):
             _required_string(name, getattr(self, name))
         _positive_int("generation", self.generation)
+        _positive_int("port", self.port)
+        if self.port > 65_535:
+            raise ContractValidationError("service port must be within 1..65535")
+        if (
+            not isinstance(self.argv, tuple)
+            or not self.argv
+            or any(not isinstance(item, str) or not item or "\0" in item for item in self.argv)
+        ):
+            raise ContractValidationError("service argv must contain non-empty strings")
+        if self.working_directory is not None:
+            _required_string("working_directory", self.working_directory)
         if not isinstance(self.environment, FrozenMap) or any(
             not isinstance(key, str) or not isinstance(value, str)
             for key, value in self.environment.items()
@@ -533,6 +551,8 @@ class ServiceHandle:
     boot_id: str
     npu_device_id: str
     process_id: int
+    port_lease_id: str
+    port: int
 
     def __post_init__(self) -> None:
         for name in (
@@ -542,10 +562,53 @@ class ServiceHandle:
             "node_id",
             "boot_id",
             "npu_device_id",
+            "port_lease_id",
         ):
             _required_string(name, getattr(self, name))
         _positive_int("generation", self.generation)
         _positive_int("process_id", self.process_id)
+        _positive_int("port", self.port)
+        if self.port > 65_535:
+            raise ContractValidationError("service port must be within 1..65535")
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceProcessProbe:
+    process_alive: bool
+    port_open: bool
+    binding_verified: bool
+    physical_device_id: str
+    process_hbm_mb: int | None
+    exit_code: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("process_alive", "port_open", "binding_verified"):
+            if not isinstance(getattr(self, name), bool):
+                raise ContractValidationError(f"{name} must be a boolean")
+        _required_string("physical_device_id", self.physical_device_id)
+        if self.process_hbm_mb is not None:
+            _non_negative_int("process_hbm_mb", self.process_hbm_mb)
+        if self.exit_code is not None and (
+            isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)
+        ):
+            raise ContractValidationError("exit_code must be an integer or None")
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceProcessExit:
+    service_handle_id: str
+    instance_id: str
+    generation: int
+    process_id: int
+    exit_code: int
+
+    def __post_init__(self) -> None:
+        for name in ("service_handle_id", "instance_id"):
+            _required_string(name, getattr(self, name))
+        _positive_int("generation", self.generation)
+        _positive_int("process_id", self.process_id)
+        if isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int):
+            raise ContractValidationError("exit_code must be an integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -608,6 +671,9 @@ class ServiceStopResult:
     process_exited: bool
     port_released: bool
     hbm_recovered: bool
+    exit_code: int | None = None
+    forced_termination: bool = False
+    final_hbm_mb: int | None = None
 
     def __post_init__(self) -> None:
         if any(
@@ -616,9 +682,16 @@ class ServiceStopResult:
                 self.process_exited,
                 self.port_released,
                 self.hbm_recovered,
+                self.forced_termination,
             )
         ):
             raise ContractValidationError("service stop confirmations must be booleans")
+        if self.exit_code is not None and (
+            isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)
+        ):
+            raise ContractValidationError("exit_code must be an integer or None")
+        if self.final_hbm_mb is not None:
+            _non_negative_int("final_hbm_mb", self.final_hbm_mb)
 
 
 @dataclass(frozen=True, slots=True)
@@ -705,6 +778,13 @@ class ServiceProcessBackend(Protocol):
         request: ServiceLaunchRequest,
         lease: PlacementLease,
     ) -> ServiceHandle: ...
+
+    async def probe_process(
+        self,
+        handle: ServiceHandle,
+        *,
+        timeout_ms: int,
+    ) -> ServiceProcessProbe: ...
 
     async def stop(
         self,

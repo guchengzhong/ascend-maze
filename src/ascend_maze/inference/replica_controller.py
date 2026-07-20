@@ -10,6 +10,7 @@ from typing import Callable
 
 from ascend_maze.core.clock import Clock, SystemClock
 from ascend_maze.core.canonical import FrozenMap, freeze_canonical
+from ascend_maze.core.errors import StateTransitionError
 from ascend_maze.core.identifiers import stable_id
 from ascend_maze.inference.catalog import ModelCatalog
 from ascend_maze.inference.contracts import (
@@ -59,6 +60,7 @@ class ReplicaController:
         self._wake = asyncio.Event()
         self._runner: asyncio.Task[None] | None = None
         self._closing = False
+        self._draining_nodes: set[tuple[str, str]] = set()
         self._lock = RLock()
 
     async def start(self) -> None:
@@ -76,6 +78,24 @@ class ReplicaController:
         if runner is not None:
             await runner
         await self.wait_for_background()
+
+    async def abandon(self) -> None:
+        """Stop reconciliation without draining model instances."""
+
+        self._closing = True
+        self._wake.set()
+        runner = self._runner
+        self._runner = None
+        if runner is not None:
+            await runner
+        with self._lock:
+            tasks = tuple(self._start_tasks.values()) + tuple(
+                self._stop_tasks.values()
+            )
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def register_demand(
         self,
@@ -179,6 +199,22 @@ class ReplicaController:
     def wake(self) -> None:
         self._wake.set()
 
+    def begin_node_drain(self, node_id: str, boot_id: str) -> None:
+        with self._lock:
+            self._draining_nodes.add((node_id, boot_id))
+        self._wake.set()
+
+    def end_node_drain(self, node_id: str, boot_id: str) -> None:
+        with self._lock:
+            self._draining_nodes.discard((node_id, boot_id))
+        self._wake.set()
+
+    def node_is_draining(self, node_id: str | None, boot_id: str | None) -> bool:
+        if node_id is None or boot_id is None:
+            return False
+        with self._lock:
+            return (node_id, boot_id) in self._draining_nodes
+
     async def wait_for_background(self) -> None:
         while True:
             with self._lock:
@@ -259,6 +295,8 @@ class ReplicaController:
             for instance in draining:
                 if len(ready) >= desired:
                     break
+                if self.node_is_draining(instance.node_id, instance.boot_id):
+                    continue
                 if self.instances.cancel_drain(
                     instance.instance_id, instance.generation
                 ):
@@ -420,6 +458,9 @@ class ReplicaController:
     async def _stop_instance(self, instance_id: str, generation: int) -> None:
         try:
             await self.instances.stop_if_drained(instance_id, generation)
+        except StateTransitionError:
+            if self.instances.snapshot(instance_id).generation == generation:
+                raise
         finally:
             with self._lock:
                 current = self._stop_tasks.get(instance_id)

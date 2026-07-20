@@ -25,10 +25,13 @@ from ascend_maze.inference.contracts import (
     ServiceHandle,
     ServiceLaunchRequest,
     ServiceProcessBackend,
+    ServiceProcessExit,
+    ServiceProcessProbe,
     ServiceStopResult,
     WarmupResult,
 )
 from ascend_maze.inference.coordinator import InferenceCoordinator
+from ascend_maze.inference.instance_manager import ModelInstanceRecoveryRecord
 from ascend_maze.inference.ports import InMemoryPortLeaseManager
 
 __all__ = [
@@ -47,6 +50,7 @@ __all__ = [
     "ModelDemand",
     "ModelInstance",
     "ModelInstanceState",
+    "ModelInstanceRecoveryRecord",
     "ModelRouteAcquireResult",
     "ModelRouteContext",
     "ModelRouteLeaseSnapshot",
@@ -57,6 +61,8 @@ __all__ = [
     "ServiceHandle",
     "ServiceLaunchRequest",
     "ServiceProcessBackend",
+    "ServiceProcessExit",
+    "ServiceProcessProbe",
     "ServiceStopResult",
     "WarmupResult",
     "chat",

@@ -89,6 +89,12 @@ class ModelCatalog:
     def adapter(self, model_id: str) -> InferenceEngineAdapter:
         return self._adapters[self.get(model_id).backend]
 
+    def adapters(self) -> tuple[InferenceEngineAdapter, ...]:
+        return tuple(
+            self._adapters[name]
+            for name in sorted(self._adapters)
+        )
+
     def validate_workflow(self, compiled: CompiledWorkflow) -> None:
         for node in compiled.tasks.values():
             anchor = node.model_anchor

@@ -49,6 +49,26 @@ class _InstanceRecord:
     cleanup_timeout_reported: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class ModelInstanceRecoveryRecord:
+    instance_id: str
+    spec: ModelSpec
+    generation: int
+    state: ModelInstanceState
+    created_at_ms: int
+    state_changed_at_ms: int
+    ready_at_ms: int | None
+    placement_lease: PlacementLease | None
+    port_lease: PortLease | None
+    service_handle: ServiceHandle | None
+    route_occupancy: int
+    actual_request_inflight: int
+    last_used_at_ms: int
+    failure_reason: str | None
+    cleanup_deadline_at_ms: int | None
+    cleanup_timeout_reported: bool
+
+
 class ModelInstanceManager:
     def __init__(
         self,
@@ -190,6 +210,8 @@ class ModelInstanceManager:
                 generation=generation,
                 lease=placement.lease,
                 request_endpoint_id=request.endpoint_id,
+                request_port_lease_id=request.port_lease_id,
+                request_port=request.port,
                 handle=handle,
             )
             attach = getattr(self.service_backend, "attach_spec", None)
@@ -494,6 +516,71 @@ class ModelInstanceManager:
                 and (states is None or record.state in states)
             )
 
+    def recovery_records(self) -> tuple[ModelInstanceRecoveryRecord, ...]:
+        with self._lock:
+            return tuple(
+                ModelInstanceRecoveryRecord(
+                    instance_id=record.instance_id,
+                    spec=record.spec,
+                    generation=record.generation,
+                    state=record.state,
+                    created_at_ms=record.created_at_ms,
+                    state_changed_at_ms=record.state_changed_at_ms,
+                    ready_at_ms=record.ready_at_ms,
+                    placement_lease=record.placement_lease,
+                    port_lease=record.port_lease,
+                    service_handle=record.service_handle,
+                    route_occupancy=record.route_occupancy,
+                    actual_request_inflight=record.actual_request_inflight,
+                    last_used_at_ms=record.last_used_at_ms,
+                    failure_reason=record.failure_reason,
+                    cleanup_deadline_at_ms=record.cleanup_deadline_at_ms,
+                    cleanup_timeout_reported=record.cleanup_timeout_reported,
+                )
+                for _, record in sorted(self._records.items())
+            )
+
+    def restore_recovery(
+        self,
+        records: tuple[ModelInstanceRecoveryRecord, ...],
+    ) -> None:
+        """Restore ownership while fencing every non-stopped old instance."""
+
+        now = self.clock.monotonic_ms()
+        with self._lock:
+            if self._records:
+                raise StateTransitionError("model recovery requires an empty manager")
+            for item in records:
+                if self.catalog.get(item.spec.model_id) != item.spec:
+                    raise StateTransitionError(
+                        f"recovered ModelSpec changed: {item.spec.model_id}"
+                    )
+                state = item.state
+                failure_reason = item.failure_reason
+                cleanup_deadline = item.cleanup_deadline_at_ms
+                if state is not ModelInstanceState.STOPPED:
+                    state = ModelInstanceState.FAILED
+                    failure_reason = "controller_generation_changed"
+                    cleanup_deadline = now + item.spec.drain_timeout_ms
+                self._records[item.instance_id] = _InstanceRecord(
+                    instance_id=item.instance_id,
+                    spec=item.spec,
+                    generation=item.generation,
+                    state=state,
+                    created_at_ms=item.created_at_ms,
+                    state_changed_at_ms=now,
+                    ready_at_ms=item.ready_at_ms,
+                    placement_lease=item.placement_lease,
+                    port_lease=item.port_lease,
+                    service_handle=item.service_handle,
+                    route_occupancy=0,
+                    actual_request_inflight=0,
+                    last_used_at_ms=item.last_used_at_ms,
+                    failure_reason=failure_reason,
+                    cleanup_deadline_at_ms=cleanup_deadline,
+                    cleanup_timeout_reported=False,
+                )
+
     def ready_instances(
         self,
         model_id: str,
@@ -540,6 +627,8 @@ class ModelInstanceManager:
         generation: int,
         lease: PlacementLease,
         request_endpoint_id: str,
+        request_port_lease_id: str,
+        request_port: int,
         handle: ServiceHandle,
     ) -> None:
         expected = (
@@ -549,6 +638,8 @@ class ModelInstanceManager:
             lease.node_id,
             lease.boot_id,
             lease.npu_device_id,
+            request_port_lease_id,
+            request_port,
         )
         actual = (
             handle.instance_id,
@@ -557,6 +648,8 @@ class ModelInstanceManager:
             handle.node_id,
             handle.boot_id,
             handle.npu_device_id,
+            handle.port_lease_id,
+            handle.port,
         )
         if actual != expected:
             raise RuntimeError("ServiceHandle identity does not match launch request")
@@ -727,6 +820,7 @@ class ModelInstanceManager:
             created_at_ms=record.created_at_ms,
             ready_at_ms=record.ready_at_ms,
             state_changed_at_ms=record.state_changed_at_ms,
+            route_capacity=record.spec.request_capacity,
             route_occupancy=record.route_occupancy,
             actual_request_inflight=record.actual_request_inflight,
             last_used_at_ms=record.last_used_at_ms,

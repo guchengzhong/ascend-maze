@@ -441,6 +441,18 @@ class InferenceRouter:
                 for record in self._routes.values()
             )
 
+    def active_leases(self) -> tuple[ModelRouteLease, ...]:
+        with self._lock:
+            return tuple(
+                record.lease
+                for _, record in sorted(self._routes.items())
+                if record.status
+                in {
+                    ModelRouteLeaseStatus.RESERVED,
+                    ModelRouteLeaseStatus.ACTIVE,
+                }
+            )
+
     def destroy_run(self, run_id: str) -> int:
         with self._lock:
             active = [
