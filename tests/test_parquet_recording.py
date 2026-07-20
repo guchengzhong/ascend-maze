@@ -166,6 +166,63 @@ def test_parquet_flush_is_atomic_and_query_is_committed_only(tmp_path: Path) -> 
     asyncio.run(scenario())
 
 
+def test_parquet_recovers_unflushed_shards_without_overwrite(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = _config(tmp_path, batch_size=1)
+        signing_key = b"recovery-cursor-signing-key"
+        first = ParquetRecorder(config, cursor_signing_key=signing_key)
+        first.open_run(_context())
+        assert first.emit(_event(1))
+        for _ in range(100):
+            if first.status().committed_file_count == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert first.status().committed_file_count == 1
+        first._stop.set()
+        await asyncio.to_thread(first._writer.join, 2)
+        assert not first._writer.is_alive()
+
+        recovered = ParquetRecorder(config, cursor_signing_key=signing_key)
+        recovered.open_run(_context())
+        assert recovered.status().committed_file_count == 1
+        assert recovered.emit(_event(2))
+        result = await recovered.flush_run("run_1", 5_000)
+        assert result.recording_complete
+        page = recovered.get_run_events("run_1", limit=10)
+        assert [event.producer_sequence for event in page.events] == [1, 2]
+        control_files = [
+            path for path in result.committed_files if ".control." in Path(path).name
+        ]
+        assert len(control_files) == 2
+        assert len(set(control_files)) == 2
+        await recovered.close(5_000)
+
+    asyncio.run(scenario())
+
+
+def test_parquet_recovers_final_flush_result_and_historical_cursor(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = _config(tmp_path)
+        signing_key = b"stable-recovery-cursor-key"
+        first = ParquetRecorder(config, cursor_signing_key=signing_key)
+        first.open_run(_context())
+        assert first.emit(_event(1))
+        expected = await first.flush_run("run_1", 5_000)
+        await first.close(5_000)
+
+        recovered = ParquetRecorder(config, cursor_signing_key=signing_key)
+        recovered.open_run(_context())
+        assert await recovered.flush_run("run_1", 5_000) == expected
+        assert not recovered.emit(_event(2))
+        page = recovered.get_run_events("run_1", limit=10)
+        assert tuple(event.event_id for event in page.events) == ("event_controller_1",)
+        await recovered.close(5_000)
+
+    asyncio.run(scenario())
+
+
 def test_control_capacity_is_reserved_when_telemetry_queue_is_full(
     tmp_path: Path,
 ) -> None:
@@ -217,6 +274,9 @@ def test_writer_failure_is_reported_without_raising_from_emit(tmp_path: Path) ->
         assert not result.recording_complete
         assert result.writer_errors
         assert "injected Parquet writer failure" in result.writer_errors[0]
+        status = recorder.status()
+        assert status.writer_error_count == 1
+        assert status.recent_writer_errors == result.writer_errors
         assert not tuple(tmp_path.rglob("*.tmp"))
         await recorder.close(5_000)
 
@@ -258,6 +318,45 @@ def test_remote_producer_flush_is_merged_without_directory_scanning(
         assert not incomplete.recording_complete
         assert incomplete.missing_producer_count == 1
         await missing.close(5_000)
+
+    asyncio.run(scenario())
+
+
+def test_recorder_status_includes_merged_producer_errors(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        recorder = ParquetRecorder(_config(tmp_path))
+        recorder.open_run(_context(expected=("controller", "node_agent:a")))
+        assert recorder.emit(_event(1))
+        recorder.merge_producer_flush(
+            "run_1",
+            "node_agent:a",
+            FlushResult(
+                run_id="run_1",
+                committed_files=(),
+                dropped_control_event_count=2,
+                dropped_telemetry_count=3,
+                sequence_gap_count=4,
+                missing_producer_count=0,
+                writer_errors=("remote writer failed",),
+                recording_complete=False,
+                flush_duration_ms=1,
+            ),
+        )
+        before = recorder.status()
+        assert before.dropped_control_event_count == 2
+        assert before.dropped_telemetry_count == 3
+        assert before.sequence_gap_count == 4
+        assert before.writer_error_count == 1
+        assert before.recent_writer_errors == ("remote writer failed",)
+        result = await recorder.flush_run("run_1", 5_000)
+        assert not result.recording_complete
+        after = recorder.status()
+        assert after.dropped_control_event_count == 2
+        assert after.dropped_telemetry_count == 3
+        assert after.sequence_gap_count == 4
+        assert after.writer_error_count == 1
+        assert after.recent_writer_errors == ("remote writer failed",)
+        await recorder.close(5_000)
 
     asyncio.run(scenario())
 

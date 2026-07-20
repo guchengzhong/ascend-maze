@@ -36,6 +36,7 @@ build/
 /benchmark_output/
 /experiment_output/
 /artifacts/
+/kernel_meta/
 /outputs/
 *.parquet
 *.arrow

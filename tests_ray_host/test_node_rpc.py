@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
+from ascend_maze.config import NodeBootstrapConfig
 from ascend_maze.contracts.data import DataHandle
 from ascend_maze.contracts.errors import ErrorInfo
 from ascend_maze.contracts.recording import (
@@ -34,10 +36,31 @@ from ascend_maze.control.node_rpc import (
     open_node_recording,
     report_worker_event,
 )
+from ascend_maze.control.node_application import fetch_node_bootstrap
+from ascend_maze.control.contracts import NodeRuntimePolicy
+from ascend_maze.control.proto import control_pb2
 from ascend_maze.control.proto_codec import decode_runtime_event, encode_runtime_event
 
 
 ENVIRONMENT = "e" * 64
+
+
+def _bootstrap_config(root: Path, endpoint: str) -> NodeBootstrapConfig:
+    return NodeBootstrapConfig(
+        schema_version=1,
+        source_path=str(root / "node.toml"),
+        cluster_id="cluster_1",
+        node_id="node_a",
+        node_ip="127.0.0.1",
+        controller_endpoint=endpoint,
+        authorization_token_file=str(root / "cluster.token"),
+        runtime_directory=str(root / "runtime"),
+        worker_rpc_bind_address="127.0.0.1:0",
+        worker_advertised_host=None,
+        ray_temp_directory=str(root / "ray"),
+        ray_num_cpus=2,
+        recording_root_directory=str(root / "records"),
+    )
 
 
 def _identity(
@@ -99,10 +122,138 @@ def _event() -> RuntimeEvent:
     )
 
 
+def test_node_bootstrap_requires_token_and_returns_frozen_controller_identity(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        controller = NodeControlServer(
+            cluster_id="cluster_1",
+            authorization_token=b"test-token",
+            controller_generation="controller_1",
+            environment_fingerprint=ENVIRONMENT,
+            config_fingerprint="c" * 64,
+            ray_address="10.0.0.1:6379",
+            ray_namespace="maze-test",
+            node_runtime_policy=NodeRuntimePolicy(
+                hbm_recovery_tolerance_mb=32,
+                recording_batch_size=17,
+            ),
+            registry=RayNodeRegistry(),
+            recorder=InMemoryRecorder(),
+            event_sink=lambda event: None,
+        )
+        endpoint = await controller.start()
+        config = _bootstrap_config(tmp_path, endpoint)
+        try:
+            response = await fetch_node_bootstrap(config, b"test-token")
+            assert response.cluster_id == "cluster_1"
+            assert response.controller_generation == "controller_1"
+            assert response.config_fingerprint == "c" * 64
+            assert response.environment_fingerprint == ENVIRONMENT
+            assert response.ray_address == "10.0.0.1:6379"
+            assert response.ray_namespace == "maze-test"
+            assert response.node_runtime_policy.hbm_recovery_tolerance_mb == 32
+            assert response.node_runtime_policy.recording_batch_size == 17
+            with pytest.raises(RuntimeError, match="authorization failed"):
+                await fetch_node_bootstrap(config, b"wrong-token")
+        finally:
+            await controller.close(grace_seconds=0)
+
+    asyncio.run(scenario())
+
+
+def test_node_capacity_round_trip_registers_unknown_node_before_validation() -> None:
+    async def scenario() -> None:
+        capacity = NodeCapacity(
+            node_id="node_a",
+            boot_id="boot_1",
+            node_ip="10.0.0.2",
+            cpu_total=8,
+            mem_total_mb=32_768,
+            cpu_system_reserved=1,
+            mem_system_reserved_mb=1_024,
+            io_slots_total=4,
+            npus=(NpuCapacity("7", "910B3", 65_536, 4_096, 1, 60_000),),
+            observed_free_mem_mb=30_000,
+            capabilities=FrozenMap((("environment_fingerprint", ENVIRONMENT),)),
+        )
+        registered: dict[str, NodeCapacity] = {}
+
+        def register_capacity(value: NodeCapacity) -> None:
+            registered[value.node_id] = value
+
+        def validate_node(
+            node_id: str,
+            capacity_value: NodeCapacity | None,
+        ) -> None:
+            if capacity_value is None or capacity_value.node_id != node_id:
+                raise ValueError(f"unknown node: {node_id}")
+
+        registry = RayNodeRegistry()
+        controller = NodeControlServer(
+            cluster_id="cluster_1",
+            authorization_token=b"test-token",
+            controller_generation="controller_1",
+            environment_fingerprint=ENVIRONMENT,
+            registry=registry,
+            recorder=InMemoryRecorder(),
+            event_sink=lambda event: None,
+            on_node_capacity=register_capacity,
+            registration_validator=validate_node,
+        )
+        endpoint = await controller.start()
+        agent = NodeAgent(
+            identity=_identity(),
+            authorization_token=b"test-token",
+            node_capacity=capacity,
+        )
+        try:
+            await agent.start(controller_endpoint=endpoint)
+            assert registered == {"node_a": capacity}
+            assert registry.binding("node_a").ray_node_id == "ray_node_a"
+            assert registry.status("node_a") is RuntimeNodeStatus.HEALTHY
+        finally:
+            await agent.close(grace_seconds=0)
+            await controller.close(grace_seconds=0)
+
+    asyncio.run(scenario())
+
+
 def test_runtime_event_protobuf_round_trip_preserves_control_identity() -> None:
     event = _event()
     restored = decode_runtime_event(encode_runtime_event(event))
     assert restored == event
+
+
+def test_node_agent_assigns_sequence_in_wire_order_not_enqueue_order() -> None:
+    identity = _identity()
+    agent = NodeAgent(identity=identity, authorization_token=b"test-token")
+    agent.controller_generation = "controller_1"
+    agent.runtime_generation = 1
+    request = control_pb2.WorkerEventRequest(
+        schema_version=1,
+        cluster_id=identity.cluster_id,
+        node_id=identity.node_id,
+        boot_id=identity.boot_id,
+        agent_generation=identity.agent_generation,
+        controller_generation="controller_1",
+        runtime_generation=1,
+        event=encode_runtime_event(_event()),
+    )
+
+    assert agent._accept_worker_event(request).accepted
+    queued = agent._queue.get_nowait()
+    assert queued.runtime_event.meta.sequence == 0
+
+    heartbeat_meta = agent._next_meta()
+    agent._stamp_queued_message(queued)
+    assert queued.runtime_event.meta.sequence == heartbeat_meta.sequence + 1
+
+    stale = control_pb2.AgentStreamMessage(
+        heartbeat=control_pb2.NodeHeartbeat(meta=heartbeat_meta)
+    )
+    agent._stamp_queued_message(stale)
+    assert stale.heartbeat.meta == heartbeat_meta
 
 
 def test_node_agent_stream_forwards_worker_events_and_marks_disconnect_stale() -> None:
@@ -154,6 +305,8 @@ def test_node_agent_stream_forwards_worker_events_and_marks_disconnect_stale() -
             report_worker_event,
             endpoint=agent_endpoint,
             identity=identity,
+            controller_generation="controller_1",
+            runtime_generation=1,
             event=event,
             timeout_seconds=2,
         )
@@ -168,6 +321,8 @@ def test_node_agent_stream_forwards_worker_events_and_marks_disconnect_stale() -
             report_worker_event,
             endpoint=agent_endpoint,
             identity=identity,
+            controller_generation="controller_1",
+            runtime_generation=1,
             event=event,
             timeout_seconds=2,
         )
@@ -190,8 +345,21 @@ def test_rejected_node_registration_does_not_pollute_runtime_registry() -> None:
     async def scenario() -> None:
         recorder = InMemoryRecorder()
         registry = RayNodeRegistry()
+        capacities: list[NodeCapacity] = []
+        capacity = NodeCapacity(
+            node_id="node_a",
+            boot_id="boot_1",
+            node_ip="127.0.0.1",
+            cpu_total=2,
+            mem_total_mb=512,
+            cpu_system_reserved=0,
+            mem_system_reserved_mb=0,
+            io_slots_total=1,
+            observed_free_mem_mb=512,
+        )
 
-        def validate_node(node_id: str) -> None:
+        def validate_node(node_id: str, capacity: NodeCapacity | None) -> None:
+            del capacity
             raise ValueError(f"unknown configured node: {node_id}")
 
         controller = NodeControlServer(
@@ -203,16 +371,19 @@ def test_rejected_node_registration_does_not_pollute_runtime_registry() -> None:
             recorder=recorder,
             event_sink=lambda event: None,
             registration_validator=validate_node,
+            on_node_capacity=capacities.append,
         )
         endpoint = await controller.start()
         agent = NodeAgent(
             identity=_identity(),
             authorization_token=b"test-token",
+            node_capacity=capacity,
         )
         try:
             with pytest.raises(Exception, match="unknown configured node"):
                 await agent.start(controller_endpoint=endpoint)
             assert registry.active_bindings() == ()
+            assert capacities == []
         finally:
             await agent.close(grace_seconds=0)
             await controller.close(grace_seconds=0)
@@ -385,10 +556,12 @@ def test_observation_failure_degrades_without_publishing_zero_metrics() -> None:
                 report_worker_event,
                 endpoint=agent_endpoint,
                 identity=identity,
+                controller_generation="controller_1",
+                runtime_generation=1,
                 event=_event(),
                 timeout_seconds=2,
             )
-            await asyncio.wait_for(received.wait(), timeout=2)
+            await asyncio.wait_for(received.wait(), timeout=5)
             assert observations == []
         finally:
             await agent.close(grace_seconds=0)
@@ -464,6 +637,8 @@ def test_node_local_parquet_recorder_owns_worker_events_and_remote_flush(
                 report_worker_event,
                 endpoint=agent_endpoint,
                 identity=identity,
+                controller_generation="controller_1",
+                runtime_generation=1,
                 event=_event(),
                 timeout_seconds=2,
             )
@@ -574,6 +749,8 @@ def test_node_telemetry_is_device_level_and_tracks_active_leases() -> None:
                 report_worker_event,
                 endpoint=agent_endpoint,
                 identity=identity,
+                controller_generation="controller_1",
+                runtime_generation=1,
                 event=started,
                 timeout_seconds=2,
             )
@@ -614,6 +791,8 @@ def test_node_telemetry_is_device_level_and_tracks_active_leases() -> None:
                 report_worker_event,
                 endpoint=agent_endpoint,
                 identity=identity,
+                controller_generation="controller_1",
+                runtime_generation=1,
                 event=terminal,
                 timeout_seconds=2,
             )

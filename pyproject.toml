@@ -25,7 +25,11 @@ classifiers = [
 dependencies = [
     "cloudpickle>=3.1,<4",
     "pyarrow>=19,<25",
+    "tomli>=2.0,<3; python_version < '3.11'",
 ]
+
+[project.scripts]
+maze = "ascend_maze.cli.main:main"
 
 [project.optional-dependencies]
 test = [
@@ -42,6 +46,10 @@ ray-host = [
     "grpcio>=1.82.1,<2",
     "protobuf>=7.35,<8",
     "ray[default]==2.55.1",
+]
+inference-vllm = [
+    "httpx>=0.28,<1",
+    "prometheus-client>=0.21,<1",
 ]
 
 [tool.setuptools.package-dir]
@@ -65,7 +73,21 @@ disallow_untyped_defs = true
 files = ["src/ascend_maze"]
 
 [[tool.mypy.overrides]]
-module = ["ray", "ray.*", "grpc", "grpc.*", "pyarrow", "pyarrow.*"]
+module = [
+    "ray",
+    "ray.*",
+    "grpc",
+    "grpc.*",
+    "httpx",
+    "httpx.*",
+    "prometheus_client",
+    "prometheus_client.*",
+    "pyarrow",
+    "pyarrow.*",
+    "tomli",
+    "tomllib",
+    "cloudpickle",
+]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

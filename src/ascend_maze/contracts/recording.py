@@ -196,6 +196,54 @@ class RunEventPage:
 
 
 @dataclass(frozen=True, slots=True)
+class RecorderStatus:
+    schema_version: int
+    backend: str
+    accepting_run_count: int
+    control_queue_depth: int
+    control_queue_capacity: int
+    telemetry_queue_depth: int
+    telemetry_queue_capacity: int
+    dropped_control_event_count: int
+    dropped_telemetry_count: int
+    sequence_gap_count: int
+    writer_error_count: int
+    recent_writer_errors: tuple[str, ...]
+    committed_file_count: int
+    closed: bool
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1 or not self.backend:
+            raise ContractValidationError("invalid RecorderStatus identity")
+        for name in (
+            "accepting_run_count",
+            "control_queue_depth",
+            "control_queue_capacity",
+            "telemetry_queue_depth",
+            "telemetry_queue_capacity",
+            "dropped_control_event_count",
+            "dropped_telemetry_count",
+            "sequence_gap_count",
+            "writer_error_count",
+            "committed_file_count",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ContractValidationError(f"{name} must be non-negative")
+        if not isinstance(self.closed, bool):
+            raise ContractValidationError("closed must be a boolean")
+        if any(
+            not isinstance(message, str) or not message
+            for message in self.recent_writer_errors
+        ):
+            raise ContractValidationError(
+                "recent_writer_errors must contain non-empty strings"
+            )
+        if len(self.recent_writer_errors) > 10:
+            raise ContractValidationError("recent_writer_errors exceeds status limit")
+
+
+@dataclass(frozen=True, slots=True)
 class ParquetRecorderConfig:
     root_directory: str
     control_queue_capacity: int = 8_192
@@ -259,6 +307,8 @@ class ExecutionRecorder(RecorderSink, Protocol):
     async def flush_run(self, run_id: str, timeout_ms: int) -> FlushResult: ...
 
     async def close(self, timeout_ms: int) -> None: ...
+
+    def status(self) -> RecorderStatus: ...
 
 
 @runtime_checkable

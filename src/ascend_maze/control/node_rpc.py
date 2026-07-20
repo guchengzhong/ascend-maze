@@ -7,6 +7,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 import hmac
+from pathlib import Path
 from typing import Any
 
 import grpc
@@ -18,11 +19,22 @@ from ascend_maze.contracts.recording import (
     RunRecordingContext,
 )
 from ascend_maze.contracts.runtime import RuntimeNodeBinding
-from ascend_maze.core.canonical import FrozenMap, freeze_canonical
+from ascend_maze.core.canonical import (
+    FrozenMap,
+    canonical_bytes,
+    decode_canonical_bytes,
+    freeze_canonical,
+)
 from ascend_maze.core.clock import Clock, SystemClock
 from ascend_maze.core.errors import ContractValidationError
 from ascend_maze.core.identifiers import new_id
-from ascend_maze.placement import NodeObservation, NpuObservation
+from ascend_maze.inference.contracts import ServiceProcessExit
+from ascend_maze.placement import (
+    NodeCapacity,
+    NodeObservation,
+    NpuCapacity,
+    NpuObservation,
+)
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 from ascend_maze.runtime.ray_node_registry import (
     RayNodeRegistry,
@@ -31,9 +43,85 @@ from ascend_maze.runtime.ray_node_registry import (
 
 from ascend_maze.control.proto import control_pb2 as _control_pb2
 from ascend_maze.control.proto import control_pb2_grpc
+from ascend_maze.control.contracts import NodeRuntimePolicy
 from ascend_maze.control.proto_codec import decode_runtime_event, encode_runtime_event
+from ascend_maze.control.service_process import (
+    NodeServiceProcessManager,
+    decode_model_placement,
+    decode_port_lease,
+    decode_service_handle,
+    decode_service_launch,
+    encode_port_lease,
+    encode_service_handle,
+)
 
 control_pb2: Any = _control_pb2
+
+
+def _encode_node_capacity(capacity: NodeCapacity) -> Any:
+    message = control_pb2.NodeCapacityMessage(
+        node_id=capacity.node_id,
+        boot_id=capacity.boot_id,
+        node_ip=capacity.node_ip,
+        cpu_total=capacity.cpu_total,
+        mem_total_mb=capacity.mem_total_mb,
+        cpu_system_reserved=capacity.cpu_system_reserved,
+        mem_system_reserved_mb=capacity.mem_system_reserved_mb,
+        io_slots_total=capacity.io_slots_total,
+        observed_free_mem_mb=capacity.observed_free_mem_mb or 0,
+        has_observed_free_mem_mb=capacity.observed_free_mem_mb is not None,
+        canonical_capabilities=canonical_bytes(capacity.capabilities),
+    )
+    for npu in capacity.npus:
+        message.npus.add(
+            device_id=npu.device_id,
+            chip_type=npu.chip_type,
+            total_hbm_mb=npu.total_hbm_mb,
+            system_reserved_hbm_mb=npu.system_reserved_hbm_mb,
+            task_slots_total=npu.task_slots_total,
+            observed_free_hbm_mb=npu.observed_free_hbm_mb or 0,
+            has_observed_free_hbm_mb=npu.observed_free_hbm_mb is not None,
+            healthy=npu.healthy,
+        )
+    return message
+
+
+def _decode_node_capacity(message: Any) -> NodeCapacity:
+    capabilities = decode_canonical_bytes(bytes(message.canonical_capabilities))
+    if not isinstance(capabilities, FrozenMap):
+        raise ContractValidationError("NodeCapacity capabilities must be a mapping")
+    return NodeCapacity(
+        node_id=str(message.node_id),
+        boot_id=str(message.boot_id),
+        node_ip=str(message.node_ip),
+        cpu_total=int(message.cpu_total),
+        mem_total_mb=int(message.mem_total_mb),
+        cpu_system_reserved=int(message.cpu_system_reserved),
+        mem_system_reserved_mb=int(message.mem_system_reserved_mb),
+        io_slots_total=int(message.io_slots_total),
+        npus=tuple(
+            NpuCapacity(
+                device_id=str(item.device_id),
+                chip_type=str(item.chip_type),
+                total_hbm_mb=int(item.total_hbm_mb),
+                system_reserved_hbm_mb=int(item.system_reserved_hbm_mb),
+                task_slots_total=int(item.task_slots_total),
+                observed_free_hbm_mb=(
+                    int(item.observed_free_hbm_mb)
+                    if item.has_observed_free_hbm_mb
+                    else None
+                ),
+                healthy=bool(item.healthy),
+            )
+            for item in message.npus
+        ),
+        observed_free_mem_mb=(
+            int(message.observed_free_mem_mb)
+            if message.has_observed_free_mem_mb
+            else None
+        ),
+        capabilities=capabilities,
+    )
 
 
 def _execution_event_from_runtime(
@@ -118,9 +206,93 @@ class NodeAgentIdentity:
                 raise ContractValidationError(f"{name} is required")
 
 
+@dataclass(frozen=True, slots=True)
+class NodeRecoveryInventory:
+    active_lease_ids: tuple[str, ...]
+    service_handle_ids: tuple[str, ...]
+    reported_controller_generation: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("active_lease_ids", "service_handle_ids"):
+            values = getattr(self, name)
+            if len(values) != len(set(values)) or any(not item for item in values):
+                raise ContractValidationError(f"invalid node recovery {name}")
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveWorkerLease:
+    device_id: str | None
+    process_id: int | None
+    process_start_time: str | None
+    controller_generation: str
+    runtime_generation: int
+
+
 class _NodeControlServicer:
     def __init__(self, owner: "NodeControlServer") -> None:
         self.owner = owner
+
+    async def GetBootstrap(self, request: Any, context: Any) -> Any:
+        del context
+        if (
+            int(request.schema_version) != 1
+            or str(request.cluster_id) != self.owner.cluster_id
+            or not hmac.compare_digest(
+                bytes(request.authorization_token), self.owner.authorization_token
+            )
+        ):
+            return control_pb2.NodeBootstrapResponse(
+                schema_version=1,
+                request_id=str(request.request_id),
+                status_code="error",
+                error_code="authorization_failed",
+                message="node bootstrap authorization failed",
+            )
+        return control_pb2.NodeBootstrapResponse(
+            schema_version=1,
+            request_id=str(request.request_id),
+            status_code="ok",
+            cluster_id=self.owner.cluster_id,
+            controller_generation=self.owner.controller_generation,
+            config_fingerprint=self.owner.config_fingerprint,
+            environment_fingerprint=self.owner.environment_fingerprint,
+            ray_address=self.owner.ray_address,
+            ray_namespace=self.owner.ray_namespace,
+            task_slots_total=self.owner.node_runtime_policy.task_slots_total,
+            allow_colocation=self.owner.node_runtime_policy.allow_colocation,
+            npu_system_reserved_hbm_mb=(
+                self.owner.node_runtime_policy.npu_system_reserved_hbm_mb
+            ),
+            npu_hbm_headroom_mb=(
+                self.owner.node_runtime_policy.npu_hbm_headroom_mb
+            ),
+            host_mem_headroom_mb=(
+                self.owner.node_runtime_policy.host_mem_headroom_mb
+            ),
+            io_slots_total=self.owner.node_runtime_policy.io_slots_total,
+            hbm_recovery_tolerance_mb=(
+                self.owner.node_runtime_policy.hbm_recovery_tolerance_mb
+            ),
+            recording_backend=self.owner.node_runtime_policy.recording_backend,
+            recording_control_queue_capacity=(
+                self.owner.node_runtime_policy.recording_control_queue_capacity
+            ),
+            recording_telemetry_queue_capacity=(
+                self.owner.node_runtime_policy.recording_telemetry_queue_capacity
+            ),
+            recording_batch_size=(
+                self.owner.node_runtime_policy.recording_batch_size
+            ),
+            recording_flush_interval_ms=(
+                self.owner.node_runtime_policy.recording_flush_interval_ms
+            ),
+            recording_compression=(
+                self.owner.node_runtime_policy.recording_compression
+            ),
+            recording_max_page_size=(
+                self.owner.node_runtime_policy.recording_max_page_size
+            ),
+        )
 
     async def Connect(
         self,
@@ -173,6 +345,10 @@ class NodeControlServer:
         authorization_token: bytes,
         controller_generation: str,
         environment_fingerprint: str,
+        config_fingerprint: str = "unconfigured",
+        ray_address: str = "unconfigured",
+        ray_namespace: str = "default",
+        node_runtime_policy: NodeRuntimePolicy | None = None,
         registry: RayNodeRegistry,
         recorder: ExecutionRecorder,
         event_sink: Callable[[RuntimeEvent], None],
@@ -181,8 +357,17 @@ class NodeControlServer:
         on_binding_registered: (
             Callable[[RuntimeNodeBinding, RuntimeNodeBinding | None], None] | None
         ) = None,
-        registration_validator: Callable[[str], None] | None = None,
+        registration_validator: (
+            Callable[[str, NodeCapacity | None], None] | None
+        ) = None,
         on_node_observation: Callable[[NodeObservation], object] | None = None,
+        on_service_process_exited: (
+            Callable[[ServiceProcessExit], object] | None
+        ) = None,
+        on_recovery_inventory: (
+            Callable[[RuntimeNodeBinding, NodeRecoveryInventory], object] | None
+        ) = None,
+        on_node_capacity: Callable[[NodeCapacity], object] | None = None,
         clock: Clock | None = None,
     ) -> None:
         if not cluster_id or not authorization_token or not controller_generation:
@@ -191,6 +376,10 @@ class NodeControlServer:
         self.authorization_token = authorization_token
         self.controller_generation = controller_generation
         self.environment_fingerprint = environment_fingerprint
+        self.config_fingerprint = config_fingerprint
+        self.ray_address = ray_address
+        self.ray_namespace = ray_namespace
+        self.node_runtime_policy = node_runtime_policy or NodeRuntimePolicy()
         self.registry = registry
         self.recorder = recorder
         self.event_sink = event_sink
@@ -199,6 +388,9 @@ class NodeControlServer:
         self.on_binding_registered = on_binding_registered
         self.registration_validator = registration_validator
         self.on_node_observation = on_node_observation
+        self.on_service_process_exited = on_service_process_exited
+        self.on_recovery_inventory = on_recovery_inventory
+        self.on_node_capacity = on_node_capacity
         self.clock = clock or SystemClock()
         self._server: grpc.aio.Server | None = None
         self.endpoint: str | None = None
@@ -244,8 +436,30 @@ class NodeControlServer:
             bytes(registration.authorization_token), self.authorization_token
         ):
             raise ContractValidationError("NodeAgent authorization failed")
+        RuntimeNodeBinding(
+            node_id=str(meta.node_id),
+            boot_id=str(meta.boot_id),
+            ray_node_id=str(registration.ray_node_id),
+            runtime_generation=1,
+            agent_generation=str(meta.agent_generation),
+            agent_endpoint=str(registration.agent_endpoint),
+            producer_id=str(registration.producer_id),
+            records_locally=bool(registration.records_locally),
+        )
+        capacity: NodeCapacity | None = None
+        if registration.has_capacity:
+            capacity = _decode_node_capacity(registration.capacity)
+            if (
+                capacity.node_id != str(meta.node_id)
+                or capacity.boot_id != str(meta.boot_id)
+            ):
+                raise ContractValidationError(
+                    "NodeAgent capacity identity does not match registration"
+                )
         if self.registration_validator is not None:
-            self.registration_validator(str(meta.node_id))
+            self.registration_validator(str(meta.node_id), capacity)
+        if capacity is not None and self.on_node_capacity is not None:
+            self.on_node_capacity(capacity)
         status = (
             RuntimeNodeStatus.HEALTHY
             if str(registration.environment_fingerprint)
@@ -264,13 +478,26 @@ class NodeControlServer:
         )
         if previous is not None and self.on_binding_replaced is not None:
             self.on_binding_replaced(previous)
+        if self.on_recovery_inventory is not None:
+            self.on_recovery_inventory(
+                binding,
+                NodeRecoveryInventory(
+                    active_lease_ids=tuple(sorted(registration.active_lease_ids)),
+                    service_handle_ids=tuple(
+                        sorted(registration.service_handle_ids)
+                    ),
+                    reported_controller_generation=(
+                        str(registration.meta.controller_generation) or None
+                    ),
+                ),
+            )
         if self.on_binding_registered is not None:
             self.on_binding_registered(binding, previous)
         return binding
 
     def _handle_message(self, binding: RuntimeNodeBinding, request: Any) -> Any:
         body = request.WhichOneof("body")
-        if body not in {"heartbeat", "runtime_event"}:
+        if body not in {"heartbeat", "runtime_event", "service_process_exit"}:
             return self._ack("", "rejected", "unsupported stream message")
         value = getattr(request, body)
         meta = value.meta
@@ -323,6 +550,35 @@ class NodeControlServer:
                     self.on_node_observation(observation)
             except Exception as exc:
                 return self._ack(str(meta.message_id), "rejected", str(exc))
+        if body == "heartbeat" and self.on_recovery_inventory is not None:
+            try:
+                self.on_recovery_inventory(
+                    binding,
+                    NodeRecoveryInventory(
+                        active_lease_ids=tuple(sorted(value.active_lease_ids)),
+                        service_handle_ids=tuple(
+                            sorted(value.service_handle_ids)
+                        ),
+                        reported_controller_generation=(
+                            str(value.meta.controller_generation) or None
+                        ),
+                    ),
+                )
+            except Exception as exc:
+                return self._ack(str(meta.message_id), "rejected", str(exc))
+        elif body == "service_process_exit":
+            try:
+                service_exit = ServiceProcessExit(
+                    service_handle_id=str(value.service_handle_id),
+                    instance_id=str(value.instance_id),
+                    generation=int(value.generation),
+                    process_id=int(value.process_id),
+                    exit_code=int(value.exit_code),
+                )
+                if self.on_service_process_exited is not None:
+                    self.on_service_process_exited(service_exit)
+            except Exception as exc:
+                return self._ack(str(meta.message_id), "rejected", str(exc))
         return self._ack(str(meta.message_id), "accepted", "")
 
     def _record_node_event(
@@ -352,6 +608,7 @@ class NodeControlServer:
             and str(meta.node_id) == binding.node_id
             and str(meta.boot_id) == binding.boot_id
             and str(meta.agent_generation) == binding.agent_generation
+            and str(meta.controller_generation) == self.controller_generation
         )
 
     def _ack(self, message_id: str, status_code: str, message: str) -> Any:
@@ -392,6 +649,157 @@ class _WorkerEventServicer:
         return await self.owner._flush_run_recording(request)
 
 
+def _port_error(code: str, message: str) -> Any:
+    return control_pb2.PortLeaseResponse(
+        accepted=False,
+        error_code=code,
+        message=message,
+    )
+
+
+def _launch_error(code: str, message: str) -> Any:
+    return control_pb2.ServiceLaunchResponse(
+        accepted=False,
+        error_code=code,
+        message=message,
+    )
+
+
+def _probe_error(code: str, message: str) -> Any:
+    return control_pb2.ServiceProcessProbeMessage(
+        accepted=False,
+        error_code=code,
+        message=message,
+    )
+
+
+def _stop_error(code: str, message: str) -> Any:
+    return control_pb2.ServiceStopResultMessage(
+        accepted=False,
+        error_code=code,
+        message=message,
+    )
+
+
+class _ServiceProcessServicer:
+    def __init__(self, owner: "NodeAgent") -> None:
+        self.owner = owner
+
+    async def AcquirePort(self, request: Any, context: Any) -> Any:
+        del context
+        error = self.owner._service_request_error(request.meta)
+        if error is not None:
+            return _port_error(error[0], error[1])
+        manager = self.owner.service_process_manager
+        if manager is None:
+            return _port_error("service_process_disabled", "service process manager is disabled")
+        try:
+            lease = await manager.acquire_port(
+                node_id=self.owner.identity.node_id,
+                boot_id=self.owner.identity.boot_id,
+                owner_instance_id=str(request.owner_instance_id),
+                generation=int(request.generation),
+            )
+        except Exception as exc:
+            return _port_error("service_port_acquire_failed", f"{type(exc).__name__}: {exc}")
+        return control_pb2.PortLeaseResponse(
+            accepted=True,
+            lease=encode_port_lease(lease),
+            has_lease=True,
+        )
+
+    async def ReleasePort(self, request: Any, context: Any) -> Any:
+        del context
+        error = self.owner._service_request_error(request.meta)
+        if error is not None:
+            return _port_error(error[0], error[1])
+        manager = self.owner.service_process_manager
+        if manager is None:
+            return _port_error("service_process_disabled", "service process manager is disabled")
+        try:
+            released = await manager.release_port(decode_port_lease(request.lease))
+        except Exception as exc:
+            return _port_error("service_port_release_failed", f"{type(exc).__name__}: {exc}")
+        if not released:
+            return _port_error("port_lease_not_found", "PortLease is already released")
+        return control_pb2.PortLeaseResponse(accepted=True)
+
+    async def Launch(self, request: Any, context: Any) -> Any:
+        del context
+        error = self.owner._service_request_error(request.meta)
+        if error is not None:
+            return _launch_error(error[0], error[1])
+        manager = self.owner.service_process_manager
+        if manager is None:
+            return _launch_error("service_process_disabled", "service process manager is disabled")
+        try:
+            handle = await manager.launch(
+                decode_service_launch(request.request),
+                decode_model_placement(request.lease),
+            )
+        except Exception as exc:
+            return _launch_error("service_launch_failed", f"{type(exc).__name__}: {exc}")
+        return control_pb2.ServiceLaunchResponse(
+            accepted=True,
+            handle=encode_service_handle(handle),
+            has_handle=True,
+        )
+
+    async def Probe(self, request: Any, context: Any) -> Any:
+        del context
+        error = self.owner._service_request_error(request.meta)
+        if error is not None:
+            return _probe_error(error[0], error[1])
+        manager = self.owner.service_process_manager
+        if manager is None:
+            return _probe_error("service_process_disabled", "service process manager is disabled")
+        try:
+            probe = await manager.probe_process(
+                decode_service_handle(request.handle),
+                timeout_ms=int(request.timeout_ms),
+            )
+        except Exception as exc:
+            return _probe_error("service_probe_failed", f"{type(exc).__name__}: {exc}")
+        return control_pb2.ServiceProcessProbeMessage(
+            accepted=True,
+            process_alive=probe.process_alive,
+            port_open=probe.port_open,
+            binding_verified=probe.binding_verified,
+            physical_device_id=probe.physical_device_id,
+            process_hbm_mb=probe.process_hbm_mb or 0,
+            has_process_hbm_mb=probe.process_hbm_mb is not None,
+            exit_code=probe.exit_code or 0,
+            has_exit_code=probe.exit_code is not None,
+        )
+
+    async def Stop(self, request: Any, context: Any) -> Any:
+        del context
+        error = self.owner._service_request_error(request.meta)
+        if error is not None:
+            return _stop_error(error[0], error[1])
+        manager = self.owner.service_process_manager
+        if manager is None:
+            return _stop_error("service_process_disabled", "service process manager is disabled")
+        try:
+            result = await manager.stop(
+                decode_service_handle(request.handle),
+                timeout_ms=int(request.timeout_ms),
+            )
+        except Exception as exc:
+            return _stop_error("service_stop_failed", f"{type(exc).__name__}: {exc}")
+        return control_pb2.ServiceStopResultMessage(
+            accepted=True,
+            process_exited=result.process_exited,
+            port_released=result.port_released,
+            hbm_recovered=result.hbm_recovered,
+            exit_code=result.exit_code or 0,
+            has_exit_code=result.exit_code is not None,
+            forced_termination=result.forced_termination,
+            final_hbm_mb=result.final_hbm_mb or 0,
+            has_final_hbm_mb=result.final_hbm_mb is not None,
+        )
+
+
 class NodeAgent:
     def __init__(
         self,
@@ -405,6 +813,8 @@ class NodeAgent:
         node_observation_provider: (
             Callable[[int, int], NodeObservation] | None
         ) = None,
+        service_process_manager: NodeServiceProcessManager | None = None,
+        node_capacity: NodeCapacity | None = None,
         clock: Clock | None = None,
     ) -> None:
         if not authorization_token:
@@ -418,20 +828,29 @@ class NodeAgent:
         self.recorder = recorder
         self.worker_device_verifier = worker_device_verifier
         self.node_observation_provider = node_observation_provider
+        self.service_process_manager = service_process_manager
+        self.node_capacity = node_capacity
+        if service_process_manager is not None:
+            service_process_manager.set_unexpected_exit_sink(
+                self._service_process_exited
+            )
         self._queue: asyncio.Queue[Any] = asyncio.Queue(event_queue_capacity)
         self._sequence = 0
         self._producer_sequence = 0
         self._recording_contexts: dict[str, RunRecordingContext] = {}
-        self._active_leases: dict[str, dict[str, str | None]] = {}
+        self._active_leases: dict[str, dict[str, _ActiveWorkerLease]] = {}
         self._event_ids: set[str] = set()
         self._event_id_order: deque[str] = deque()
         self._event_dedup_capacity = max(1_024, event_queue_capacity * 4)
+        self._message_acks: dict[str, str] = {}
+        self._message_ack_order: deque[str] = deque()
         self._server: grpc.aio.Server | None = None
         self._channel: grpc.aio.Channel | None = None
         self._call: Any = None
         self._response_task: asyncio.Task[None] | None = None
         self._registered = asyncio.Event()
         self._closed = False
+        self._controller_endpoint: str | None = None
         self.endpoint: str | None = None
         self.controller_generation: str | None = None
         self.runtime_generation: int | None = None
@@ -453,12 +872,42 @@ class NodeAgent:
         control_pb2_grpc.add_WorkerEventSinkServicer_to_server(
             _WorkerEventServicer(self), server
         )
+        control_pb2_grpc.add_ServiceProcessControlServicer_to_server(
+            _ServiceProcessServicer(self), server
+        )
         port = server.add_insecure_port(worker_bind_address)
         if port == 0:
             raise RuntimeError(f"failed to bind WorkerEvent RPC: {worker_bind_address}")
         self.endpoint = f"{host}:{port}"
         await server.start()
         self._server = server
+        self._controller_endpoint = controller_endpoint
+        await self._connect(controller_endpoint)
+        return self.endpoint
+
+    async def reconnect(self, controller_endpoint: str | None = None) -> str:
+        """Reconnect the long-lived node authority to a new Controller generation."""
+
+        if self._closed or self._server is None or self.endpoint is None:
+            raise RuntimeError("NodeAgent is not running")
+        endpoint = controller_endpoint or self._controller_endpoint
+        if endpoint is None:
+            raise RuntimeError("Controller endpoint is unavailable")
+        call = self._call
+        if call is not None:
+            call.cancel()
+        task = self._response_task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if self._channel is not None:
+            await self._channel.close()
+        self._registered.clear()
+        self._controller_endpoint = endpoint
+        await self._connect(endpoint)
+        return self.endpoint
+
+    async def _connect(self, controller_endpoint: str) -> None:
         self._channel = grpc.aio.insecure_channel(controller_endpoint)
         stub = control_pb2_grpc.NodeControlStub(self._channel)
         self._call = stub.Connect(self._request_stream())
@@ -471,7 +920,7 @@ class NodeAgent:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if registration_waiter in done and self._registered.is_set():
-                return self.endpoint
+                return
             if self._response_task in done:
                 await self._response_task
                 raise RuntimeError("NodeControl stream ended before registration")
@@ -499,6 +948,10 @@ class NodeAgent:
         if self._server is not None:
             await self._server.stop(grace_seconds)
         self._server = None
+        if self.service_process_manager is not None:
+            await self.service_process_manager.close(
+                max(1_000, int(grace_seconds * 1_000))
+            )
         if self.recorder is not None:
             await self.recorder.close(max(1, int(grace_seconds * 1_000) or 1_000))
 
@@ -509,10 +962,19 @@ class NodeAgent:
         self._server = None
         await server.stop(grace_seconds)
 
+    def message_ack(self, message_id: str) -> str | None:
+        return self._message_acks.get(message_id)
+
     async def _request_stream(self) -> AsyncIterator[Any]:
         assert self.endpoint is not None
-        yield control_pb2.AgentStreamMessage(
-            register=control_pb2.RegisterNode(
+        self._prune_exited_worker_leases()
+        service_handle_ids: tuple[str, ...] = ()
+        if self.service_process_manager is not None:
+            service_handle_ids = tuple(
+                item.service_handle_id
+                for item in await self.service_process_manager.active_handles()
+            )
+        registration = control_pb2.RegisterNode(
                 meta=self._next_meta(),
                 ray_node_id=self.identity.ray_node_id,
                 agent_endpoint=self.endpoint,
@@ -520,7 +982,20 @@ class NodeAgent:
                 environment_fingerprint=self.identity.environment_fingerprint,
                 authorization_token=self.authorization_token,
                 records_locally=self.recorder is not None,
+                active_lease_ids=tuple(
+                    sorted(
+                        lease_id
+                        for leases in self._active_leases.values()
+                        for lease_id in leases
+                    )
+                ),
+                service_handle_ids=tuple(sorted(service_handle_ids)),
             )
+        if self.node_capacity is not None:
+            registration.capacity.CopyFrom(_encode_node_capacity(self.node_capacity))
+            registration.has_capacity = True
+        yield control_pb2.AgentStreamMessage(
+            register=registration
         )
         await self._registered.wait()
         while not self._closed:
@@ -529,8 +1004,25 @@ class NodeAgent:
                     self._queue.get(), self.heartbeat_interval_ms / 1_000
                 )
             except asyncio.TimeoutError:
+                self._prune_exited_worker_leases()
                 meta = self._next_meta()
-                heartbeat = control_pb2.NodeHeartbeat(meta=meta)
+                service_handle_ids = ()
+                if self.service_process_manager is not None:
+                    service_handle_ids = tuple(
+                        item.service_handle_id
+                        for item in await self.service_process_manager.active_handles()
+                    )
+                heartbeat = control_pb2.NodeHeartbeat(
+                    meta=meta,
+                    active_lease_ids=tuple(
+                        sorted(
+                            lease_id
+                            for leases in self._active_leases.values()
+                            for lease_id in leases
+                        )
+                    ),
+                    service_handle_ids=tuple(sorted(service_handle_ids)),
+                )
                 provider = self.node_observation_provider
                 if provider is not None:
                     try:
@@ -554,7 +1046,19 @@ class NodeAgent:
                                 has_utilization=item.utilization is not None,
                             )
                 message = control_pb2.AgentStreamMessage(heartbeat=heartbeat)
+            else:
+                self._stamp_queued_message(message)
             yield message
+
+    def _stamp_queued_message(self, message: Any) -> None:
+        """Assign sequence identity in wire order, immediately before yielding."""
+
+        body = message.WhichOneof("body")
+        if body not in {"heartbeat", "runtime_event", "service_process_exit"}:
+            raise RuntimeError(f"unsupported queued NodeAgent message: {body}")
+        meta = getattr(message, body).meta
+        if int(meta.sequence) == 0:
+            meta.CopyFrom(self._next_meta())
 
     async def _consume_responses(self) -> None:
         assert self._call is not None
@@ -568,16 +1072,30 @@ class NodeAgent:
                 )
                 self.runtime_generation = int(response.registration.runtime_generation)
                 self._registered.set()
+            elif body == "ack":
+                message_id = str(response.ack.message_id)
+                self._message_acks[message_id] = str(response.ack.status_code)
+                self._message_ack_order.append(message_id)
+                if len(self._message_ack_order) > self._event_dedup_capacity:
+                    expired = self._message_ack_order.popleft()
+                    self._message_acks.pop(expired, None)
 
     def _accept_worker_event(self, request: Any) -> Any:
         event_id = str(request.event.event_id)
-        if (
-            int(request.schema_version) != 1
-            or str(request.cluster_id) != self.identity.cluster_id
-            or str(request.node_id) != self.identity.node_id
-            or str(request.boot_id) != self.identity.boot_id
-            or str(request.agent_generation) != self.identity.agent_generation
-        ):
+        node_identity_matches = (
+            int(request.schema_version) == 1
+            and str(request.cluster_id) == self.identity.cluster_id
+            and str(request.node_id) == self.identity.node_id
+            and str(request.boot_id) == self.identity.boot_id
+            and str(request.agent_generation) == self.identity.agent_generation
+        )
+        authority_matches = (
+            str(request.controller_generation) == self.controller_generation
+            and int(request.runtime_generation) == self.runtime_generation
+        )
+        if not node_identity_matches or not authority_matches:
+            if node_identity_matches:
+                self._consume_stale_worker_terminal(request)
             return control_pb2.WorkerEventAck(
                 event_id=event_id,
                 accepted=False,
@@ -621,7 +1139,6 @@ class NodeAgent:
         self._record_runtime_event(event, producer_sequence)
         message = control_pb2.AgentStreamMessage(
             runtime_event=control_pb2.NodeRuntimeEvent(
-                meta=self._next_meta(),
                 event=request.event,
                 producer_sequence=producer_sequence,
             )
@@ -636,21 +1153,76 @@ class NodeAgent:
                 message="NodeAgent control event queue is full",
             )
         if event.kind is RuntimeEventKind.WORKER_STARTED:
+            process_id = event.worker_pid
             self._active_leases.setdefault(event.run_id, {})[event.lease_id] = (
-                event.device_id
+                _ActiveWorkerLease(
+                    device_id=event.device_id,
+                    process_id=process_id,
+                    process_start_time=self._process_start_time(process_id),
+                    controller_generation=str(request.controller_generation),
+                    runtime_generation=int(request.runtime_generation),
+                )
             )
         else:
-            active = self._active_leases.get(event.run_id)
-            if active is not None:
-                active.pop(event.lease_id, None)
-                if not active:
-                    self._active_leases.pop(event.run_id, None)
+            self._remove_active_worker_lease(event.run_id, event.lease_id)
         self._event_ids.add(event_id)
         self._event_id_order.append(event_id)
         if len(self._event_id_order) > self._event_dedup_capacity:
             expired = self._event_id_order.popleft()
             self._event_ids.discard(expired)
         return control_pb2.WorkerEventAck(event_id=event_id, accepted=True)
+
+    def _consume_stale_worker_terminal(self, request: Any) -> None:
+        try:
+            event = decode_runtime_event(request.event)
+        except Exception:
+            return
+        if event.kind is RuntimeEventKind.WORKER_STARTED:
+            return
+        active = self._active_leases.get(event.run_id, {}).get(event.lease_id)
+        if active is None:
+            return
+        if (
+            active.controller_generation != str(request.controller_generation)
+            or active.runtime_generation != int(request.runtime_generation)
+        ):
+            return
+        self._remove_active_worker_lease(event.run_id, event.lease_id)
+
+    def _remove_active_worker_lease(self, run_id: str, lease_id: str) -> None:
+        active = self._active_leases.get(run_id)
+        if active is None:
+            return
+        active.pop(lease_id, None)
+        if not active:
+            self._active_leases.pop(run_id, None)
+
+    def _prune_exited_worker_leases(self) -> None:
+        for run_id, leases in tuple(self._active_leases.items()):
+            for lease_id, worker in tuple(leases.items()):
+                process_id = worker.process_id
+                if process_id is None:
+                    continue
+                current_start_time = self._process_start_time(process_id)
+                if (
+                    current_start_time is None
+                    or current_start_time != worker.process_start_time
+                ):
+                    self._remove_active_worker_lease(run_id, lease_id)
+
+    @staticmethod
+    def _process_start_time(process_id: int | None) -> str | None:
+        if process_id is None or process_id <= 0:
+            return None
+        try:
+            stat = Path(f"/proc/{process_id}/stat").read_text(encoding="ascii")
+        except OSError:
+            return None
+        _, separator, suffix = stat.rpartition(")")
+        if not separator:
+            return None
+        fields = suffix.split()
+        return fields[19] if len(fields) > 19 else None
 
     def _open_run_recording(self, request: Any) -> Any:
         run_id = str(request.context.run_id)
@@ -763,6 +1335,48 @@ class NodeAgent:
             return "stale_recording_generation", "Recorder control generation mismatch"
         return None
 
+    def _service_request_error(self, meta: Any) -> tuple[str, str] | None:
+        if int(meta.schema_version) != 1:
+            return "unsupported_schema", "Unsupported service control schema"
+        if not hmac.compare_digest(
+            bytes(meta.authorization_token), self.authorization_token
+        ):
+            return "authorization_failed", "Service control authorization failed"
+        expected = (
+            self.identity.cluster_id,
+            self.identity.node_id,
+            self.identity.boot_id,
+            self.identity.agent_generation,
+            self.controller_generation,
+            self.runtime_generation,
+        )
+        actual = (
+            str(meta.cluster_id),
+            str(meta.node_id),
+            str(meta.boot_id),
+            str(meta.agent_generation),
+            str(meta.controller_generation),
+            int(meta.runtime_generation),
+        )
+        if actual != expected:
+            return "stale_service_generation", "Service control generation mismatch"
+        return None
+
+    async def _service_process_exited(self, event: ServiceProcessExit) -> None:
+        if self._closed:
+            return
+        await self._queue.put(
+            control_pb2.AgentStreamMessage(
+                service_process_exit=control_pb2.ServiceProcessExitMessage(
+                    service_handle_id=event.service_handle_id,
+                    instance_id=event.instance_id,
+                    generation=event.generation,
+                    process_id=event.process_id,
+                    exit_code=event.exit_code,
+                )
+            )
+        )
+
     def _record_runtime_event(
         self, event: RuntimeEvent, producer_sequence: int
     ) -> None:
@@ -822,8 +1436,8 @@ class NodeAgent:
                         "observed_free_hbm_mb": npu.observed_free_hbm_mb,
                         "utilization": npu.utilization,
                         "active_lease_count": sum(
-                            device_id == npu.device_id
-                            for device_id in leases.values()
+                            worker.device_id == npu.device_id
+                            for worker in leases.values()
                         ),
                         "observation_sequence": observation.sequence,
                     }
@@ -882,6 +1496,7 @@ class NodeAgent:
             sequence=self._sequence,
             message_id=new_id("node_message"),
             sent_at_ms=self.clock.wall_ms(),
+            controller_generation=self.controller_generation or "",
         )
 
     def _next_producer_sequence(self) -> int:
@@ -1017,6 +1632,8 @@ def report_worker_event(
     *,
     endpoint: str,
     identity: NodeAgentIdentity,
+    controller_generation: str,
+    runtime_generation: int,
     event: RuntimeEvent,
     timeout_seconds: float,
 ) -> None:
@@ -1026,6 +1643,8 @@ def report_worker_event(
         node_id=identity.node_id,
         boot_id=identity.boot_id,
         agent_generation=identity.agent_generation,
+        controller_generation=controller_generation,
+        runtime_generation=runtime_generation,
         event=encode_runtime_event(event),
     )
     with grpc.insecure_channel(endpoint) as channel:

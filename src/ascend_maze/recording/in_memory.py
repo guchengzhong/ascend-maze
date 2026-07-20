@@ -8,6 +8,7 @@ from threading import RLock
 from ascend_maze.contracts.recording import (
     ExecutionEvent,
     FlushResult,
+    RecorderStatus,
     RunRecordingContext,
 )
 from ascend_maze.core.errors import ContractValidationError
@@ -236,6 +237,64 @@ class InMemoryRecorder:
         with self._lock:
             self._closed = True
 
+    def status(self) -> RecorderStatus:
+        with self._lock:
+            recordings = tuple(self._runs.values())
+            dropped_control = 0
+            dropped_telemetry = 0
+            sequence_gaps = 0
+            committed_files: set[str] = set()
+            for recording in recordings:
+                if recording.flushed is not None:
+                    dropped_control += recording.flushed.dropped_control_event_count
+                    dropped_telemetry += recording.flushed.dropped_telemetry_count
+                    sequence_gaps += recording.flushed.sequence_gap_count
+                    committed_files.update(recording.flushed.committed_files)
+                    continue
+                producer_results = tuple(recording.producer_flushes.values())
+                dropped_control += recording.dropped_control + sum(
+                    result.dropped_control_event_count for result in producer_results
+                )
+                dropped_telemetry += sum(
+                    result.dropped_telemetry_count for result in producer_results
+                )
+                sequence_gaps += recording.sequence_gaps + sum(
+                    result.sequence_gap_count for result in producer_results
+                )
+                committed_files.update(
+                    path for result in producer_results for path in result.committed_files
+                )
+            writer_errors = tuple(
+                error
+                for recording in recordings
+                for error in (
+                    recording.flushed.writer_errors
+                    if recording.flushed is not None
+                    else tuple(recording.writer_errors)
+                    + tuple(
+                        message
+                        for result in recording.producer_flushes.values()
+                        for message in result.writer_errors
+                    )
+                )
+            )
+            return RecorderStatus(
+                schema_version=1,
+                backend="memory",
+                accepting_run_count=sum(item.accepting for item in recordings),
+                control_queue_depth=0,
+                control_queue_capacity=self.control_capacity_per_run,
+                telemetry_queue_depth=0,
+                telemetry_queue_capacity=0,
+                dropped_control_event_count=dropped_control,
+                dropped_telemetry_count=dropped_telemetry,
+                sequence_gap_count=sequence_gaps,
+                writer_error_count=len(writer_errors),
+                recent_writer_errors=writer_errors[-10:],
+                committed_file_count=len(committed_files),
+                closed=self._closed,
+            )
+
     def events(self, run_id: str) -> tuple[ExecutionEvent, ...]:
         with self._lock:
             return tuple(self._require_run(run_id).events)
@@ -292,3 +351,21 @@ class NoopRecorder:
 
     async def close(self, timeout_ms: int) -> None:
         del timeout_ms
+
+    def status(self) -> RecorderStatus:
+        return RecorderStatus(
+            schema_version=1,
+            backend="noop",
+            accepting_run_count=0,
+            control_queue_depth=0,
+            control_queue_capacity=0,
+            telemetry_queue_depth=0,
+            telemetry_queue_capacity=0,
+            dropped_control_event_count=0,
+            dropped_telemetry_count=0,
+            sequence_gap_count=0,
+            writer_error_count=0,
+            recent_writer_errors=(),
+            committed_file_count=0,
+            closed=False,
+        )

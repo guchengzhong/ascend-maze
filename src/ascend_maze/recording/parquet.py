@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import json
 import os
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -11,13 +12,14 @@ import secrets
 from threading import Condition, Event, RLock, Thread
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 from uuid import uuid4
 
 from ascend_maze.contracts.recording import (
     ExecutionEvent,
     FlushResult,
     ParquetRecorderConfig,
+    RecorderStatus,
     RunEventPage,
     RunRecordingContext,
 )
@@ -122,10 +124,16 @@ class ParquetRecorder:
                         "run recording context conflicts with existing context"
                     )
                 return
-            self._runs[context.run_id] = _RunState(
+            state = _RunState(
                 context=context,
                 expected_producers=set(context.initial_expected_producer_ids),
             )
+            self._runs[context.run_id] = state
+            try:
+                self._restore_run_state(state)
+            except Exception:
+                del self._runs[context.run_id]
+                raise
 
     def abort_run(self, run_id: str) -> bool:
         with self._condition:
@@ -350,6 +358,65 @@ class ParquetRecorder:
         with self._lock:
             return len(self._runs)
 
+    def status(self) -> RecorderStatus:
+        with self._lock:
+            states = tuple(self._runs.values())
+            dropped_control = 0
+            dropped_telemetry = 0
+            sequence_gaps = 0
+            committed_files: set[str] = set()
+            for state in states:
+                if state.flushed is not None:
+                    dropped_control += state.flushed.dropped_control_event_count
+                    dropped_telemetry += state.flushed.dropped_telemetry_count
+                    sequence_gaps += state.flushed.sequence_gap_count
+                    committed_files.update(state.flushed.committed_files)
+                    continue
+                producer_results = tuple(state.producer_flushes.values())
+                dropped_control += state.dropped_control + sum(
+                    result.dropped_control_event_count for result in producer_results
+                )
+                dropped_telemetry += state.dropped_telemetry + sum(
+                    result.dropped_telemetry_count for result in producer_results
+                )
+                sequence_gaps += state.sequence_gaps + sum(
+                    result.sequence_gap_count for result in producer_results
+                )
+                committed_files.update(state.committed_files)
+                committed_files.update(
+                    path for result in producer_results for path in result.committed_files
+                )
+            writer_errors = tuple(
+                error
+                for state in states
+                for error in (
+                    state.flushed.writer_errors
+                    if state.flushed is not None
+                    else tuple(state.writer_errors)
+                    + tuple(
+                        message
+                        for result in state.producer_flushes.values()
+                        for message in result.writer_errors
+                    )
+                )
+            )
+            return RecorderStatus(
+                schema_version=1,
+                backend="parquet",
+                accepting_run_count=sum(item.accepting for item in states),
+                control_queue_depth=self._control_queue.qsize(),
+                control_queue_capacity=self.config.control_queue_capacity,
+                telemetry_queue_depth=self._telemetry_queue.qsize(),
+                telemetry_queue_capacity=self.config.telemetry_queue_capacity,
+                dropped_control_event_count=dropped_control,
+                dropped_telemetry_count=dropped_telemetry,
+                sequence_gap_count=sequence_gaps,
+                writer_error_count=len(writer_errors),
+                recent_writer_errors=writer_errors[-10:],
+                committed_file_count=len(committed_files),
+                closed=self._closed,
+            )
+
     def _writer_loop(self) -> None:
         interval_seconds = self.config.flush_interval_ms / 1_000
         while (
@@ -530,6 +597,18 @@ class ParquetRecorder:
                     state,
                     max(0, monotonic_time_ms() - started),
                 )
+                try:
+                    self._write_flush_result_atomic(state.context, result)
+                except Exception as exc:
+                    self._append_writer_error(
+                        state,
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                    result = self._build_flush_result(
+                        run_id,
+                        state,
+                        max(0, monotonic_time_ms() - started),
+                    )
                 state.flushed = result
                 state.flush_in_progress = False
                 owns_flush = False
@@ -676,6 +755,157 @@ class ParquetRecorder:
             / self._path_component(producer_id)
             / f"{self._path_component(context.run_id)}.context.parquet"
         )
+
+    def _flush_result_path(self, context: RunRecordingContext) -> Path:
+        return (
+            self.root
+            / self._path_component(context.experiment_id)
+            / "_context"
+            / "_flush"
+            / f"{self._path_component(context.run_id)}.flush.json"
+        )
+
+    def _restore_run_state(self, state: _RunState) -> None:
+        context = state.context
+        experiment_root = self.root / self._path_component(context.experiment_id)
+        if not experiment_root.exists():
+            return
+        encoded_run_id = self._path_component(context.run_id)
+        context_path = self._context_path(context)
+        if context_path.exists():
+            rows = self._read_rows(context_path)
+            if len(rows) != 1 or self._context_from_row(rows[0]) != context:
+                raise ContractValidationError(
+                    "persisted RunRecordingContext conflicts with recovered context"
+                )
+            state.context_file = str(context_path)
+            state.committed_files.append(str(context_path))
+        event_paths = tuple(
+            sorted(
+                path
+                for path in experiment_root.glob(f"**/{encoded_run_id}.*.parquet")
+                if path != context_path
+                and (".control." in path.name or ".telemetry." in path.name)
+            )
+        )
+        for path in event_paths:
+            relative = path.relative_to(experiment_root)
+            if len(relative.parts) < 3:
+                raise ContractValidationError("persisted Recorder shard path is malformed")
+            node_id, producer_id = (
+                unquote(relative.parts[-3]),
+                unquote(relative.parts[-2]),
+            )
+            channel = "control" if ".control." in path.name else "telemetry"
+            try:
+                shard_sequence = int(path.name.rsplit(".", 2)[1])
+            except (IndexError, ValueError) as exc:
+                raise ContractValidationError(
+                    "persisted Recorder shard sequence is malformed"
+                ) from exc
+            key = (producer_id, node_id, channel)
+            state.shard_sequences[key] = max(
+                shard_sequence,
+                state.shard_sequences.get(key, 0),
+            )
+            for row in self._read_rows(path):
+                event = self._row_to_event(row)
+                if event.run_id != context.run_id or event.experiment_id != context.experiment_id:
+                    raise ContractValidationError(
+                        "persisted Recorder shard belongs to another run"
+                    )
+                existing_owner = self._event_owners.get(event.event_id)
+                if existing_owner is not None and existing_owner != context.run_id:
+                    raise ContractValidationError(
+                        "persisted event_id belongs to another run"
+                    )
+                previous = state.events_by_id.get(event.event_id)
+                if previous is not None and previous != event:
+                    raise ContractValidationError(
+                        "persisted event_id identifies conflicting events"
+                    )
+                state.events_by_id[event.event_id] = event
+                state.seen_producers.add(event.producer_id)
+                self._event_owners[event.event_id] = context.run_id
+                self._last_sequence[event.producer_id] = max(
+                    event.producer_sequence,
+                    self._last_sequence.get(event.producer_id, 0),
+                )
+            state.event_files.append(str(path))
+            state.committed_files.append(str(path))
+        flush_path = self._flush_result_path(context)
+        if flush_path.exists():
+            result = self._read_flush_result(flush_path)
+            if result.run_id != context.run_id:
+                raise ContractValidationError(
+                    "persisted FlushResult belongs to another run"
+                )
+            missing_files = [
+                path for path in result.committed_files if not Path(path).is_file()
+            ]
+            if missing_files:
+                raise ContractValidationError(
+                    "persisted FlushResult references unavailable committed files"
+                )
+            state.flushed = result
+            state.accepting = False
+
+    def _write_flush_result_atomic(
+        self,
+        context: RunRecordingContext,
+        result: FlushResult,
+    ) -> None:
+        path = self._flush_result_path(context)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        payload = {
+            "schema_version": 1,
+            "run_id": result.run_id,
+            "committed_files": list(result.committed_files),
+            "dropped_control_event_count": result.dropped_control_event_count,
+            "dropped_telemetry_count": result.dropped_telemetry_count,
+            "sequence_gap_count": result.sequence_gap_count,
+            "missing_producer_count": result.missing_producer_count,
+            "writer_errors": list(result.writer_errors),
+            "recording_complete": result.recording_complete,
+            "flush_duration_ms": result.flush_duration_ms,
+        }
+        try:
+            with temporary.open("w", encoding="utf-8") as stream:
+                json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _read_flush_result(path: Path) -> FlushResult:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+                raise ValueError("unsupported FlushResult schema")
+            return FlushResult(
+                run_id=str(payload["run_id"]),
+                committed_files=tuple(str(item) for item in payload["committed_files"]),
+                dropped_control_event_count=int(payload["dropped_control_event_count"]),
+                dropped_telemetry_count=int(payload["dropped_telemetry_count"]),
+                sequence_gap_count=int(payload["sequence_gap_count"]),
+                missing_producer_count=int(payload["missing_producer_count"]),
+                writer_errors=tuple(str(item) for item in payload["writer_errors"]),
+                recording_complete=bool(payload["recording_complete"]),
+                flush_duration_ms=int(payload["flush_duration_ms"]),
+            )
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise ContractValidationError(
+                f"persisted FlushResult is invalid: {path}"
+            ) from exc
 
     @staticmethod
     def _path_component(value: str) -> str:
@@ -833,6 +1063,35 @@ class ParquetRecorder:
             wall_time_ms=ParquetRecorder._required_int(row, "wall_time_ms"),
             duration_ms=ParquetRecorder._optional_int(row, "duration_ms"),
             payload=payload,
+        )
+
+    @staticmethod
+    def _context_from_row(row: dict[str, object]) -> RunRecordingContext:
+        producer_ids = row["initial_expected_producer_ids"]
+        if not isinstance(producer_ids, list) or any(
+            not isinstance(item, str) or not item for item in producer_ids
+        ):
+            raise ContractValidationError(
+                "Parquet initial_expected_producer_ids must be strings"
+            )
+        return RunRecordingContext(
+            schema_version=ParquetRecorder._required_int(row, "schema_version"),
+            experiment_id=ParquetRecorder._required_str(row, "experiment_id"),
+            run_id=ParquetRecorder._required_str(row, "run_id"),
+            workflow_fingerprint=ParquetRecorder._required_str(
+                row, "workflow_fingerprint"
+            ),
+            config_fingerprint=ParquetRecorder._required_str(
+                row, "config_fingerprint"
+            ),
+            environment_fingerprint=ParquetRecorder._required_str(
+                row, "environment_fingerprint"
+            ),
+            build_revision=ParquetRecorder._required_str(row, "build_revision"),
+            started_wall_time_ms=ParquetRecorder._required_int(
+                row, "started_wall_time_ms"
+            ),
+            initial_expected_producer_ids=tuple(producer_ids),
         )
 
     @staticmethod

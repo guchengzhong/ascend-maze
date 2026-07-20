@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -255,3 +256,73 @@ class Workflow:
         self._compiled = compiled
         self._frozen = True
         return compiled
+
+    async def run_async(
+        self,
+        *,
+        inputs: Mapping[str, object],
+        submission_id: str | None = None,
+        config_path: str | None = None,
+        socket_path: str | None = None,
+    ) -> str:
+        """Compile locally and submit through the Head-local C13 RuntimeClient."""
+
+        import os
+        from pathlib import Path
+
+        from ascend_maze.compiler.compiler import CompileOptions
+        from ascend_maze.config import load_config
+        from ascend_maze.control.local_rpc import UdsRuntimeClient
+
+        loaded = load_config(config_path)
+        self.compile(
+            CompileOptions(
+                max_literal_value_bytes=loaded.config.workflow.max_literal_value_bytes,
+                max_compiled_literal_bytes=loaded.config.workflow.max_compiled_literal_bytes,
+            )
+        )
+        selected_socket = (
+            socket_path
+            or os.environ.get("ASCEND_MAZE_CONTROL_SOCKET")
+            or loaded.config.control.socket_path
+        )
+        client = UdsRuntimeClient(
+            Path(selected_socket).expanduser().resolve(strict=False),
+            max_inline_control_bytes=loaded.config.control.max_inline_control_bytes,
+            shared_filesystem_roots=loaded.config.data.shared_filesystem_roots,
+        )
+        client.config_fingerprint = loaded.snapshot.config_fingerprint
+        await client.get_controller_status()
+        await client.verify_compatibility()
+        return await client.run(
+            self,
+            inputs=dict(inputs),
+            submission_id=submission_id,
+        )
+
+    def run(
+        self,
+        *,
+        inputs: Mapping[str, object],
+        submission_id: str | None = None,
+        config_path: str | None = None,
+        socket_path: str | None = None,
+    ) -> str:
+        """Synchronous convenience wrapper for :meth:`run_async`."""
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError(
+                "Workflow.run() cannot block an active event loop; use run_async()"
+            )
+        return asyncio.run(
+            self.run_async(
+                inputs=inputs,
+                submission_id=submission_id,
+                config_path=config_path,
+                socket_path=socket_path,
+            )
+        )

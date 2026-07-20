@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import hmac
+import os
+from pathlib import Path
+import stat
 from typing import Callable
 
 from ascend_maze.api.workflow import Workflow
 from ascend_maze.compiler.ir import CompiledWorkflow
-from ascend_maze.contracts.data import DataHandle
+from ascend_maze.contracts.data import DataHandle, SharedFileRef
 from ascend_maze.contracts.submission import (
     RunInputIdentity,
     SubmissionContract,
@@ -18,6 +23,7 @@ from ascend_maze.contracts.submission import (
 from ascend_maze.core.canonical import FrozenMap, canonical_digest, freeze_canonical
 from ascend_maze.core.errors import (
     CanonicalizationError,
+    ContractValidationError,
     DataHandleInvalidError,
     SubmissionAbortedError,
     SubmissionConflictError,
@@ -39,8 +45,16 @@ class PreparedSubmission:
 
 
 class InMemoryRuntimeClient:
-    def __init__(self, controller: InMemoryController) -> None:
+    def __init__(
+        self,
+        controller: InMemoryController,
+        *,
+        shared_filesystem_roots: tuple[str, ...] = (),
+    ) -> None:
         self.controller = controller
+        self.shared_filesystem_roots = normalize_shared_filesystem_roots(
+            shared_filesystem_roots
+        )
         self._prepared: dict[str, PreparedSubmission] = {}
 
     def prepare_submission(
@@ -54,7 +68,7 @@ class InMemoryRuntimeClient:
         execution_options: dict[str, object] | None = None,
     ) -> PreparedSubmission:
         if isinstance(workflow, Workflow):
-            compiled = workflow.compile()
+            compiled = workflow._compiled or workflow.compile()
             callables_by_definition: dict[str, Callable[..., object]] = {}
             for draft in workflow._draft_tasks:
                 definition_id = compiled.tasks[draft.task_id].definition_id
@@ -97,11 +111,16 @@ class InMemoryRuntimeClient:
         handles: list[tuple[str, DataHandle]] = []
         try:
             for name in sorted(inputs):
+                value = inputs[name]
+                if isinstance(value, SharedFileRef):
+                    validate_shared_file_ref(
+                        value, self.shared_filesystem_roots
+                    )
                 handles.append(
                     (
                         name,
                         self.controller.data_store.put_staged(
-                            inputs[name], self.controller.controller_generation
+                            value, self.controller.data_owner_generation
                         ),
                     )
                 )
@@ -110,7 +129,7 @@ class InMemoryRuntimeClient:
                 self.controller.data_store.release(handle)
             raise
         identities = tuple(
-            RunInputIdentity.from_data_handle(name, handle)
+            run_input_identity(name, inputs[name], handle)
             for name, handle in handles
         )
         contract = SubmissionContract.create(
@@ -219,6 +238,13 @@ class InMemoryRuntimeClient:
 
     @staticmethod
     def _value_identity(value: object) -> tuple[str, ...]:
+        if isinstance(value, SharedFileRef):
+            return (
+                "shared_file",
+                value.canonical_path,
+                value.content_sha256,
+                str(value.size_bytes),
+            )
         try:
             return ("digest", canonical_digest(value))
         except CanonicalizationError:
@@ -228,3 +254,64 @@ class InMemoryRuntimeClient:
                 type(value).__qualname__,
                 str(id(value)),
             )
+
+
+def validate_shared_file_ref(
+    file_ref: SharedFileRef,
+    shared_filesystem_roots: tuple[str, ...],
+) -> None:
+    path = Path(file_ref.canonical_path)
+    if not shared_filesystem_roots:
+        raise ContractValidationError(
+            "SharedFileRef requires data.shared_filesystem_roots"
+        )
+    if not any(
+        path == root or root in path.parents
+        for root in (Path(value) for value in shared_filesystem_roots)
+    ):
+        raise ContractValidationError(
+            "SharedFileRef path is outside data.shared_filesystem_roots"
+        )
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as stream:
+            info_before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info_before.st_mode):
+                raise ContractValidationError("SharedFileRef path must be a regular file")
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+            info_after = os.fstat(stream.fileno())
+    except OSError as exc:
+        raise ContractValidationError(
+            f"SharedFileRef is not readable on Head: {path}"
+        ) from exc
+    if (
+        info_before.st_size != info_after.st_size
+        or info_before.st_mtime_ns != info_after.st_mtime_ns
+    ):
+        raise ContractValidationError("SharedFileRef changed while it was validated")
+    if size != file_ref.size_bytes:
+        raise ContractValidationError("SharedFileRef size_bytes does not match file")
+    if not hmac.compare_digest(digest.hexdigest(), file_ref.content_sha256):
+        raise ContractValidationError("SharedFileRef content_sha256 does not match file")
+
+
+def run_input_identity(
+    name: str,
+    value: object,
+    handle: DataHandle,
+) -> RunInputIdentity:
+    if isinstance(value, SharedFileRef):
+        return RunInputIdentity.from_shared_file(name, value)
+    return RunInputIdentity.from_data_handle(name, handle)
+
+
+def normalize_shared_filesystem_roots(values: tuple[str, ...]) -> tuple[str, ...]:
+    roots: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise ContractValidationError("shared filesystem root must be a path string")
+        roots.append(str(Path(value).expanduser().resolve(strict=False)))
+    return tuple(sorted(set(roots)))
