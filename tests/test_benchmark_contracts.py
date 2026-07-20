@@ -69,3 +69,22 @@ def test_direct_contract_construction_cannot_reintroduce_mutability(
         replace(plan.spec, schema_version=True)
     with pytest.raises(ExperimentValidationError, match="one Trial per Cell"):
         replace(plan, trials=plan.trials[:-1])
+
+
+def test_closed_loop_rejects_duration_warmup_during_offline_validation(
+    tmp_path: Path,
+) -> None:
+    spec_path = write_experiment_spec(tmp_path)
+    text = spec_path.read_text(encoding="utf-8")
+    text = text.replace('mode = "poisson"', 'mode = "closed_loop"').replace(
+        "rate_per_second = 2.5", "concurrency = 2"
+    )
+    text = text.replace("warmup_runs = 10", "warmup_runs = 0").replace(
+        "warmup_duration_ms = 0", "warmup_duration_ms = 100"
+    )
+    text = text.replace("measurement_run_count = 0", "measurement_run_count = 2").replace(
+        "measurement_duration_ms = 60000", "measurement_duration_ms = 0"
+    )
+    spec_path.write_text(text, encoding="utf-8")
+    with pytest.raises(ExperimentValidationError, match="count-based warmup"):
+        load_study_plan(spec_path)

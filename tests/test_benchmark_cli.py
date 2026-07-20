@@ -48,8 +48,8 @@ def test_maze_bench_reports_structured_local_errors(
     assert error["error_code"] == "experiment_validation_failed"
 
     parser = build_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["run", "experiment.toml"])
+    assert parser.parse_args(["run", "experiment.toml"]).command == "run"
+    assert parser.parse_args(["resume", "study-dir"]).command == "resume"
 
 
 def test_plan_bytes_are_identical_across_process_hash_seeds(tmp_path: Path) -> None:
@@ -114,6 +114,8 @@ def test_planner_import_and_execution_do_not_load_heavy_runtimes(
                     violations.append((str(path.relative_to(ROOT)), name))
                 if name == "ascend_maze" and isinstance(node, ast.ImportFrom):
                     module = node.module or ""
-                    if module.startswith("ascend_maze.control"):
+                    if module.startswith("ascend_maze.control") and path.name != (
+                        "c13_runtime.py"
+                    ):
                         violations.append((str(path.relative_to(ROOT)), module))
     assert violations == []

@@ -22,7 +22,11 @@ from ascend_maze.api.workflow import Workflow
 from ascend_maze.compiler.compiler import CompileOptions
 from ascend_maze.cli.doctor import run_doctor
 from ascend_maze.cli.output import emit_error, emit_json, json_value
-from ascend_maze.config import LoadedConfig, load_config
+from ascend_maze.config import (
+    LoadedConfig,
+    load_config,
+    load_config_override_document,
+)
 from ascend_maze.contracts.data import SharedFileRef
 from ascend_maze.control.local_rpc import ControlRpcError, UdsRuntimeClient
 from ascend_maze.core.errors import (
@@ -57,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     controller_start = controller_commands.add_parser("start")
     controller_start.add_argument("--config", required=True)
+    controller_start.add_argument("--config-overrides")
+    controller_start.add_argument("--fresh-recovery", action="store_true")
     controller_status = controller_commands.add_parser("status")
     _connection_options(controller_status)
     controller_stop = controller_commands.add_parser("stop")
@@ -178,7 +184,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "controller" and args.controller_command == "start":
             from ascend_maze.control.application import ControllerApplication
 
-            loaded = load_config(args.config, build_revision=_build_revision())
+            loaded = _load_controller_start_config(args)
+            if args.fresh_recovery:
+                _clear_stopped_controller_recovery(loaded)
             return asyncio.run(ControllerApplication(loaded).run())
         if args.command == "node" and args.node_command == "start":
             from ascend_maze.config import load_node_bootstrap
@@ -270,6 +278,86 @@ def _render_config(loaded: object, as_json: bool) -> None:
 
 def _build_revision() -> str:
     return os.environ.get("ASCEND_MAZE_BUILD_REVISION", "uncommitted")
+
+
+def _load_controller_start_config(args: argparse.Namespace) -> LoadedConfig:
+    if not args.config_overrides:
+        return load_config(args.config, build_revision=_build_revision())
+    override_document = load_config_override_document(args.config_overrides)
+    if override_document.build_revision != _build_revision():
+        raise ContractValidationError(
+            "config override build_revision does not match Controller"
+        )
+    loaded = load_config(
+        args.config,
+        build_revision=_build_revision(),
+        config_overrides=override_document.overrides,
+    )
+    if (
+        loaded.snapshot.config_fingerprint
+        != override_document.expected_config_fingerprint
+    ):
+        raise ContractValidationError(
+            "config override fingerprint does not match resolved Controller config"
+        )
+    return loaded
+
+
+def _clear_stopped_controller_recovery(loaded: LoadedConfig) -> None:
+    """Reset recovery only when no Controller endpoint or live PID exists."""
+
+    socket_path = Path(loaded.config.control.socket_path)
+    pid_path = Path(loaded.config.control.pid_file)
+    if socket_path.exists():
+        raise ContractValidationError(
+            "fresh recovery is forbidden while the Controller socket exists"
+        )
+    if pid_path.exists():
+        try:
+            identity = json.loads(pid_path.read_text(encoding="utf-8"))
+            if not isinstance(identity, dict):
+                raise ValueError("PID lock is not an object")
+            pid = identity.get("pid")
+            expected_ticks = identity.get("process_start_ticks")
+            if (
+                isinstance(pid, bool)
+                or not isinstance(pid, int)
+                or pid < 1
+                or isinstance(expected_ticks, bool)
+                or not isinstance(expected_ticks, int)
+                or expected_ticks < 1
+            ):
+                raise ValueError("PID lock identity is invalid")
+            fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+            current_ticks = int(fields[21])
+        except FileNotFoundError:
+            current_ticks = None
+            expected_ticks = -1
+        except (OSError, UnicodeDecodeError, ValueError, IndexError) as exc:
+            raise ContractValidationError(
+                "cannot prove that the previous Controller PID is stopped"
+            ) from exc
+        if current_ticks == expected_ticks:
+            raise ContractValidationError(
+                "fresh recovery is forbidden while the Controller PID is alive"
+            )
+        pid_path.unlink()
+    recovery = Path(loaded.config.control.recovery_path)
+    for path in (
+        recovery,
+        recovery.with_name(recovery.name + "-wal"),
+        recovery.with_name(recovery.name + "-shm"),
+    ):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    recovery.parent.mkdir(parents=True, exist_ok=True)
+    directory_fd = os.open(recovery.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _connection_options(parser: argparse.ArgumentParser) -> None:

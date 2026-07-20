@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 
@@ -65,11 +66,49 @@ def write_experiment_spec(
     reverse_matrix: bool = False,
     study_kind: str = "formal",
     block_count: int = 10,
+    workflow_factory: str = "benchmarks.workloads:build",
+    workflow_fingerprint: str = WORKFLOW_FINGERPRINT,
+    arrival_mode: str = "poisson",
+    concurrency: int = 2,
+    rate_per_second: float = 2.5,
+    warmup_runs: int = 10,
+    warmup_duration_ms: int = 0,
+    measurement_run_count: int = 0,
+    measurement_duration_ms: int = 60_000,
+    drain_deadline_ms: int = 30_000,
+    trace_offsets_ms: tuple[int, ...] = (0, 0, 25, 50),
 ) -> Path:
     config = base_config or write_performance_config(root)
     dataset = root / "dataset.json"
     if not dataset.exists():
-        dataset.write_bytes(b'{"items":[1,2,3]}\n')
+        dataset.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "workflow_fingerprint": workflow_fingerprint,
+                    "records": [
+                        {"record_id": "record-a", "inputs": {"value": 1}},
+                        {"record_id": "record-b", "inputs": {"value": 2}},
+                        {"record_id": "record-c", "inputs": {"value": 3}},
+                    ],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    trace = root / "trace.json"
+    if arrival_mode == "trace_replay":
+        trace.write_text(
+            json.dumps(
+                {"schema_version": 1, "offsets_ms": list(trace_offsets_ms)},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     factors = [
         ("ordering", ["scheduler.policy"]),
         ("anchor", ["placement.anchor_strategy"]),
@@ -114,8 +153,8 @@ def write_experiment_spec(
         "",
         "[workload]",
         'name = "qwen-workflow"',
-        'workflow_factory = "benchmarks.workloads:build"',
-        f'workflow_fingerprint = "{WORKFLOW_FINGERPRINT}"',
+        f'workflow_factory = "{workflow_factory}"',
+        f'workflow_fingerprint = "{workflow_fingerprint}"',
         'model_catalog_revision = "no-model-catalog"',
         f'model_artifact_digest = "{MODEL_DIGEST}"',
         f'required_environment_fingerprint = "{ENVIRONMENT_FINGERPRINT}"',
@@ -125,33 +164,57 @@ def write_experiment_spec(
         f'path = "{dataset.name}"',
         f'sha256 = "{sha256(dataset)}"',
         f"size_bytes = {dataset.stat().st_size}",
-        "",
-        "[arrival]",
-        'mode = "poisson"',
-        "rate_per_second = 2.5",
-        "",
-        "[windows]",
-        "warmup_runs = 10",
-        "warmup_duration_ms = 0",
-        "measurement_run_count = 0",
-        "measurement_duration_ms = 60000",
-        "drain_deadline_ms = 30000",
-        "",
-        "[analysis]",
-        'metric_set = ["dct_ms", "throughput_success_per_s"]',
-        'validity_policy = "c14_v1"',
-        'statistics_policy = "c14_v1"',
-        'performance_budget_set = "c14_v1"',
-        'quantile_method = "hyndman_fan_type_7"',
-        "bootstrap_samples = 10000",
-        "confidence_level = 0.95",
-        "familywise_confidence_level = 0.9875",
-        "automatic_outlier_removal = false",
-        "",
-        "[matrix]",
-        'kind = "internal_ablation_v1"',
-        'baseline_cell = "maze_full"',
     ]
+    if arrival_mode == "trace_replay":
+        lines.extend(
+            (
+                "",
+                "[[workload.inputs]]",
+                'logical_name = "trace"',
+                f'path = "{trace.name}"',
+                f'sha256 = "{sha256(trace)}"',
+                f"size_bytes = {trace.stat().st_size}",
+            )
+        )
+    arrival_value = (
+        f"concurrency = {concurrency}"
+        if arrival_mode == "closed_loop"
+        else (
+            'trace_input = "trace"'
+            if arrival_mode == "trace_replay"
+            else f"rate_per_second = {rate_per_second}"
+        )
+    )
+    lines.extend(
+        (
+            "",
+            "[arrival]",
+            f'mode = "{arrival_mode}"',
+            arrival_value,
+            "",
+            "[windows]",
+            f"warmup_runs = {warmup_runs}",
+            f"warmup_duration_ms = {warmup_duration_ms}",
+            f"measurement_run_count = {measurement_run_count}",
+            f"measurement_duration_ms = {measurement_duration_ms}",
+            f"drain_deadline_ms = {drain_deadline_ms}",
+            "",
+            "[analysis]",
+            'metric_set = ["dct_ms", "throughput_success_per_s"]',
+            'validity_policy = "c14_v1"',
+            'statistics_policy = "c14_v1"',
+            'performance_budget_set = "c14_v1"',
+            'quantile_method = "hyndman_fan_type_7"',
+            "bootstrap_samples = 10000",
+            "confidence_level = 0.95",
+            "familywise_confidence_level = 0.9875",
+            "automatic_outlier_removal = false",
+            "",
+            "[matrix]",
+            'kind = "internal_ablation_v1"',
+            'baseline_cell = "maze_full"',
+        )
+    )
     for name, paths in factors:
         rendered_paths = ", ".join(f'"{path}"' for path in paths)
         lines.extend(

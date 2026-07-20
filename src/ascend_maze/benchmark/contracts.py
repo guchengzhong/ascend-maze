@@ -274,9 +274,9 @@ class MeasurementWindows:
         ):
             _non_negative(f"windows.{name}", getattr(self, name))
         _positive("windows.drain_deadline_ms", self.drain_deadline_ms)
-        if (self.warmup_runs > 0) == (self.warmup_duration_ms > 0):
+        if self.warmup_runs > 0 and self.warmup_duration_ms > 0:
             raise ExperimentValidationError(
-                "windows: exactly one of warmup_runs and warmup_duration_ms must be positive"
+                "windows: warmup_runs and warmup_duration_ms cannot both be positive"
             )
         if (self.measurement_run_count > 0) == (self.measurement_duration_ms > 0):
             raise ExperimentValidationError(
@@ -287,6 +287,10 @@ class MeasurementWindows:
         if arrival.mode == "closed_loop" and self.measurement_run_count == 0:
             raise ExperimentValidationError(
                 "windows.measurement_run_count: required for closed_loop"
+            )
+        if arrival.mode == "closed_loop" and self.warmup_duration_ms > 0:
+            raise ExperimentValidationError(
+                "windows.warmup_duration_ms: closed_loop requires count-based warmup"
             )
         if arrival.mode != "closed_loop" and self.measurement_duration_ms == 0:
             raise ExperimentValidationError(
