@@ -237,6 +237,14 @@ def test_standby_hit_and_sanitized_cpu_reuse_keep_one_reservation() -> None:
         assert worker_lease.cold_start_ms == 0
         assert worker_lease.host_warmup_ms == 2
         assert worker_lease.worker_id == idle.worker_id
+        active_snapshot = broker.snapshot().worker_leases
+        assert broker.snapshot().active_worker_lease_count == 1
+        assert len(active_snapshot) == 1
+        assert active_snapshot[0].lease == worker_lease
+        assert active_snapshot[0].placement_lease_id == result.lease.lease_id
+        assert not active_snapshot[0].released
+        assert not active_snapshot[0].releasing
+        assert active_snapshot[0].disposition is None
         assert broker.submit(worker_lease.worker_lease_id, {"request": "same"}) == {
             "request": "same"
         }
@@ -249,6 +257,9 @@ def test_standby_hit_and_sanitized_cpu_reuse_keep_one_reservation() -> None:
         assert returned.cold_starts == 0
         assert returned.workers[0].state is StandbyWorkerState.IDLE
         assert returned.workers[0].tasks_completed == 1
+        assert returned.worker_leases[0].released
+        assert returned.worker_leases[0].disposition == "reuse"
+        assert returned.active_worker_lease_count == 0
         assert len(factory.started) == 1
         assert placement.active_lease_count("run_1") == 0
         assert placement.active_lease_count() == 1

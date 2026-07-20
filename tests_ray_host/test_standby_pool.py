@@ -8,6 +8,7 @@ import ray
 
 from ascend_maze import Workflow, task
 from ascend_maze.control.client import InMemoryRuntimeClient
+from ascend_maze.control.local_rpc import UdsRuntimeClient
 from ascend_maze.control.node_rpc import NodeAgent, NodeAgentIdentity
 from ascend_maze.control.ray_controller import RayHostController
 from ascend_maze.contracts.resources import ReservationVector
@@ -20,7 +21,9 @@ from ascend_maze.contracts.worker import (
 )
 from ascend_maze.lifecycle import RunStatus
 from ascend_maze.placement import NodeCapacity
+from ascend_maze.runtime.ray_node_registry import RuntimeNodeStatus
 from tests_ray_host.standby_task_fixtures import (
+    drain_slow_cpu_task,
     leak_file_descriptor,
     leak_child_process,
     slow_cpu_task,
@@ -42,6 +45,7 @@ def _node() -> NodeCapacity:
         mem_system_reserved_mb=0,
         io_slots_total=2,
         observed_free_mem_mb=1_024,
+        capabilities={"environment_fingerprint": ENVIRONMENT},
     )
 
 
@@ -66,6 +70,54 @@ def _pool_config() -> WorkerPoolConfig:
         ),
         reconcile_interval_ms=25,
     )
+
+
+def test_control_socket_opens_only_after_worker_broker_is_ready(
+    ray_namespace: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        controller = RayHostController(
+            cluster_id="cluster_start_order",
+            authorization_token=b"test-token",
+            ray_namespace=ray_namespace,
+            config_fingerprint=CONFIG,
+            environment_fingerprint=ENVIRONMENT,
+            build_revision="test_build",
+            node_capacities=(_node(),),
+            worker_pool_config=_pool_config(),
+            control_socket_path=(tmp_path / "runtime" / "control.sock").resolve(),
+        )
+        assert controller.local_rpc is not None
+        events: list[str] = []
+        original_broker_start = controller.worker_broker.start
+        original_rpc_start = controller.local_rpc.start
+
+        async def broker_start() -> None:
+            events.append("worker_broker_ready")
+            await original_broker_start()
+
+        async def rpc_start() -> None:
+            events.append("control_socket_open")
+            await original_rpc_start()
+
+        monkeypatch.setattr(controller.worker_broker, "start", broker_start)
+        monkeypatch.setattr(controller.local_rpc, "start", rpc_start)
+        try:
+            await controller.start()
+            client = UdsRuntimeClient(
+                (tmp_path / "runtime" / "control.sock").resolve()
+            )
+            await client.get_controller_status()
+            pools = await client.query("GetWorkerPools")
+            assert pools["worker_pool"]["mode"] == "zero_hbm_standby"
+            assert pools["worker_pools"] == [pools["worker_pool"]]
+            assert events == ["worker_broker_ready", "control_socket_open"]
+        finally:
+            await controller.close(force=True, drain_timeout_ms=0)
+
+    asyncio.run(scenario())
 
 
 def test_ray_standby_actor_reuses_pid_and_common_execution_path(
@@ -165,6 +217,133 @@ def test_ray_standby_actor_reuses_pid_and_common_execution_path(
                 await agent.close(grace_seconds=0)
             await controller.close()
         assert controller.placement.active_lease_count() == 0
+
+    asyncio.run(scenario())
+
+
+def test_node_drain_allows_active_standby_task_then_retires_and_resumes(
+    ray_namespace: str,
+) -> None:
+    async def scenario() -> None:
+        controller = RayHostController(
+            cluster_id="cluster_node_drain",
+            authorization_token=b"test-token",
+            ray_namespace=ray_namespace,
+            config_fingerprint=CONFIG,
+            environment_fingerprint=ENVIRONMENT,
+            build_revision="test_build",
+            node_capacities=(_node(),),
+            worker_pool_config=_pool_config(),
+        )
+        agent: NodeAgent | None = None
+        try:
+            await controller.start()
+            agent = NodeAgent(
+                identity=NodeAgentIdentity(
+                    cluster_id="cluster_node_drain",
+                    node_id="node_a",
+                    boot_id="boot_1",
+                    ray_node_id=ray.get_runtime_context().get_node_id(),
+                    agent_generation="agent_1",
+                    environment_fingerprint=ENVIRONMENT,
+                    producer_id="node_agent:node_a:agent_1",
+                ),
+                authorization_token=b"test-token",
+                heartbeat_interval_ms=25,
+            )
+            await agent.start(controller_endpoint=controller.node_rpc_endpoint)
+            for _ in range(400):
+                idle = [
+                    worker
+                    for worker in controller.worker_broker.snapshot().workers
+                    if worker.state is StandbyWorkerState.IDLE
+                ]
+                if idle:
+                    break
+                await asyncio.sleep(0.025)
+            else:
+                raise AssertionError(controller.worker_broker.snapshot())
+            original_pid = idle[0].process_id
+
+            workflow = Workflow("ray-node-drain-active")
+            value = workflow.input("value")
+            workflow.add_task(drain_slow_cpu_task, inputs={"value": value})
+            outcome = await InMemoryRuntimeClient(controller).submit(
+                workflow,
+                inputs={"value": "completed"},
+                submission_id="submission_ray_node_drain_active",
+            )
+            assert outcome.run_id is not None
+            for _ in range(400):
+                if any(
+                    item.lease.run_id == outcome.run_id
+                    and item.status.value == "bound"
+                    for item in controller.placement.lease_snapshots()
+                ):
+                    break
+                await asyncio.sleep(0.005)
+            else:
+                raise AssertionError("Task did not reach the running state")
+
+            draining = asyncio.create_task(
+                controller.drain_node(
+                    "node_a",
+                    boot_id="boot_1",
+                    timeout_ms=5_000,
+                )
+            )
+            await asyncio.sleep(0.05)
+            assert not draining.done()
+            assert (
+                controller.node_registry.status("node_a")
+                is RuntimeNodeStatus.DRAINING
+            )
+            assert controller.worker_broker.active_count("node_a") == 1
+
+            terminal = await controller.wait_run(
+                outcome.run_id, timeout_seconds=5
+            )
+            assert terminal.status is RunStatus.SUCCEEDED
+            result = await draining
+            assert result.status == "drained"
+            assert result.cleanup_confirmed
+            assert controller.worker_broker.active_count("node_a") == 0
+            assert controller.worker_broker.live_count("node_a", "boot_1") == 0
+            assert controller.placement.active_lease_count() == 0
+            assert (
+                controller.node_registry.status("node_a")
+                is RuntimeNodeStatus.DRAINED
+            )
+            try:
+                assert original_pid is not None
+                os.kill(original_pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise AssertionError("drained Standby Worker process is still alive")
+
+            repeated = await controller.drain_node(
+                "node_a", boot_id="boot_1", timeout_ms=1_000
+            )
+            assert repeated.status == "drained"
+            resumed = await controller.resume_node("node_a", boot_id="boot_1")
+            assert resumed.status == "healthy"
+            for _ in range(400):
+                replacement = [
+                    worker
+                    for worker in controller.worker_broker.snapshot().workers
+                    if worker.state is StandbyWorkerState.IDLE
+                ]
+                if replacement:
+                    break
+                await asyncio.sleep(0.025)
+            else:
+                raise AssertionError(controller.worker_broker.snapshot())
+            assert replacement[0].process_id != original_pid
+        finally:
+            if agent is not None:
+                await agent.close(grace_seconds=0)
+            await controller.close(force=True, drain_timeout_ms=0)
 
     asyncio.run(scenario())
 

@@ -38,7 +38,9 @@ def ascend_admission() -> AscendAdmission:
     eligible = [
         item
         for item in devices
-        if item.health == "healthy" and not item.processes and item.total_hbm_mb >= 65_000
+        if item.health == "healthy"
+        and not item.processes
+        and item.total_hbm_mb >= 65_000
     ]
     if not eligible:
         raise RuntimeError("stage 4 requires one idle healthy 64 GiB Ascend NPU")
@@ -49,6 +51,13 @@ def ascend_admission() -> AscendAdmission:
         "cloudpickle": "3.1.2",
         "cann": "9.0.0-beta.2",
         "driver": "25.3.rc1",
+        "atb": "9.0.0",
+        "atb_libmki_sha256": (
+            "41d55d3994ab35b0460a0ce12aec1a35c6a9ed515d3d6424e654465a44d0f27f"
+        ),
+        "atb_libtbe_adapter_sha256": (
+            "f9b332bd0fe8d8ba39f78fc1042b360c4517615d97a075fca5edd5393e69a108"
+        ),
     }
     mismatches = {
         name: (environment.versions.get(name), version)

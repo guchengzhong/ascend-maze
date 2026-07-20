@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
 from typing import Any
 
 import ray
@@ -19,10 +25,23 @@ def validate_ray_version() -> None:
         )
 
 
+def current_ray_node_id() -> str:
+    if not ray.is_initialized():
+        raise RuntimeError("Ray is not initialized")
+    return str(ray.get_runtime_context().get_node_id())
+
+
+def current_ray_address() -> str:
+    if not ray.is_initialized():
+        raise RuntimeError("Ray is not initialized")
+    return str(ray.get_runtime_context().gcs_address)
+
+
 @dataclass(frozen=True, slots=True)
 class RayClusterConfig:
     namespace: str
     address: str | None = None
+    temp_directory: str | None = None
     include_dashboard: bool = False
     local_num_cpus: int | None = None
     local_object_store_memory: int | None = None
@@ -35,6 +54,8 @@ class RayClusterConfig:
             value = getattr(self, name)
             if value is not None and value <= 0:
                 raise ValueError(f"{name} must be positive or None")
+        if self.temp_directory is not None and not self.temp_directory:
+            raise ValueError("temp_directory cannot be empty")
 
 
 class ManagedRayCluster:
@@ -63,6 +84,8 @@ class ManagedRayCluster:
             kwargs["address"] = self.config.address
         else:
             kwargs["address"] = "local"
+            if self.config.temp_directory is not None:
+                kwargs["_temp_dir"] = self.config.temp_directory
             if self.config.local_num_cpus is not None:
                 kwargs["num_cpus"] = self.config.local_num_cpus
             if self.config.local_object_store_memory is not None:
@@ -108,3 +131,129 @@ class ManagedRayCluster:
                 if bool(node.get("Alive"))
             )
         )
+
+
+class ManagedRayWorkerNode:
+    """Own one public `ray start --block` worker generation by process group."""
+
+    def __init__(
+        self,
+        *,
+        address: str,
+        namespace: str,
+        node_ip: str,
+        temp_directory: str,
+        num_cpus: int,
+        log_path: str | Path,
+        startup_timeout_seconds: float = 30.0,
+    ) -> None:
+        if not address or not namespace or not node_ip or not temp_directory:
+            raise ValueError("Ray worker bootstrap identities are required")
+        if num_cpus < 1 or startup_timeout_seconds <= 0:
+            raise ValueError("Ray worker capacity/deadline is invalid")
+        self.address = address
+        self.namespace = namespace
+        self.node_ip = node_ip
+        self.temp_directory = str(Path(temp_directory).resolve(strict=False))
+        self.num_cpus = num_cpus
+        self.log_path = Path(log_path).resolve(strict=False)
+        self.startup_timeout_seconds = startup_timeout_seconds
+        self.process: subprocess.Popen[bytes] | None = None
+        self.node_id: str | None = None
+        self._log_stream: object | None = None
+
+    def start(self) -> str:
+        if self.process is not None:
+            assert self.node_id is not None
+            return self.node_id
+        if ray.is_initialized():
+            raise RuntimeError("Ray is already initialized outside ManagedRayWorkerNode")
+        validate_ray_version()
+        Path(self.temp_directory).mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        log_stream = self.log_path.open("ab", buffering=0)
+        self._log_stream = log_stream
+        environment = dict(os.environ)
+        environment["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
+        command = (
+            sys.executable,
+            "-m",
+            "ray",
+            "start",
+            f"--address={self.address}",
+            f"--node-ip-address={self.node_ip}",
+            f"--num-cpus={self.num_cpus}",
+            "--num-gpus=0",
+            f"--resources={json.dumps({'NPU': 0}, separators=(',', ':'))}",
+            f"--temp-dir={self.temp_directory}",
+            "--disable-usage-stats",
+            "--block",
+            "--log-style=record",
+            "--log-color=false",
+        )
+        deadline = time.monotonic() + self.startup_timeout_seconds
+        try:
+            ray.init(address=self.address, namespace=self.namespace)
+            existing_node_ids = {
+                str(item["NodeID"])
+                for item in ray.nodes()
+                if bool(item.get("Alive"))
+            }
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=log_stream,
+                stderr=subprocess.STDOUT,
+                env=environment,
+                start_new_session=True,
+            )
+            self.process = process
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise RuntimeError(
+                        f"managed Ray worker exited with code {process.returncode}"
+                    )
+                matches = tuple(
+                    str(item["NodeID"])
+                    for item in ray.nodes()
+                    if bool(item.get("Alive"))
+                    and str(item.get("NodeManagerAddress")) == self.node_ip
+                    and str(item["NodeID"]) not in existing_node_ids
+                )
+                if len(matches) == 1:
+                    self.node_id = matches[0]
+                    return self.node_id
+                if len(matches) > 1:
+                    raise RuntimeError(
+                        "managed Ray worker join is ambiguous for node IP "
+                        f"{self.node_ip}"
+                    )
+                time.sleep(0.1)
+            raise TimeoutError("managed Ray worker did not join before deadline")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if ray.is_initialized():
+            ray.shutdown()
+        process = self.process
+        self.process = None
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=5)
+        stream = self._log_stream
+        self._log_stream = None
+        if stream is not None:
+            stream.close()  # type: ignore[attr-defined]
+        self.node_id = None

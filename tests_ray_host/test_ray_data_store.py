@@ -5,7 +5,12 @@ from uuid import uuid4
 
 import pytest
 
-from ascend_maze.contracts.data import DataHandle, DataOwner
+from ascend_maze.contracts.data import (
+    DataHandle,
+    DataOwner,
+    SharedFileRef,
+    shared_file_from_handle,
+)
 from ascend_maze.core.errors import DataHandleInvalidError, DataOwnershipError
 from ascend_maze.data.ray_store import RayDataStore
 
@@ -38,6 +43,22 @@ def test_ray_data_store_staged_adopt_release_lifecycle(ray_store: RayDataStore) 
     assert ray_store.state_of(handle) == "released"
     with pytest.raises(DataHandleInvalidError):
         ray_store.get(handle)
+
+
+def test_ray_data_store_preserves_explicit_shared_file_identity(
+    ray_store: RayDataStore,
+    tmp_path,
+) -> None:
+    path = (tmp_path / "shared.txt").resolve()
+    path.write_text("payload", encoding="utf-8")
+    file_ref = SharedFileRef(str(path), "2" * 64, 7)
+    handle = ray_store.put_staged(
+        file_ref,
+        ray_store.descriptor.owner_generation,
+    )
+    assert handle.stable_digest is None
+    assert shared_file_from_handle(handle) == file_ref
+    assert ray_store.get(handle) == file_ref
 
 
 def test_ray_data_store_adopt_is_atomic_and_generation_checked(

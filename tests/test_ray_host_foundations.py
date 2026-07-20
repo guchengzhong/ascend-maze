@@ -124,6 +124,39 @@ def test_unhealthy_runtime_binding_rejects_placement_lease() -> None:
         registry.resolve_lease(_lease())
 
 
+def test_registration_and_heartbeat_cannot_clear_administrative_drain() -> None:
+    registry = RayNodeRegistry()
+    _register(
+        registry,
+        boot_id="boot_1",
+        ray_node_id="ray_1",
+        agent_generation="agent_1",
+    )
+    assert registry.set_status("node_a", RuntimeNodeStatus.DRAINING)
+    _register(
+        registry,
+        boot_id="boot_1",
+        ray_node_id="ray_1",
+        agent_generation="agent_1",
+    )
+    assert registry.status("node_a") is RuntimeNodeStatus.DRAINING
+    assert registry.heartbeat(
+        node_id="node_a",
+        boot_id="boot_1",
+        agent_generation="agent_1",
+        sequence=1,
+    )
+    assert registry.status("node_a") is RuntimeNodeStatus.DRAINING
+    assert registry.set_status("node_a", RuntimeNodeStatus.DRAINED)
+    assert registry.heartbeat(
+        node_id="node_a",
+        boot_id="boot_1",
+        agent_generation="agent_1",
+        sequence=2,
+    )
+    assert registry.status("node_a") is RuntimeNodeStatus.DRAINED
+
+
 def test_cold_worker_lease_release_and_node_invalidation_are_idempotent() -> None:
     registry = RayNodeRegistry()
     _register(

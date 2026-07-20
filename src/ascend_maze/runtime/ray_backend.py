@@ -83,6 +83,7 @@ class RayRuntimeBackend:
         worker_broker: ColdWorkerBroker | StandbyWorkerBroker,
         cluster_id: str,
         owner_generation: str,
+        controller_generation: str | None = None,
         environment_fingerprint: str,
         authorization_token: bytes = b"",
         event_timeout_seconds: float = 2.0,
@@ -96,6 +97,7 @@ class RayRuntimeBackend:
         self.worker_broker = worker_broker
         self.cluster_id = cluster_id
         self.owner_generation = owner_generation
+        self.controller_generation = controller_generation or owner_generation
         self.environment_fingerprint = environment_fingerprint
         self.authorization_token = authorization_token
         self.event_timeout_seconds = event_timeout_seconds
@@ -181,7 +183,7 @@ class RayRuntimeBackend:
                     tuple(staged),
                     DataOwner(
                         owner_kind="code_registry",
-                        owner_id=self.owner_generation,
+                        owner_id=self.controller_generation,
                         owner_generation=self.owner_generation,
                     ),
                 )
@@ -298,6 +300,7 @@ class RayRuntimeBackend:
                 worker_lease=worker_lease,
                 binding=binding,
                 agent_identity=identity,
+                controller_generation=self.controller_generation,
                 data_store_descriptor=self.data_store.descriptor,
                 code_package_handle=code.package_handle,
                 event_timeout_seconds=self.event_timeout_seconds,
@@ -402,6 +405,9 @@ class RayRuntimeBackend:
     def producer_for_lease(self, lease: PlacementLease) -> str | None:
         return self.node_registry.producer_for_lease(lease)
 
+    def producer_is_persistent(self, lease: PlacementLease) -> bool:
+        return self.node_registry.resolve_lease(lease).records_locally
+
     async def prepare_run_recording(
         self,
         context: RunRecordingContext,
@@ -424,7 +430,7 @@ class RayRuntimeBackend:
             open_node_recording,
             binding=binding,
             cluster_id=self.cluster_id,
-            controller_generation=self.owner_generation,
+            controller_generation=self.controller_generation,
             authorization_token=self.authorization_token,
             context=context,
             timeout_seconds=self.event_timeout_seconds,
@@ -446,7 +452,7 @@ class RayRuntimeBackend:
                     flush_node_recording,
                     binding=binding,
                     cluster_id=self.cluster_id,
-                    controller_generation=self.owner_generation,
+                    controller_generation=self.controller_generation,
                     authorization_token=self.authorization_token,
                     run_id=run_id,
                     timeout_ms=timeout_ms,
@@ -542,6 +548,19 @@ class RayRuntimeBackend:
         return sum(
             not record.terminal and (run_id is None or record.request.run_id == run_id)
             for record in self._dispatches.values()
+        )
+
+    def active_dispatch_ids_for_node(
+        self, node_id: str, boot_id: str
+    ) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                record.request.dispatch_id
+                for record in self._dispatches.values()
+                if not record.terminal
+                and record.binding.node_id == node_id
+                and record.binding.boot_id == boot_id
+            )
         )
 
     def code_reference_count(self) -> int:
@@ -760,6 +779,8 @@ class RayRuntimeBackend:
                 report_worker_event,
                 endpoint=record.binding.agent_endpoint,
                 identity=self._agent_identity(record.binding),
+                controller_generation=self.controller_generation,
+                runtime_generation=record.binding.runtime_generation,
                 event=event,
                 timeout_seconds=self.event_timeout_seconds,
             )

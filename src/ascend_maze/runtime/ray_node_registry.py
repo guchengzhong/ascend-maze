@@ -15,6 +15,7 @@ class RuntimeNodeStatus(str, Enum):
     HEALTHY = "healthy"
     STALE = "stale"
     DRAINING = "draining"
+    DRAINED = "drained"
     OFFLINE = "offline"
     UNSCHEDULABLE = "unschedulable"
 
@@ -51,7 +52,12 @@ class RayNodeRegistry:
                 and previous.binding.ray_node_id == ray_node_id
                 and previous.binding.agent_generation == agent_generation
             ):
-                previous.status = status
+                if not (
+                    previous.status
+                    in {RuntimeNodeStatus.DRAINING, RuntimeNodeStatus.DRAINED}
+                    and status is RuntimeNodeStatus.HEALTHY
+                ):
+                    previous.status = status
                 return previous.binding, None
             generation = self._generation_by_node.get(node_id, 0) + 1
             binding = RuntimeNodeBinding(

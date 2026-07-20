@@ -281,6 +281,7 @@ def _execute_one_shot(
     worker_lease: WorkerLease,
     binding: RuntimeNodeBinding,
     agent_identity: NodeAgentIdentity,
+    controller_generation: str,
     data_store_descriptor: RayDataStoreDescriptor,
     code_package_handle: DataHandle,
     event_timeout_seconds: float,
@@ -311,6 +312,8 @@ def _execute_one_shot(
         delivered = _try_report(
             binding.agent_endpoint,
             agent_identity,
+            controller_generation,
+            binding.runtime_generation,
             terminal,
             event_timeout_seconds,
         )
@@ -344,6 +347,8 @@ def _execute_one_shot(
             delivered = _try_report(
                 binding.agent_endpoint,
                 agent_identity,
+                controller_generation,
+                binding.runtime_generation,
                 terminal,
                 event_timeout_seconds,
             )
@@ -375,6 +380,8 @@ def _execute_one_shot(
             delivered = _try_report(
                 binding.agent_endpoint,
                 agent_identity,
+                controller_generation,
+                binding.runtime_generation,
                 terminal,
                 event_timeout_seconds,
             )
@@ -405,6 +412,8 @@ def _execute_one_shot(
         delivered = _try_report(
             binding.agent_endpoint,
             agent_identity,
+            controller_generation,
+            binding.runtime_generation,
             terminal,
             event_timeout_seconds,
         )
@@ -437,6 +446,8 @@ def _execute_one_shot(
     started_delivered = _try_report(
         binding.agent_endpoint,
         agent_identity,
+        controller_generation,
+        binding.runtime_generation,
         started,
         event_timeout_seconds,
     )
@@ -478,6 +489,8 @@ def _execute_one_shot(
     delivered = _try_report(
         binding.agent_endpoint,
         agent_identity,
+        controller_generation,
+        binding.runtime_generation,
         terminal,
         event_timeout_seconds,
     )
@@ -821,6 +834,8 @@ def _resource_observation(
 def _try_report(
     endpoint: str,
     identity: NodeAgentIdentity,
+    controller_generation: str,
+    runtime_generation: int,
     event: RuntimeEvent,
     timeout_seconds: float,
 ) -> bool:
@@ -828,6 +843,8 @@ def _try_report(
         report_worker_event(
             endpoint=endpoint,
             identity=identity,
+            controller_generation=controller_generation,
+            runtime_generation=runtime_generation,
             event=event,
             timeout_seconds=timeout_seconds,
         )
@@ -836,16 +853,36 @@ def _try_report(
     return True
 
 
+_RAY_ONE_SHOT_MAX_CALLS = 1
+_RAY_ONE_SHOT_MAX_RETRIES = 0
+_RAY_ONE_SHOT_NUM_CPUS = 0
+RAY_ONE_SHOT_FAULT_OPTIONS = FrozenMap(
+    (
+        ("max_calls", _RAY_ONE_SHOT_MAX_CALLS),
+        ("max_retries", _RAY_ONE_SHOT_MAX_RETRIES),
+        ("num_cpus", _RAY_ONE_SHOT_NUM_CPUS),
+    )
+)
 _RAY_REMOTE: Any = ray.remote(
-    num_cpus=0,
-    max_retries=0,
-    max_calls=1,
+    max_calls=_RAY_ONE_SHOT_MAX_CALLS,
+    max_retries=_RAY_ONE_SHOT_MAX_RETRIES,
+    num_cpus=_RAY_ONE_SHOT_NUM_CPUS,
 )
 RAY_ONE_SHOT_WORKER: Any = _RAY_REMOTE(_execute_one_shot)
 
+_RAY_STANDBY_MAX_RESTARTS = 0
+_RAY_STANDBY_MAX_TASK_RETRIES = 0
+_RAY_STANDBY_NUM_CPUS = 0
+RAY_STANDBY_FAULT_OPTIONS = FrozenMap(
+    (
+        ("max_restarts", _RAY_STANDBY_MAX_RESTARTS),
+        ("max_task_retries", _RAY_STANDBY_MAX_TASK_RETRIES),
+        ("num_cpus", _RAY_STANDBY_NUM_CPUS),
+    )
+)
 _RAY_STANDBY_REMOTE: Any = ray.remote(
-    num_cpus=0,
-    max_restarts=0,
-    max_task_retries=0,
+    max_restarts=_RAY_STANDBY_MAX_RESTARTS,
+    max_task_retries=_RAY_STANDBY_MAX_TASK_RETRIES,
+    num_cpus=_RAY_STANDBY_NUM_CPUS,
 )
 RAY_STANDBY_WORKER: Any = _RAY_STANDBY_REMOTE(_RayStandbyWorker)

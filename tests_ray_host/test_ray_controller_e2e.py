@@ -540,6 +540,8 @@ def test_cancelled_ray_attempt_releases_worker_and_late_output_handle(
                 report_worker_event,
                 endpoint=agent.endpoint,
                 identity=identity,
+                controller_generation=controller.controller_generation,
+                runtime_generation=agent.runtime_generation,
                 event=late_event,
                 timeout_seconds=2,
             )

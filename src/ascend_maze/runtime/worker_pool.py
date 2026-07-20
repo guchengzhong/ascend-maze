@@ -25,7 +25,7 @@ from ascend_maze.placement import (
     PlacementManager,
     StandbyReservationStatus,
 )
-from ascend_maze.runtime.ray_node_registry import RayNodeRegistry
+from ascend_maze.runtime.ray_node_registry import RayNodeRegistry, RuntimeNodeStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,10 +48,21 @@ class WorkerPoolEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkerLeaseSnapshot:
+    lease: WorkerLease
+    placement_lease_id: str
+    released: bool
+    releasing: bool
+    disposition: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerPoolSnapshot:
     mode: str
     config_generation: int
     workers: tuple[StandbyWorkerDescriptor, ...]
+    worker_leases: tuple[WorkerLeaseSnapshot, ...]
+    active_worker_lease_count: int
     standby_hits: int
     cold_starts: int
     replenish_failures: int
@@ -335,6 +346,7 @@ class StandbyWorkerBroker:
         can_reuse = (
             self.config.mode == "zero_hbm_standby"
             and disposition == "reuse"
+            and self._node_is_healthy(descriptor.node_id, descriptor.boot_id)
             and descriptor.profile in {WorkerProfile.CPU, WorkerProfile.IO}
             and descriptor.tasks_completed + 1 < profile_config.max_tasks_per_worker
             and monotonic_time_ms() - descriptor.created_at_ms
@@ -448,6 +460,26 @@ class StandbyWorkerBroker:
                 for record in self._leases.values()
             )
 
+    def live_count(
+        self, node_id: str | None = None, boot_id: str | None = None
+    ) -> int:
+        with self._lock:
+            return sum(
+                worker.descriptor.state is not StandbyWorkerState.DEAD
+                and (node_id is None or worker.descriptor.node_id == node_id)
+                and (boot_id is None or worker.descriptor.boot_id == boot_id)
+                for worker in self._workers.values()
+            )
+
+    async def advance_node_drain(self, node_id: str, boot_id: str) -> None:
+        try:
+            binding = self.node_registry.binding(node_id)
+        except KeyError:
+            return
+        if binding.boot_id != boot_id:
+            raise StateTransitionError("Worker Pool node boot generation changed")
+        await self.reconcile_once()
+
     def is_released(self, worker_lease_id: str) -> bool:
         with self._lock:
             record = self._leases.get(worker_lease_id)
@@ -467,10 +499,24 @@ class StandbyWorkerBroker:
                 self._workers[worker_id].descriptor
                 for worker_id in sorted(self._workers)
             )
+            worker_leases = tuple(
+                WorkerLeaseSnapshot(
+                    lease=record.lease,
+                    placement_lease_id=record.placement_lease.lease_id,
+                    released=record.released,
+                    releasing=record.releasing,
+                    disposition=record.disposition,
+                )
+                for _, record in sorted(self._leases.items())
+            )
             return WorkerPoolSnapshot(
                 mode=self.config.mode,
                 config_generation=self.config.config_generation,
                 workers=workers,
+                worker_leases=worker_leases,
+                active_worker_lease_count=sum(
+                    not item.released for item in worker_leases
+                ),
                 standby_hits=self._standby_hits,
                 cold_starts=self._cold_starts,
                 replenish_failures=self._replenish_failures,
@@ -499,6 +545,16 @@ class StandbyWorkerBroker:
                 retire.append((descriptor.worker_id, "pool_config_replaced"))
                 continue
             if (descriptor.node_id, descriptor.boot_id) not in bindings:
+                try:
+                    node_status = self.node_registry.status(descriptor.node_id)
+                except KeyError:
+                    node_status = RuntimeNodeStatus.OFFLINE
+                if (
+                    node_status
+                    in {RuntimeNodeStatus.DRAINING, RuntimeNodeStatus.DRAINED}
+                    and descriptor.state is StandbyWorkerState.ACQUIRED
+                ):
+                    continue
                 retire.append((descriptor.worker_id, "node_not_healthy"))
                 continue
             if descriptor.state is StandbyWorkerState.IDLE:
@@ -789,6 +845,15 @@ class StandbyWorkerBroker:
                 and worker.descriptor.profile is profile
                 for worker in self._workers.values()
             )
+
+    def _node_is_healthy(self, node_id: str, boot_id: str) -> bool:
+        try:
+            return (
+                self.node_registry.binding(node_id).boot_id == boot_id
+                and self.node_registry.status(node_id) is RuntimeNodeStatus.HEALTHY
+            )
+        except KeyError:
+            return False
 
     def _purge_dead_workers(self) -> None:
         with self._lock:

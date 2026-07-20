@@ -18,6 +18,7 @@ from ascend_maze.ascend import (
     create_ascend_colocation_config_snapshot,
 )
 from ascend_maze.control.client import InMemoryRuntimeClient
+from ascend_maze.control.lifecycle import ShutdownMode
 from ascend_maze.control.node_rpc import NodeAgent, NodeAgentIdentity
 from ascend_maze.control.node_rpc import report_worker_event
 from ascend_maze.control.ray_controller import RayHostController
@@ -37,7 +38,12 @@ from ascend_maze.contracts.worker import (
 from ascend_maze.data.index import RunDataState
 from ascend_maze.lifecycle import AttemptStatus, RunStatus
 from ascend_maze.core.errors import DataHandleInvalidError
-from ascend_maze.placement import LeaseStatus, NpuCapacity, PlacementManager
+from ascend_maze.placement import (
+    LeaseStatus,
+    NodeStatus,
+    NpuCapacity,
+    PlacementManager,
+)
 from ascend_maze.recording import ParquetRecorder
 from ascend_maze.resources import DeclaredOnlyAnchorProvider
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
@@ -459,19 +465,30 @@ def test_zero_hbm_standby_jit_binds_one_shot_and_replenishes(
                     break
                 await asyncio.sleep(0.05)
             assert standby_pid is not None, controller.worker_broker.snapshot()
-            for _ in range(10):
+            deadline = time.monotonic() + 10
+            stable_samples = 0
+            devices = admission.adapter.devices()
+            while time.monotonic() < deadline:
                 devices = admission.adapter.devices()
                 assert all(
                     standby_pid not in {process.pid for process in device.processes}
                     for device in devices
                 )
-                assert all(
+                hbm_stable = all(
                     device.used_hbm_mb
                     <= baseline[device.physical_device_id]
                     + admission.config.hbm_recovery_tolerance_mb
                     for device in devices
-                ), (baseline, devices)
+                )
+                stable_samples = stable_samples + 1 if hbm_stable else 0
+                if stable_samples == 10:
+                    break
                 await asyncio.sleep(0.1)
+            else:
+                raise AssertionError(
+                    "zero-HBM Standby did not reach a stable HBM baseline: "
+                    f"baseline={baseline}, last={devices}"
+                )
             standby_lease = next(
                 worker.standby_lease_id
                 for worker in controller.worker_broker.snapshot().workers
@@ -878,6 +895,8 @@ def test_cancelled_colocated_run_and_late_result_do_not_release_survivor(
                 report_worker_event,
                 endpoint=agent.endpoint,
                 identity=agent.identity,
+                controller_generation=controller.controller_generation,
+                runtime_generation=agent.runtime_generation,
                 event=late,
                 timeout_seconds=2,
             )
@@ -1301,6 +1320,8 @@ def test_real_npu_cancel_releases_late_output_and_hbm(
                 report_worker_event,
                 endpoint=agent.endpoint,
                 identity=agent.identity,
+                controller_generation=controller.controller_generation,
+                runtime_generation=agent.runtime_generation,
                 event=late,
                 timeout_seconds=2,
             )
@@ -1321,6 +1342,128 @@ def test_real_npu_cancel_releases_late_output_and_hbm(
                 controller,
                 outcome.run_id,
                 expected_handle_count=0,
+            )
+            await _destroy_and_assert(controller, outcome.run_id)
+        finally:
+            await agent.close(grace_seconds=0)
+            await controller.close()
+
+    asyncio.run(scenario())
+
+
+def test_force_shutdown_cancels_active_npu_worker_and_recovers_hbm(
+    ascend_admission: AscendAdmission,
+    ascend_ray: str,
+) -> None:
+    async def scenario() -> None:
+        admission = ascend_admission
+        baseline = admission.adapter.device(
+            admission.device.physical_device_id
+        ).used_hbm_mb
+        controller, agent = await _start_controller(admission, ascend_ray)
+        try:
+            workflow = Workflow("stage7b-force-shutdown")
+            node = workflow.add_task(npu_long_running, inputs={})
+            outcome = await InMemoryRuntimeClient(controller).submit(
+                workflow,
+                inputs={},
+                submission_id="stage7b_force_shutdown",
+            )
+            assert outcome.run_id is not None
+            attempt = None
+            for _ in range(1_000):
+                task = controller.snapshot(outcome.run_id).task(node.task_id)
+                if task.attempts and task.attempts[0].worker_started_at_ms is not None:
+                    attempt = task.attempts[0]
+                    break
+                await asyncio.sleep(0.01)
+            assert attempt is not None
+            worker_pid = _worker_pid(controller, attempt.dispatch_id)
+
+            result = await controller.shutdown(force=True)
+
+            assert result.mode is ShutdownMode.FORCE
+            assert result.terminated_run_ids == (outcome.run_id,)
+            assert result.cleanup_confirmed
+            assert result.recording_complete
+            assert result.exit_code == 0
+            assert controller.snapshot(outcome.run_id).status is RunStatus.CANCELLED
+            assert controller.placement.active_lease_count() == 0
+            assert controller.worker_broker.active_count() == 0
+            assert controller.ray_runtime.active_dispatch_count() == 0
+            await _wait_hbm_recovery(
+                admission,
+                baseline,
+                worker_pids=(worker_pid,),
+            )
+        finally:
+            await agent.close(grace_seconds=0)
+            await controller.close()
+
+    asyncio.run(scenario())
+
+
+def test_force_node_drain_cancels_npu_worker_recovers_hbm_and_resumes(
+    ascend_admission: AscendAdmission,
+    ascend_ray: str,
+) -> None:
+    async def scenario() -> None:
+        admission = ascend_admission
+        baseline = admission.adapter.device(
+            admission.device.physical_device_id
+        ).used_hbm_mb
+        controller, agent = await _start_controller(admission, ascend_ray)
+        try:
+            workflow = Workflow("stage7c-force-node-drain")
+            node = workflow.add_task(npu_long_running, inputs={})
+            outcome = await InMemoryRuntimeClient(controller).submit(
+                workflow,
+                inputs={},
+                submission_id="stage7c_force_node_drain",
+            )
+            assert outcome.run_id is not None
+            attempt = None
+            for _ in range(1_000):
+                task = controller.snapshot(outcome.run_id).task(node.task_id)
+                if task.attempts and task.attempts[0].worker_started_at_ms is not None:
+                    attempt = task.attempts[0]
+                    break
+                await asyncio.sleep(0.01)
+            assert attempt is not None
+            worker_pid = _worker_pid(controller, attempt.dispatch_id)
+
+            drained = await controller.drain_node(
+                "node_ascend",
+                boot_id="boot_stage4",
+                force=True,
+                timeout_ms=admission.config.hbm_recovery_deadline_ms,
+            )
+
+            assert drained.status == "drained"
+            assert drained.cleanup_confirmed
+            assert drained.cancelled_run_ids == (outcome.run_id,)
+            assert not drained.incomplete_resources
+            assert controller.snapshot(outcome.run_id).status is RunStatus.CANCELLED
+            assert controller.placement.active_lease_count() == 0
+            assert controller.worker_broker.active_count() == 0
+            assert controller.ray_runtime.active_dispatch_count() == 0
+            assert (
+                controller.placement.snapshot().nodes[0].status
+                is NodeStatus.DRAINED
+            )
+            await _wait_hbm_recovery(
+                admission,
+                baseline,
+                worker_pids=(worker_pid,),
+            )
+
+            resumed = await controller.resume_node(
+                "node_ascend", boot_id="boot_stage4"
+            )
+            assert resumed.status == "healthy"
+            assert (
+                controller.placement.snapshot().nodes[0].status
+                is NodeStatus.HEALTHY
             )
             await _destroy_and_assert(controller, outcome.run_id)
         finally:

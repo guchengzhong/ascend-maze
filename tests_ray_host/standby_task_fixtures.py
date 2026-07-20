@@ -32,6 +32,12 @@ def slow_cpu_task(value: str):
 
 
 @task(resources={"cpu_num": 1, "mem": 64})
+def drain_slow_cpu_task(value: str):
+    time.sleep(0.2)
+    return {"result": value}
+
+
+@task(resources={"cpu_num": 1, "mem": 64})
 def leak_child_process():
     child = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(10)"],

@@ -1,11 +1,20 @@
 """Stable source-backed tasks shared by compiler and subprocess tests."""
 
 from ascend_maze import task
+from ascend_maze.contracts.data import SharedFileRef
 
 
 @task(task_kind="io", resources={"cpu_num": 1, "mem": 64, "io_num": 1})
 def load_text(path: str):
     return {"text": path}
+
+
+@task(task_kind="io", resources={"cpu_num": 1, "mem": 64, "io_num": 1})
+def read_shared_file(file_ref: SharedFileRef):
+    from pathlib import Path
+
+    content = Path(file_ref.canonical_path).read_text(encoding="utf-8")
+    return {"content": content, "size": file_ref.size_bytes}
 
 
 @task(
