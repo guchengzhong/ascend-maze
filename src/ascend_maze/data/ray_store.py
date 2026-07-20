@@ -8,7 +8,12 @@ from typing import Any
 
 import ray
 
-from ascend_maze.contracts.data import DataHandle, DataOwner
+from ascend_maze.contracts.data import (
+    DataHandle,
+    DataOwner,
+    SharedFileRef,
+    shared_file_metadata,
+)
 from ascend_maze.core.canonical import FrozenMap, canonical_bytes, canonical_digest
 from ascend_maze.core.errors import (
     CanonicalizationError,
@@ -137,6 +142,30 @@ class _DataStoreOwner:
             self.release(handle)
         return len(handles)
 
+    def release_staged_for_node(self, node_id: str, boot_id: str) -> int:
+        handles = tuple(
+            entry.handle
+            for entry in self._entries.values()
+            if entry.state == "staged"
+            and entry.handle.metadata.get("source_node_id") == node_id
+            and entry.handle.metadata.get("source_boot_id") == boot_id
+        )
+        for handle in handles:
+            self.release(handle)
+        return len(handles)
+
+    def release_owner(self, owner_kind: str, owner_id: str) -> int:
+        handles = tuple(
+            entry.handle
+            for entry in self._entries.values()
+            if entry.owner is not None
+            and entry.owner.owner_kind == owner_kind
+            and entry.owner.owner_id == owner_id
+        )
+        for handle in handles:
+            self.release(handle)
+        return len(handles)
+
     def stats(self) -> dict[str, int | str]:
         return {
             "owner_generation": self.owner_generation,
@@ -223,6 +252,14 @@ class RayDataStore:
             raise DataHandleInvalidError("DataStoreOwner generation changed")
         return cls(descriptor, actor)
 
+    @classmethod
+    def connect_client(cls, descriptor: RayDataStoreDescriptor) -> "RayDataStore":
+        """Join the managed Head cluster before resolving its detached owner."""
+
+        if not ray.is_initialized():
+            ray.init(address="auto", namespace=descriptor.owner_namespace)
+        return cls.connect(descriptor)
+
     def put_staged(self, value: Any, owner_generation: str) -> DataHandle:
         return self._put_staged(value, owner_generation, FrozenMap((("backend", "ray"),)))
 
@@ -266,11 +303,16 @@ class RayDataStore:
             raise DataStoreWriteError("owner generation does not match DataStoreOwner")
         stable_digest: str | None = None
         size_bytes: int | None = None
-        try:
-            stable_digest = canonical_digest(value)
-            size_bytes = len(canonical_bytes(value))
-        except CanonicalizationError:
-            pass
+        if isinstance(value, SharedFileRef):
+            metadata = FrozenMap(
+                (*metadata.items_tuple(), *shared_file_metadata(value))
+            )
+        else:
+            try:
+                stable_digest = canonical_digest(value)
+                size_bytes = len(canonical_bytes(value))
+            except CanonicalizationError:
+                pass
         handle = DataHandle(
             owner_generation=owner_generation,
             staged_handle_id=new_id("data"),
@@ -383,6 +425,32 @@ class RayDataStore:
         except Exception as exc:
             raise DataHandleInvalidError(
                 f"failed to release stale runtime handles: {exc}"
+            ) from exc
+
+    def release_staged_for_node(self, *, node_id: str, boot_id: str) -> int:
+        try:
+            return int(
+                ray.get(
+                    self._owner_actor.release_staged_for_node.remote(
+                        node_id, boot_id
+                    )
+                )
+            )
+        except Exception as exc:
+            raise DataHandleInvalidError(
+                f"failed to release recovered runtime handles: {exc}"
+            ) from exc
+
+    def release_owner(self, *, owner_kind: str, owner_id: str) -> int:
+        try:
+            return int(
+                ray.get(
+                    self._owner_actor.release_owner.remote(owner_kind, owner_id)
+                )
+            )
+        except Exception as exc:
+            raise DataHandleInvalidError(
+                f"failed to release recovered data owner: {exc}"
             ) from exc
 
     def close(self, *, kill_owner: bool) -> None:

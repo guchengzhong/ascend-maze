@@ -297,6 +297,10 @@ class FakeRuntimeBackend:
         del lease
         return None
 
+    def producer_is_persistent(self, lease: PlacementLease) -> bool:
+        del lease
+        return False
+
     async def prepare_run_recording(
         self,
         context: RunRecordingContext,

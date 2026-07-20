@@ -22,7 +22,12 @@ from ascend_maze.scheduler.policies.hacs import (
     HacsRunState,
     HacsScore,
 )
-from ascend_maze.scheduler.core import DestroyResult, SchedulerCore
+from ascend_maze.scheduler.core import (
+    DestroyResult,
+    QueueSnapshot,
+    QueueTaskSnapshot,
+    SchedulerCore,
+)
 
 __all__ = [
     "DispatchProposal",
@@ -36,6 +41,8 @@ __all__ = [
     "HacsScore",
     "PolicyCapabilities",
     "QueuePartitioner",
+    "QueueSnapshot",
+    "QueueTaskSnapshot",
     "QueueToken",
     "RunLifecycleAwarePolicy",
     "SchedulerCore",

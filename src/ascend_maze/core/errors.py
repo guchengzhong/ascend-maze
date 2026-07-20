@@ -33,6 +33,14 @@ class ContractValidationError(AscendMazeError, ValueError):
     """Raised when a cross-component contract object is invalid."""
 
 
+class EnvironmentValidationError(ContractValidationError):
+    """Raised when the local cluster environment fails a hard check."""
+
+
+class ModelValidationError(ContractValidationError):
+    """Raised when a configured model catalog or artifact is invalid."""
+
+
 class StateTransitionError(AscendMazeError, RuntimeError):
     """Raised when a lifecycle transition violates the state machine."""
 

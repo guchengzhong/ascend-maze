@@ -59,6 +59,8 @@ class DispatchProposal:
 
 
 class QueuePartitioner(Protocol):
+    name: str
+
     def partition(self, task: SchedulableTaskView) -> str: ...
 
 

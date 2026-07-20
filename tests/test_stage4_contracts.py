@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 
 import pytest
 
@@ -10,6 +11,7 @@ from ascend_maze.ascend.contracts import (
     AscendEnvironmentSnapshot,
     create_ascend_correctness_config_snapshot,
 )
+from ascend_maze.ascend.discovery import discover_atb_runtime_library_preloads
 from ascend_maze.compiler import compile_workflow
 from ascend_maze.control.client import InMemoryRuntimeClient
 from ascend_maze.control.controller import InMemoryController
@@ -96,6 +98,24 @@ def test_environment_fingerprint_covers_versions_and_chip_family() -> None:
     )
     assert first.environment_fingerprint == same.environment_fingerprint
     assert first.environment_fingerprint != changed.environment_fingerprint
+
+
+def test_atb_runtime_preload_discovery_pins_resolved_library_digest(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "atb" / "cxx_abi_1"
+    library_directory = home / "lib"
+    library_directory.mkdir(parents=True)
+    libmki = library_directory / "libmki.so"
+    libmki.write_bytes(b"test-mki")
+    (library_directory / "libtbe_adapter.so").write_bytes(b"test-tbe")
+    monkeypatch.setenv("ATB_HOME_PATH", str(home))
+
+    discovered = discover_atb_runtime_library_preloads()
+
+    assert dict(discovered) == {
+        str(libmki.resolve()): hashlib.sha256(b"test-mki").hexdigest(),
+    }
 
 
 def test_correctness_config_snapshot_covers_every_stage_four_setting() -> None:
@@ -294,7 +314,9 @@ def test_static_anchor_config_drives_end_to_end_reservation() -> None:
     asyncio.run(scenario())
 
 
-def test_placement_enforces_environment_observations_and_permanent_single_card_limit() -> None:
+def test_placement_enforces_environment_observations_and_permanent_single_card_limit() -> (
+    None
+):
     manager = PlacementManager(
         npu_hbm_headroom_mb=1_024,
         required_environment_fingerprint=ENVIRONMENT,
@@ -326,9 +348,9 @@ def test_placement_enforces_environment_observations_and_permanent_single_card_l
     workflow = Workflow("impossible-placement")
     node = workflow.add_task(impossible_npu, inputs={"value": 1})
     compiled = compile_workflow(workflow)
-    anchor = DeclaredOnlyAnchorProvider(
-        environment_fingerprint=ENVIRONMENT
-    ).resolve(run_id="run", compiled=compiled, task_id=node.task_id)
+    anchor = DeclaredOnlyAnchorProvider(environment_fingerprint=ENVIRONMENT).resolve(
+        run_id="run", compiled=compiled, task_id=node.task_id
+    )
     rejected = manager.try_reserve(
         run_id="run",
         task_id=node.task_id,

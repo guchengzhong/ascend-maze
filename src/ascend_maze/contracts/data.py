@@ -102,6 +102,26 @@ class SharedFileRef:
         object.__setattr__(self, "canonical_path", str(path))
 
 
+def shared_file_metadata(
+    file_ref: SharedFileRef,
+) -> tuple[tuple[str, CanonicalValue], ...]:
+    return (
+        ("value_kind", "shared_file"),
+        ("shared_file_path", file_ref.canonical_path),
+        ("shared_file_sha256", file_ref.content_sha256),
+        ("shared_file_size_bytes", file_ref.size_bytes),
+    )
+
+
+def shared_file_from_handle(handle: DataHandle) -> SharedFileRef | None:
+    if handle.metadata.get("value_kind") != "shared_file":
+        return None
+    path = handle.metadata.get("shared_file_path")
+    digest = handle.metadata.get("shared_file_sha256")
+    size = handle.metadata.get("shared_file_size_bytes")
+    return SharedFileRef(path, digest, size)  # type: ignore[arg-type]
+
+
 @runtime_checkable
 class DataStore(Protocol):
     def put_staged(self, value: Any, owner_generation: str) -> DataHandle: ...

@@ -8,8 +8,18 @@ from enum import Enum
 from threading import RLock
 from typing import Any
 
-from ascend_maze.contracts.data import DataHandle, DataOwner
-from ascend_maze.core.canonical import FrozenMap, canonical_bytes, canonical_digest
+from ascend_maze.contracts.data import (
+    DataHandle,
+    DataOwner,
+    SharedFileRef,
+    shared_file_metadata,
+)
+from ascend_maze.core.canonical import (
+    CanonicalValue,
+    FrozenMap,
+    canonical_bytes,
+    canonical_digest,
+)
 from ascend_maze.core.errors import (
     CanonicalizationError,
     DataHandleInvalidError,
@@ -73,17 +83,25 @@ class InMemoryDataStore:
                 raise DataStoreWriteError("value cannot be copied into DataStore") from exc
             stable_digest: str | None = None
             size_bytes: int | None = None
-            try:
-                stable_digest = canonical_digest(stored_value)
-                size_bytes = len(canonical_bytes(stored_value))
-            except CanonicalizationError:
-                pass
+            metadata: FrozenMap[CanonicalValue, CanonicalValue] = FrozenMap(
+                (("backend", "memory"),)
+            )
+            if isinstance(stored_value, SharedFileRef):
+                metadata = FrozenMap(
+                    (*metadata.items_tuple(), *shared_file_metadata(stored_value))
+                )
+            else:
+                try:
+                    stable_digest = canonical_digest(stored_value)
+                    size_bytes = len(canonical_bytes(stored_value))
+                except CanonicalizationError:
+                    pass
             handle = DataHandle(
                 owner_generation=owner_generation,
                 staged_handle_id=new_id("data"),
                 stable_digest=stable_digest,
                 size_bytes=size_bytes,
-                metadata=FrozenMap((("backend", "memory"),)),
+                metadata=metadata,
             )
             key = self._key(handle)
             self._entries[key] = _Entry(

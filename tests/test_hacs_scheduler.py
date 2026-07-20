@@ -627,6 +627,36 @@ def test_failed_npu_attempt_keeps_n_val_until_retry_succeeds() -> None:
 
         await controller.destroy_run(outcome.run_id)
         assert controller.placement.lease_record_count() == 0
+
+        failing_workflow = Workflow("hacs-final-failure")
+        failing = failing_workflow.add_task(
+            local_npu_task,
+            inputs={"value": "failure"},
+        )
+        for attempt in (1, 2):
+            controller.runtime.set_plan(
+                failing.task_id,
+                attempt,
+                FakeExecutionPlan(fail_before_start="worker_start_failed"),
+            )
+        failed_outcome = await client.submit(
+            failing_workflow,
+            inputs={},
+            submission_id="stage5a_final_failure",
+        )
+        assert failed_outcome.run_id is not None
+        failed_terminal = await controller.wait_run(
+            failed_outcome.run_id,
+            timeout_seconds=2,
+        )
+        assert failed_terminal.status is RunStatus.FAILED
+        assert failed_terminal.task(failing.task_id).attempt_count == 2
+        assert policy.remaining_at_terminal[failed_outcome.run_id] == 1
+        assert (failed_outcome.run_id, failing.task_id) not in (
+            policy.success_notifications
+        )
+        await controller.destroy_run(failed_outcome.run_id)
+        assert controller.placement.lease_record_count() == 0
         await controller.close()
 
     asyncio.run(scenario())

@@ -222,6 +222,77 @@ class RunStateManager:
                 task_states=tasks,
             )
 
+    def restore_run(
+        self,
+        *,
+        compiled: CompiledWorkflow,
+        snapshot: RunSnapshot,
+    ) -> None:
+        """Restore an authoritative snapshot before startup reconciliation."""
+
+        if compiled.workflow_id != snapshot.workflow_id:
+            raise StateTransitionError("restored workflow_id does not match snapshot")
+        if compiled.workflow_fingerprint != snapshot.workflow_fingerprint:
+            raise StateTransitionError(
+                "restored workflow fingerprint does not match snapshot"
+            )
+        by_task = {item.task_id: item for item in snapshot.task_states}
+        if set(by_task) != set(compiled.tasks):
+            raise StateTransitionError("restored task set does not match workflow")
+        tasks: dict[str, _TaskRecord] = {}
+        for task_id in compiled.topological_order:
+            item = by_task[task_id]
+            tasks[task_id] = _TaskRecord(
+                task_id=item.task_id,
+                status=item.status,
+                remaining_predecessors=item.remaining_predecessors,
+                ready_at_ms=item.ready_at_ms,
+                queued_at_ms=item.queued_at_ms,
+                started_at_ms=item.started_at_ms,
+                finished_at_ms=item.finished_at_ms,
+                attempt_count=item.attempt_count,
+                attempts=[
+                    _AttemptRecord(
+                        attempt=attempt.attempt,
+                        dispatch_id=attempt.dispatch_id,
+                        lease_id=attempt.lease_id,
+                        status=attempt.status,
+                        dispatched_at_ms=attempt.dispatched_at_ms,
+                        worker_started_at_ms=attempt.worker_started_at_ms,
+                        finished_at_ms=attempt.finished_at_ms,
+                        node_id=attempt.node_id,
+                        device_ids=attempt.device_ids,
+                        anchor_revision=attempt.anchor_revision,
+                        error=attempt.error,
+                    )
+                    for attempt in item.attempts
+                ],
+                pending_reason=item.pending_reason,
+                cancellation_reason=item.cancellation_reason,
+                last_error=item.last_error,
+            )
+        with self._lock:
+            if snapshot.run_id in self._runs:
+                raise StateTransitionError(f"run already exists: {snapshot.run_id}")
+            self._runs[snapshot.run_id] = _RunRecord(
+                run_id=snapshot.run_id,
+                workflow_id=snapshot.workflow_id,
+                workflow_fingerprint=snapshot.workflow_fingerprint,
+                routing_session_key_hash=snapshot.routing_session_key_hash,
+                status=snapshot.status,
+                submitted_at_ms=snapshot.submitted_at_ms,
+                started_at_ms=snapshot.started_at_ms,
+                finished_at_ms=snapshot.finished_at_ms,
+                deadline_at_ms=snapshot.deadline_at_ms,
+                compiled=compiled,
+                task_states=tasks,
+                failure=snapshot.failure,
+            )
+
+    def snapshots(self) -> tuple[RunSnapshot, ...]:
+        with self._lock:
+            return tuple(self.snapshot(run_id) for run_id in sorted(self._runs))
+
     def remove_submitted_run(self, run_id: str) -> None:
         with self._lock:
             run = self._require_run(run_id)

@@ -350,6 +350,10 @@ def test_partial_output_failure_publishes_nothing_and_empty_task_puts_nothing() 
             summarize,
             inputs={"text": "hello", "options": {}},
         )
+        successor = failing.add_task(
+            finish,
+            inputs={"summary": task.outputs["summary"]},
+        )
         controller.data_store.fail_on_put_number(controller.data_store.put_count + 2)
         outcome = await client.submit(
             failing,
@@ -363,6 +367,9 @@ def test_partial_output_failure_publishes_nothing_and_empty_task_puts_nothing() 
         assert task_state.status is TaskStatus.FAILED
         assert task_state.last_error is not None
         assert task_state.last_error.error_code == "result_publish_failed"
+        successor_state = terminal.task(successor.task_id)
+        assert successor_state.status is TaskStatus.CANCELLED
+        assert successor_state.attempt_count == 0
         assert controller.indexes.get(outcome.run_id).handle_count() == 0
         assert controller.data_store.active_count == 0
         assert controller.data_store.staged_count == 0

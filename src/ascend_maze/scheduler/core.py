@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from collections.abc import Callable
+from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable
 from time import perf_counter_ns
 from typing import Any, Protocol
 
@@ -47,11 +47,22 @@ from ascend_maze.core.errors import (
 )
 from ascend_maze.core.identifiers import new_id
 from ascend_maze.data.index import (
+    RunDataIndexCheckpoint,
     RunDataIndexRef,
     RunDataIndexRegistry,
     RunDataTombstone,
 )
-from ascend_maze.fault import CleanupBarrier, RecoveryAction, RecoveryPolicy
+from ascend_maze.fault import (
+    CleanupBarrier,
+    ErrorNormalizer,
+    FaultIdentity,
+    RecoveryAction,
+    RecoveryCoordinator,
+    RecoveryDecision,
+    RecoveryPolicy,
+    ReplayabilityChecker,
+    ReplayabilityResult,
+)
 from ascend_maze.lifecycle.deadlines import DeadlineEvent, DeadlineKind, DeadlineManager
 from ascend_maze.lifecycle.state import (
     AttemptSnapshot,
@@ -62,7 +73,7 @@ from ascend_maze.lifecycle.state import (
     TaskStatus,
 )
 from ascend_maze.inference import InferenceCoordinator, ModelRouteLeaseStatus
-from ascend_maze.placement.manager import LeaseStatus, PlacementManager
+from ascend_maze.placement.manager import LeaseStatus, NodeStatus, PlacementManager
 from ascend_maze.resources.anchors import ResourceAnchorProvider
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 from ascend_maze.scheduler.contracts import (
@@ -84,14 +95,28 @@ class DestroyResult:
     code_handles_released: int
 
 
+@dataclass(frozen=True, slots=True)
+class SchedulerRunRecovery:
+    run_id: str
+    submission_id: str
+    snapshot: RunSnapshot
+    index: RunDataIndexCheckpoint
+    recording_context: RunRecordingContext
+    session_key_hash: str | None
+    destroy_result: DestroyResult | None
+    expected_producer_ids: tuple[str, ...] = ()
+
+
 @dataclass(slots=True)
 class _RunExecution:
+    submission_id: str
     compiled: CompiledWorkflow
     code_handles: tuple[CodeHandle, ...]
     code_by_definition: dict[str, CodeHandle]
     index_ref: RunDataIndexRef
     recording_context: RunRecordingContext
     session_key_hash: str | None
+    expected_producer_ids: set[str] = field(default_factory=set)
     destroyed: DestroyResult | None = None
 
 
@@ -109,6 +134,27 @@ class _BlockedRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class QueueTaskSnapshot:
+    run_id: str
+    task_id: str
+    status: TaskStatus
+    pending_reason: str | None
+    partition: str | None
+    queue_generation: int
+    blocked_since_ms: int | None
+    bypass_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class QueueSnapshot:
+    snapshot_version: int
+    policy_name: str
+    policy_version: str
+    partitioner_name: str
+    tasks: tuple[QueueTaskSnapshot, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _DispatchRecord:
     handle: DispatchHandle
     lease_id: str
@@ -118,6 +164,7 @@ class _DispatchRecord:
 @dataclass(slots=True)
 class _CommitCommand:
     run_id: str
+    submission_id: str
     compiled: CompiledWorkflow
     workflow_inputs: dict[str, DataHandle]
     code_handles: tuple[CodeHandle, ...]
@@ -145,6 +192,12 @@ class _DestroyCommand:
 
 @dataclass(slots=True)
 class _ShutdownCommand:
+    terminate_active_runs: bool
+    future: asyncio.Future[None]
+
+
+@dataclass(slots=True)
+class _BeginDrainCommand:
     future: asyncio.Future[None]
 
 
@@ -175,6 +228,8 @@ class SchedulerRuntimeBackend(RuntimeBackend, Protocol):
     def worker_released(self, dispatch_id: str) -> bool: ...
 
     def producer_for_lease(self, lease: PlacementLease) -> str | None: ...
+
+    def producer_is_persistent(self, lease: PlacementLease) -> bool: ...
 
     async def prepare_run_recording(
         self,
@@ -213,7 +268,12 @@ class SchedulerCore:
         recorder_flush_timeout_ms: int = 1_000,
         controller_producer_id: str = "controller",
         recovery: RecoveryPolicy | None = None,
+        recovery_coordinator: RecoveryCoordinator | None = None,
+        error_normalizer: ErrorNormalizer | None = None,
+        replayability: ReplayabilityChecker | None = None,
         inference: InferenceCoordinator | None = None,
+        checkpoint_sink: Callable[[], Awaitable[None]] | None = None,
+        control_event_sink: Callable[[ExecutionEvent], None] | None = None,
     ) -> None:
         if placement_lookahead < 1:
             raise ValueError("placement_lookahead must be positive")
@@ -239,11 +299,17 @@ class SchedulerCore:
         self.recorder_flush_timeout_ms = recorder_flush_timeout_ms
         self.controller_producer_id = controller_producer_id
         self.recovery = recovery or RecoveryPolicy()
+        self.recovery_coordinator = recovery_coordinator or RecoveryCoordinator()
+        self.error_normalizer = error_normalizer or ErrorNormalizer()
+        self.replayability = replayability or ReplayabilityChecker(indexes.data_store)
         self.inference = inference
+        self._checkpoint_sink = checkpoint_sink
+        self._control_event_sink = control_event_sink
         self._queue: asyncio.Queue[object] = asyncio.Queue()
         self._runner: asyncio.Task[None] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._running = False
+        self._dispatch_enabled = False
         self._runs: dict[str, _RunExecution] = {}
         self._queued: dict[TaskKey, _QueuedRecord] = {}
         self._blocked: dict[TaskKey, _BlockedRecord] = {}
@@ -257,6 +323,8 @@ class SchedulerCore:
         self._seen_runtime_events: dict[str, str] = {}
         self._producer_sequence = 0
         self._terminal_waiters: dict[str, list[asyncio.Future[RunSnapshot]]] = {}
+        self._recovered_runs: set[str] = set()
+        self._recording_flushes: dict[str, FlushResult] = {}
 
     async def start(self) -> None:
         if self._running:
@@ -269,12 +337,114 @@ class SchedulerCore:
             self.inference.set_route_failure_sink(self.post_model_route_failure)
             await self.inference.start()
         self._running = True
+        self._dispatch_enabled = True
         self._runner = asyncio.create_task(self._run_loop())
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    @property
+    def dispatch_enabled(self) -> bool:
+        return self._dispatch_enabled
+
+    def set_checkpoint_sink(
+        self,
+        sink: Callable[[], Awaitable[None]] | None,
+    ) -> None:
+        if self._running:
+            raise RuntimeError("checkpoint sink must be configured before start")
+        self._checkpoint_sink = sink
+
+    def restore_run(
+        self,
+        *,
+        compiled: CompiledWorkflow,
+        code_handles: tuple[CodeHandle, ...],
+        recovery: SchedulerRunRecovery,
+    ) -> RunDataIndexRef:
+        if self._running:
+            raise RuntimeError("runs must be restored before Scheduler start")
+        self.state.restore_run(compiled=compiled, snapshot=recovery.snapshot)
+        index = self.indexes.restore(recovery.index)
+        self._runs[recovery.run_id] = _RunExecution(
+            submission_id=recovery.submission_id,
+            compiled=compiled,
+            code_handles=code_handles,
+            code_by_definition={item.definition_id: item for item in code_handles},
+            index_ref=index.reference,
+            recording_context=recovery.recording_context,
+            session_key_hash=recovery.session_key_hash,
+            expected_producer_ids=set(recovery.expected_producer_ids),
+            destroyed=recovery.destroy_result,
+        )
+        for producer_id in recovery.expected_producer_ids:
+            if producer_id in recovery.recording_context.initial_expected_producer_ids:
+                continue
+            try:
+                self.recorder.expect_producer(recovery.run_id, producer_id)
+            except Exception as exc:
+                self._record_recorder_error(recovery.run_id, exc)
+        self._recovered_runs.add(recovery.run_id)
+        return index.reference
+
+    def bind_recovered_code(
+        self,
+        run_id: str,
+        code_handles: tuple[CodeHandle, ...],
+    ) -> None:
+        execution = self._runs[run_id]
+        if execution.destroyed is not None:
+            if code_handles:
+                raise RuntimeError("destroyed recovered run cannot own CodeHandles")
+            return
+        execution.code_handles = code_handles
+        execution.code_by_definition = {
+            item.definition_id: item for item in code_handles
+        }
+
+    async def reconcile_recovered_runs(self, previous_generation: str) -> None:
+        if not self._running:
+            raise RuntimeError("Scheduler must be started before reconciliation")
+        now = self.clock.monotonic_ms()
+        for run_id in sorted(self._recovered_runs):
+            snapshot = self.state.snapshot(run_id)
+            if not snapshot.terminal:
+                self.state.terminate_run(
+                    run_id=run_id,
+                    target=RunStatus.INTERRUPTED,
+                    reason="controller_generation_changed",
+                    now_ms=now,
+                )
+                self._record(
+                    run_id,
+                    "run_recovered_interrupted",
+                    payload={"previous_controller_generation": previous_generation},
+                )
+                await self._on_run_terminal(run_id)
+        self._recovered_runs.clear()
+        await self._checkpoint()
+
+    def recovery_runs(self) -> tuple[SchedulerRunRecovery, ...]:
+        return tuple(
+            SchedulerRunRecovery(
+                run_id=run_id,
+                submission_id=execution.submission_id,
+                snapshot=self.state.snapshot(run_id),
+                index=self.indexes.get(run_id).checkpoint(),
+                recording_context=execution.recording_context,
+                session_key_hash=execution.session_key_hash,
+                destroy_result=execution.destroyed,
+                expected_producer_ids=tuple(sorted(execution.expected_producer_ids)),
+            )
+            for run_id, execution in sorted(self._runs.items())
+        )
 
     async def commit_run(
         self,
         *,
         run_id: str,
+        submission_id: str,
         compiled: CompiledWorkflow,
         workflow_inputs: dict[str, DataHandle],
         code_handles: tuple[CodeHandle, ...],
@@ -287,6 +457,7 @@ class SchedulerCore:
         await self._queue.put(
             _CommitCommand(
                 run_id,
+                submission_id,
                 compiled,
                 workflow_inputs,
                 code_handles,
@@ -371,18 +542,166 @@ class SchedulerCore:
             return await future
         return await asyncio.wait_for(future, timeout_seconds)
 
-    async def shutdown(self) -> None:
+    async def begin_draining(self) -> None:
+        if not self._running or not self._dispatch_enabled:
+            return
+        future: asyncio.Future[None] = self._new_future()
+        await self._queue.put(_BeginDrainCommand(future))
+        await future
+
+    async def shutdown(self, *, terminate_active_runs: bool = True) -> None:
         if not self._running:
             return
         future: asyncio.Future[None] = self._new_future()
-        await self._queue.put(_ShutdownCommand(future))
+        await self._queue.put(_ShutdownCommand(terminate_active_runs, future))
         await future
         assert self._runner is not None
         await self._runner
         self._runner = None
 
+    def run_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._runs))
+
+    def recordable_run_ids(self) -> tuple[str, ...]:
+        return tuple(
+            run_id
+            for run_id, execution in sorted(self._runs.items())
+            if execution.destroyed is None
+        )
+
+    def nonterminal_run_ids(self) -> tuple[str, ...]:
+        return tuple(
+            run_id
+            for run_id in sorted(self._runs)
+            if not self.state.snapshot(run_id).terminal
+        )
+
+    def active_route_lease_ids(self) -> tuple[str, ...]:
+        if self.inference is None:
+            return ()
+        return tuple(
+            sorted(
+                route.route_lease_id
+                for route in self._attempt_routes.values()
+                if self.inference.route_snapshot(route.route_lease_id).status
+                in {
+                    ModelRouteLeaseStatus.RESERVED,
+                    ModelRouteLeaseStatus.ACTIVE,
+                }
+            )
+        )
+
+    def active_dispatch_ids(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                dispatch_id
+                for dispatch_id in self._dispatches
+                if not self.runtime.dispatch_invalidated(dispatch_id)
+                or not self.runtime.worker_released(dispatch_id)
+            )
+        )
+
+    def record_control_event(
+        self,
+        run_id: str,
+        event_type: str,
+        *,
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        if run_id in self._runs:
+            self._record(run_id, event_type, payload=payload)
+
+    async def flush_run_recording(self, run_id: str) -> FlushResult:
+        cached = self._recording_flushes.get(run_id)
+        if cached is not None:
+            return cached
+        flush_started = perf_counter_ns()
+        try:
+            producer_results = await self.runtime.flush_run_recorders(
+                run_id, self.recorder_flush_timeout_ms
+            )
+        except Exception as exc:
+            producer_results = ()
+            self._record_recorder_error(run_id, exc)
+        for producer in producer_results:
+            if producer.result is not None:
+                try:
+                    self.recorder.merge_producer_flush(
+                        run_id, producer.producer_id, producer.result
+                    )
+                except Exception as exc:
+                    self._record_recorder_error(run_id, exc)
+            else:
+                self._record_recorder_error(
+                    run_id,
+                    RuntimeError(
+                        f"producer {producer.producer_id} flush failed: {producer.error}"
+                    ),
+                )
+        elapsed_ms = max(0, (perf_counter_ns() - flush_started) // 1_000_000)
+        remaining_ms = max(1, self.recorder_flush_timeout_ms - elapsed_ms)
+        result = await self.recorder.flush_run(run_id, remaining_ms)
+        self._recording_flushes[run_id] = result
+        return result
+
+    def recording_result(self, run_id: str) -> FlushResult | None:
+        if run_id not in self._runs:
+            raise KeyError(run_id)
+        return self._recording_flushes.get(run_id)
+
+    async def abandon(self) -> None:
+        """Stop this authority without mutating persisted Run/resource state."""
+
+        if not self._running:
+            return
+        self._checkpoint_sink = None
+        self._running = False
+        runner = self._runner
+        self._runner = None
+        if runner is not None:
+            runner.cancel()
+            await asyncio.gather(runner, return_exceptions=True)
+        if self.inference is not None:
+            await self.inference.abandon()
+        await self.runtime.close()
+
     def snapshot(self, run_id: str) -> RunSnapshot:
         return self.state.snapshot(run_id)
+
+    def queue_snapshot(self, *, snapshot_version: int) -> QueueSnapshot:
+        tasks: list[QueueTaskSnapshot] = []
+        for run in self.state.snapshots():
+            for task in run.task_states:
+                if task.status not in {
+                    TaskStatus.READY,
+                    TaskStatus.QUEUED,
+                    TaskStatus.RETRY_WAIT,
+                }:
+                    continue
+                key = TaskKey(run.run_id, task.task_id)
+                queued = self._queued.get(key)
+                blocked = self._blocked.get(key)
+                tasks.append(
+                    QueueTaskSnapshot(
+                        run_id=run.run_id,
+                        task_id=task.task_id,
+                        status=task.status,
+                        pending_reason=task.pending_reason,
+                        partition=None if queued is None else queued.partition,
+                        queue_generation=self._queue_generations.get(key, 0),
+                        blocked_since_ms=(
+                            None if blocked is None else blocked.blocked_since_ms
+                        ),
+                        bypass_count=0 if blocked is None else blocked.bypass_count,
+                    )
+                )
+        return QueueSnapshot(
+            snapshot_version=snapshot_version,
+            policy_name=self.policy.name,
+            policy_version=self.policy.version,
+            partitioner_name=self.partitioner.name,
+            tasks=tuple(sorted(tasks, key=lambda item: (item.run_id, item.task_id))),
+        )
 
     def run_index_ref(self, run_id: str) -> RunDataIndexRef:
         return self._runs[run_id].index_ref
@@ -431,10 +750,18 @@ class SchedulerCore:
                 if item is not None:
                     await self._process_item(item)
                 await self._process_due_deadlines()
-                if self._running:
+                if self._running and self._dispatch_enabled:
+                    await self._checkpoint()
                     await self._dispatch_pass()
+                await self._checkpoint()
             except Exception as exc:
                 await self._interrupt_after_scheduler_failure(exc)
+                if self._checkpoint_sink is not None:
+                    self._running = False
+
+    async def _checkpoint(self) -> None:
+        if self._checkpoint_sink is not None:
+            await self._checkpoint_sink()
 
     def _next_wait_seconds(self) -> float | None:
         if not self.clock.automatic_wait:
@@ -448,15 +775,18 @@ class SchedulerCore:
         try:
             if isinstance(item, _CommitCommand):
                 commit_result = await self._commit(item)
+                await self._checkpoint()
                 item.future.set_result(commit_result)
                 self._activate_run(item.run_id)
             elif isinstance(item, _CancelCommand):
                 cancel_result = await self._terminate_run(
                     item.run_id, item.target, item.reason
                 )
+                await self._checkpoint()
                 item.future.set_result(cancel_result)
             elif isinstance(item, _DestroyCommand):
                 destroy_result = await self._destroy(item.run_id, force=item.force)
+                await self._checkpoint()
                 item.future.set_result(destroy_result)
             elif isinstance(item, _WakeCommand):
                 item.future.set_result(None)
@@ -483,8 +813,17 @@ class SchedulerCore:
                     )
             elif isinstance(item, _ModelRouteFailed):
                 await self._handle_model_route_failure(item)
+            elif isinstance(item, _BeginDrainCommand):
+                self._dispatch_enabled = False
+                item.future.set_result(None)
             elif isinstance(item, _ShutdownCommand):
-                await self._shutdown_active_runs()
+                self._dispatch_enabled = False
+                if item.terminate_active_runs:
+                    await self._shutdown_active_runs()
+                elif self.nonterminal_run_ids():
+                    raise RuntimeError(
+                        "cannot stop SchedulerCore while Runs are nonterminal"
+                    )
                 if self.inference is not None:
                     await self.inference.close()
                     self.inference.set_capacity_sink(None)
@@ -541,12 +880,16 @@ class SchedulerCore:
             raise
         code_by_definition = {item.definition_id: item for item in command.code_handles}
         execution = _RunExecution(
+            submission_id=command.submission_id,
             compiled=command.compiled,
             code_handles=command.code_handles,
             code_by_definition=code_by_definition,
             index_ref=index.reference,
             recording_context=command.recording_context,
             session_key_hash=command.session_key_hash,
+            expected_producer_ids=set(
+                command.recording_context.initial_expected_producer_ids
+            ),
         )
         self._runs[command.run_id] = execution
         if command.deadline_at_ms is not None:
@@ -962,6 +1305,10 @@ class SchedulerCore:
         if event.run_id not in self._runs:
             await self._release_event_outputs(event)
             return
+        conflict = self._conflicting_active_attempt(event)
+        if conflict is not None:
+            await self._handle_conflicting_dispatch(event, conflict)
+            return
         if event.kind is RuntimeEventKind.WORKER_STARTED:
             await self._worker_started(event)
         elif event.kind is RuntimeEventKind.TASK_RESULT:
@@ -981,6 +1328,64 @@ class SchedulerCore:
                 expected_route_lease_id=event.route_lease_id,
                 record_inference=True,
             )
+
+    def _conflicting_active_attempt(
+        self,
+        event: RuntimeEvent,
+    ) -> AttemptSnapshot | None:
+        try:
+            snapshot = self.state.snapshot(event.run_id)
+            task = snapshot.task(event.task_id)
+        except KeyError:
+            return None
+        for attempt in task.attempts:
+            if (
+                attempt.attempt == event.attempt
+                and attempt.status
+                not in {
+                    AttemptStatus.CANCELLED,
+                    AttemptStatus.FAILED,
+                    AttemptStatus.SUCCEEDED,
+                    AttemptStatus.TIMED_OUT,
+                }
+                and attempt.dispatch_id != event.dispatch_id
+            ):
+                return attempt
+        return None
+
+    async def _handle_conflicting_dispatch(
+        self,
+        event: RuntimeEvent,
+        active: AttemptSnapshot,
+    ) -> None:
+        await self._release_event_outputs(event)
+        await self._cancel_dispatch(event.dispatch_id, "conflicting_dispatch_id")
+        await self._cancel_dispatch(active.dispatch_id, "conflicting_dispatch_id")
+        error = self._error(
+            run_id=event.run_id,
+            task_id=event.task_id,
+            attempt=event.attempt,
+            dispatch_id=active.dispatch_id,
+            lease_id=active.lease_id,
+            error_code="backend_internal_error",
+            category="control",
+            origin="runtime",
+            phase="cleanup",
+            message=(
+                "one Attempt received two dispatch IDs: "
+                f"{active.dispatch_id} and {event.dispatch_id}"
+            ),
+        )
+        await self._handle_attempt_failure(
+            run_id=event.run_id,
+            task_id=event.task_id,
+            attempt=event.attempt,
+            dispatch_id=active.dispatch_id,
+            lease_id=active.lease_id,
+            error=error,
+            attempt_status=AttemptStatus.FAILED,
+            dispatch_handle=self._dispatches.get(active.dispatch_id),
+        )
 
     async def _handle_model_route_failure(self, event: _ModelRouteFailed) -> None:
         lease = event.lease
@@ -1283,6 +1688,27 @@ class SchedulerCore:
                 ].instance_id
             ),
         )
+        if event.attempt > 1:
+            previous = self.recovery.decision(
+                event.run_id,
+                event.task_id,
+                event.attempt - 1,
+            )
+            if previous is not None and previous.action is RecoveryAction.RETRY:
+                self._record(
+                    event.run_id,
+                    "recovery_succeeded",
+                    task_id=event.task_id,
+                    attempt=event.attempt,
+                    lease_id=event.lease_id,
+                    route_lease_id=event.route_lease_id,
+                    payload={
+                        "decision_id": previous.decision_id,
+                        "failed_attempt": previous.attempt,
+                        "recovered_attempt": event.attempt,
+                        "error_code": previous.error.error_code,
+                    },
+                )
         for task_id in result.ready_task_ids:
             self._enqueue_ready(event.run_id, task_id)
         if result.run_terminal:
@@ -1303,7 +1729,17 @@ class SchedulerCore:
                 message="runtime failure event omitted ErrorInfo",
             )
         else:
-            error = event.error
+            error = self.error_normalizer.normalize(
+                event.error,
+                identity=FaultIdentity(
+                    run_id=event.run_id,
+                    task_id=event.task_id,
+                    attempt=event.attempt,
+                    dispatch_id=event.dispatch_id,
+                    lease_id=event.lease_id,
+                    route_lease_id=event.route_lease_id,
+                ),
+            )
         await self._handle_attempt_failure(
             run_id=event.run_id,
             task_id=event.task_id,
@@ -1365,14 +1801,9 @@ class SchedulerCore:
             task_id=task_id,
             attempt=attempt,
         )
-        self.placement.release_lease(
-            lease_id,
-            now_ms=self.clock.monotonic_ms(),
-            run_id=run_id,
-            task_id=task_id,
-            attempt=attempt,
-            reason=error.error_code,
-        )
+        cleanup_started_ns = perf_counter_ns()
+        dispatch_invalidated = self.runtime.dispatch_invalidated(dispatch_id)
+        worker_released = self.runtime.worker_released(dispatch_id)
         route_released = await self._release_attempt_route(
             run_id=run_id,
             task_id=task_id,
@@ -1381,19 +1812,51 @@ class SchedulerCore:
             expected_route_lease_id=expected_route_lease_id,
             record_inference=True,
         )
+        quarantined = False
+        if not worker_released:
+            quarantined = self._quarantine_attempt_resource(
+                lease_id=lease_id,
+                error=error,
+            )
+        if worker_released:
+            self._release_attempt_lease(
+                lease_id=lease_id,
+                run_id=run_id,
+                task_id=task_id,
+                attempt=attempt,
+                reason=error.error_code,
+            )
+        elif quarantined:
+            try:
+                self.placement.invalidate_lease(
+                    lease_id,
+                    now_ms=self.clock.monotonic_ms(),
+                    reason=f"quarantined_after_{error.error_code}",
+                )
+            except (KeyError, StateTransitionError):
+                pass
         definition = self._definition(run_id, task_id)
         task_snapshot = self.state.snapshot(run_id).task(task_id)
         run_snapshot = self.state.snapshot(run_id)
-        cleanup = CleanupBarrier(
-            dispatch_invalidated=self.runtime.dispatch_invalidated(dispatch_id),
-            worker_released=self.runtime.worker_released(dispatch_id),
+        cleanup = self.recovery_coordinator.finalize_cleanup(
+            run_id=run_id,
+            task_id=task_id,
+            attempt=attempt,
+            dispatch_invalidated=dispatch_invalidated,
+            worker_released=worker_released,
             unpublished_data_released=True,
             route_released=route_released,
             placement_released=(
                 self.placement.lease_snapshot(lease_id).status
                 not in {LeaseStatus.RESERVED, LeaseStatus.BOUND}
             ),
+            node_or_device_quarantined=quarantined,
         )
+        cleanup_duration_ms = max(
+            0,
+            (perf_counter_ns() - cleanup_started_ns) // 1_000_000,
+        )
+        self._record_error_info(error)
         precondition_reason = self.recovery.retry_precondition_reason(
             definition=definition,
             error=error,
@@ -1403,6 +1866,12 @@ class SchedulerCore:
             run_deadline_at_ms=run_snapshot.deadline_at_ms,
         )
         retry_block_reason: str | None = None
+        replayability = None
+        if precondition_reason is None:
+            replayability = self._check_replayability(run_id, task_id)
+            if not replayability.replayable:
+                precondition_reason = replayability.reason
+                retry_block_reason = replayability.reason
         if error.error_code == "npu_oom":
             execution = self._runs[run_id]
             observed_peak = None
@@ -1476,6 +1945,14 @@ class SchedulerCore:
             now_ms=self.clock.monotonic_ms(),
             run_deadline_at_ms=run_snapshot.deadline_at_ms,
             retry_block_reason=retry_block_reason,
+        )
+        self._record_recovery_decision(
+            decision,
+            cleanup=cleanup,
+            cleanup_duration_ms=cleanup_duration_ms,
+            replayability_reason=(
+                None if replayability is None else replayability.reason
+            ),
         )
         if decision.action is RecoveryAction.RETRY:
             result = self.state.attempt_retry_wait(
@@ -1689,8 +2166,12 @@ class SchedulerCore:
     ) -> None:
         for attempt in attempts:
             dispatch = self._dispatches.get(attempt.dispatch_id)
+            cancel_error: Exception | None = None
             if dispatch is not None:
-                await self.runtime.cancel(dispatch.handle, "run_terminal")
+                try:
+                    await self.runtime.cancel(dispatch.handle, "run_terminal")
+                except Exception as exc:
+                    cancel_error = exc
             self.deadlines.cancel(
                 kind=DeadlineKind.LEASE,
                 run_id=run_id,
@@ -1703,17 +2184,59 @@ class SchedulerCore:
                 task_id=attempt.task_id,
                 attempt=attempt.attempt,
             )
-            self.placement.release_lease(
-                attempt.lease_id,
-                now_ms=self.clock.monotonic_ms(),
-                reason="run_terminal",
-            )
-            await self._release_attempt_route(
+            worker_released = self.runtime.worker_released(attempt.dispatch_id)
+            quarantined = False
+            if worker_released:
+                self._release_attempt_lease(
+                    lease_id=attempt.lease_id,
+                    run_id=run_id,
+                    task_id=attempt.task_id,
+                    attempt=attempt.attempt,
+                    reason="run_terminal",
+                )
+            else:
+                try:
+                    lease = self.placement.lease_snapshot(attempt.lease_id).lease
+                    self.placement.set_node_status(
+                        lease.node_id,
+                        NodeStatus.UNSCHEDULABLE,
+                        now_ms=self.clock.monotonic_ms(),
+                    )
+                    self.placement.invalidate_lease(
+                        attempt.lease_id,
+                        now_ms=self.clock.monotonic_ms(),
+                        reason="run_terminal_cleanup_quarantined",
+                    )
+                    quarantined = True
+                except (KeyError, StateTransitionError):
+                    pass
+            route_released = await self._release_attempt_route(
                 run_id=run_id,
                 task_id=attempt.task_id,
                 attempt=attempt.attempt,
                 reason="run_terminal",
                 record_inference=True,
+            )
+            self._record(
+                run_id,
+                "cancel_cleanup",
+                task_id=attempt.task_id,
+                attempt=attempt.attempt,
+                lease_id=attempt.lease_id,
+                payload={
+                    "dispatch_id": attempt.dispatch_id,
+                    "dispatch_invalidated": self.runtime.dispatch_invalidated(
+                        attempt.dispatch_id
+                    ),
+                    "worker_released": worker_released,
+                    "route_released": route_released,
+                    "node_or_device_quarantined": quarantined,
+                    "cancel_error": (
+                        None
+                        if cancel_error is None
+                        else f"{type(cancel_error).__name__}: {cancel_error}"
+                    ),
+                },
             )
 
     async def _on_run_terminal(self, run_id: str) -> None:
@@ -1725,6 +2248,14 @@ class SchedulerCore:
                 self._blocked.pop(key, None)
         snapshot = self.state.snapshot(run_id)
         assert snapshot.finished_at_ms is not None
+        self._record(
+            run_id,
+            "run_terminal",
+            payload={
+                "status": snapshot.status.value,
+                "finished_at_ms": snapshot.finished_at_ms,
+            },
+        )
         if self.inference is not None:
             self.inference.replicas.remove_run(run_id)
             await self.inference.reconcile()
@@ -1756,32 +2287,7 @@ class SchedulerCore:
         snapshot = self.state.snapshot(run_id)
         if not snapshot.terminal:
             raise RunNotTerminalError("run must be terminal before destroy")
-        flush_started = perf_counter_ns()
-        try:
-            producer_results = await self.runtime.flush_run_recorders(
-                run_id, self.recorder_flush_timeout_ms
-            )
-        except Exception as exc:
-            producer_results = ()
-            self._record_recorder_error(run_id, exc)
-        for producer in producer_results:
-            if producer.result is not None:
-                try:
-                    self.recorder.merge_producer_flush(
-                        run_id, producer.producer_id, producer.result
-                    )
-                except Exception as exc:
-                    self._record_recorder_error(run_id, exc)
-            else:
-                self._record_recorder_error(
-                    run_id,
-                    RuntimeError(
-                        f"producer {producer.producer_id} flush failed: {producer.error}"
-                    ),
-                )
-        elapsed_ms = max(0, (perf_counter_ns() - flush_started) // 1_000_000)
-        remaining_ms = max(1, self.recorder_flush_timeout_ms - elapsed_ms)
-        flush = await self.recorder.flush_run(run_id, remaining_ms)
+        flush = await self.flush_run_recording(run_id)
         if not flush.recording_complete and not force:
             raise RuntimeError("recording is incomplete; force is required")
         if self.placement.active_lease_count(run_id) != 0:
@@ -1836,6 +2342,8 @@ class SchedulerCore:
             del self._attempt_routes[route_key]
         self._recorded_inference_routes.difference_update(route_ids)
         self._recorded_route_terminals.difference_update(route_ids)
+        self.recovery.destroy_run(run_id)
+        self.recovery_coordinator.destroy_run(run_id)
         for event_id in [
             event_id
             for event_id, event_run_id in self._seen_runtime_events.items()
@@ -1935,6 +2443,139 @@ class SchedulerCore:
                     pass
 
         await asyncio.to_thread(release)
+
+    def _check_replayability(
+        self,
+        run_id: str,
+        task_id: str,
+    ) -> ReplayabilityResult:
+        execution = self._runs[run_id]
+        node = execution.compiled.tasks[task_id]
+        index = self.indexes.get(run_id)
+        handles: list[DataHandle] = []
+        for binding in node.inputs:
+            if isinstance(binding, WorkflowInputBinding):
+                handles.append(
+                    index.workflow_input_handle(
+                        binding.workflow_input_name,
+                        controller_generation=execution.index_ref.controller_generation,
+                        index_generation=execution.index_ref.index_generation,
+                    )
+                )
+            elif isinstance(binding, OutputBinding):
+                handles.append(
+                    index.task_output_handle(
+                        binding.source_task_id,
+                        binding.source_output,
+                        controller_generation=execution.index_ref.controller_generation,
+                        index_generation=execution.index_ref.index_generation,
+                    )
+                )
+        return self.replayability.check(
+            code_available=node.definition_id in execution.code_by_definition,
+            environment_matches=(
+                execution.recording_context.environment_fingerprint
+                == self.runtime.environment_fingerprint
+            ),
+            handles=handles,
+        )
+
+    def _quarantine_attempt_resource(
+        self,
+        *,
+        lease_id: str,
+        error: ErrorInfo,
+    ) -> bool:
+        try:
+            lease = self.placement.lease_snapshot(lease_id).lease
+            node_id = error.node_id or lease.node_id
+            status = (
+                NodeStatus.OFFLINE
+                if error.error_code in {"node_offline", "runtime_node_unavailable"}
+                else NodeStatus.UNSCHEDULABLE
+            )
+            self.placement.set_node_status(
+                node_id,
+                status,
+                now_ms=self.clock.monotonic_ms(),
+            )
+            return True
+        except (KeyError, StateTransitionError):
+            return False
+
+    def _record_error_info(self, error: ErrorInfo) -> None:
+        self._record(
+            error.run_id,
+            "error_normalized",
+            task_id=error.task_id,
+            attempt=error.attempt,
+            lease_id=error.lease_id,
+            route_lease_id=error.route_lease_id,
+            model_instance_id=error.model_instance_id,
+            payload={
+                "schema_version": error.schema_version,
+                "error_code": error.error_code,
+                "category": error.category,
+                "origin": error.origin,
+                "classification_confidence": error.classification_confidence,
+                "execution_phase": error.execution_phase,
+                "dispatch_id": error.dispatch_id,
+                "node_id": error.node_id,
+                "boot_id": error.boot_id,
+                "device_id": error.device_id,
+                "worker_id": error.worker_id,
+                "model_instance_id": error.model_instance_id,
+                "exception_type": error.exception_type,
+                "platform_error_code": error.platform_error_code,
+                "occurred_at_ms": error.occurred_at_ms,
+                "details": dict(error.details.items_tuple()),
+            },
+        )
+
+    def _record_recovery_decision(
+        self,
+        decision: RecoveryDecision,
+        *,
+        cleanup: CleanupBarrier,
+        cleanup_duration_ms: int,
+        replayability_reason: str | None,
+    ) -> None:
+        self._record(
+            decision.run_id,
+            "recovery_decision",
+            task_id=decision.task_id,
+            attempt=decision.attempt,
+            lease_id=decision.error.lease_id,
+            route_lease_id=decision.error.route_lease_id,
+            model_instance_id=decision.error.model_instance_id,
+            payload={
+                "decision_id": decision.decision_id,
+                "dispatch_id": decision.error.dispatch_id,
+                "action": decision.action.value,
+                "reason": decision.reason,
+                "error_code": decision.error.error_code,
+                "next_attempt": decision.next_attempt,
+                "eligible_at_ms": decision.eligible_at_ms,
+                "reanchor_required": decision.reanchor_required,
+                "avoid_node_id": decision.avoid_node_id,
+                "avoid_device_id": decision.avoid_device_id,
+                "retry_budget_before": decision.retry_budget_before,
+                "retry_budget_after": decision.retry_budget_after,
+                "replayability_reason": replayability_reason,
+                "cleanup_duration_ms": cleanup_duration_ms,
+                "cleanup": {
+                    "dispatch_invalidated": cleanup.dispatch_invalidated,
+                    "worker_released": cleanup.worker_released,
+                    "unpublished_data_released": cleanup.unpublished_data_released,
+                    "route_released": cleanup.route_released,
+                    "placement_released": cleanup.placement_released,
+                    "node_or_device_quarantined": (
+                        cleanup.node_or_device_quarantined
+                    ),
+                    "satisfied": cleanup.satisfied,
+                },
+            },
+        )
 
     def _release_event_lease(self, event: RuntimeEvent, reason: str) -> bool:
         return self._release_attempt_lease(
@@ -2227,12 +2868,13 @@ class SchedulerCore:
         self, run_id: str, lease: PlacementLease
     ) -> None:
         producer_id = self.runtime.producer_for_lease(lease)
-        if producer_id is None:
-            return
-        try:
-            self.recorder.expect_producer(run_id, producer_id)
-        except Exception as exc:
-            self._record_recorder_error(run_id, exc)
+        if producer_id is not None:
+            if self.runtime.producer_is_persistent(lease):
+                self._runs[run_id].expected_producer_ids.add(producer_id)
+            try:
+                self.recorder.expect_producer(run_id, producer_id)
+            except Exception as exc:
+                self._record_recorder_error(run_id, exc)
         try:
             await self.runtime.prepare_run_recording(
                 self._runs[run_id].recording_context, lease
@@ -2286,6 +2928,16 @@ class SchedulerCore:
                 duration_ms=None,
                 payload=frozen_payload,
             )
+        except Exception as exc:
+            try:
+                self.recorder.record_writer_error(
+                    run_id,
+                    f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+            return
+        try:
             self.recorder.emit(event)
         except Exception as exc:
             try:
@@ -2293,6 +2945,11 @@ class SchedulerCore:
                     run_id,
                     f"{type(exc).__name__}: {exc}",
                 )
+            except Exception:
+                pass
+        if self._control_event_sink is not None:
+            try:
+                self._control_event_sink(event)
             except Exception:
                 pass
 

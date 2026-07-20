@@ -29,6 +29,7 @@ class NodeStatus(str, Enum):
     HEALTHY = "healthy"
     STALE = "stale"
     DRAINING = "draining"
+    DRAINED = "drained"
     OFFLINE = "offline"
     UNSCHEDULABLE = "unschedulable"
 
@@ -233,6 +234,9 @@ class ClusterSnapshot:
     snapshot_version: int
     nodes: tuple[NodeSnapshot, ...]
     active_lease_count: int
+    active_leases: tuple[LeaseSnapshot, ...]
+    host_mem_headroom_mb: int
+    npu_hbm_headroom_mb: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,6 +368,7 @@ class PlacementManager:
                 )
             elif status in {
                 NodeStatus.DRAINING,
+                NodeStatus.DRAINED,
                 NodeStatus.STALE,
                 NodeStatus.UNSCHEDULABLE,
             }:
@@ -1003,6 +1008,49 @@ class PlacementManager:
                 finish_reason=record.finish_reason,
             )
 
+    def lease_snapshots(self) -> tuple[LeaseSnapshot, ...]:
+        with self._lock:
+            return tuple(
+                LeaseSnapshot(
+                    lease=record.lease,
+                    status=record.status,
+                    finished_at_ms=record.finished_at_ms,
+                    finish_reason=record.finish_reason,
+                )
+                for _, record in sorted(self._leases.items())
+            )
+
+    def restore_reconciled_leases(
+        self,
+        snapshots: tuple[LeaseSnapshot, ...],
+        *,
+        now_ms: int,
+    ) -> None:
+        """Retain old Lease identities as invalidated history after restart."""
+
+        with self._lock:
+            for snapshot in snapshots:
+                lease = snapshot.lease
+                if lease.lease_id in self._leases:
+                    raise StateTransitionError(
+                        f"lease already exists during recovery: {lease.lease_id}"
+                    )
+                status = snapshot.status
+                finished_at_ms = snapshot.finished_at_ms
+                finish_reason = snapshot.finish_reason
+                if status in ACTIVE_LEASE_STATUSES:
+                    status = LeaseStatus.INVALIDATED
+                    finished_at_ms = now_ms
+                    finish_reason = "controller_generation_changed"
+                self._leases[lease.lease_id] = _LeaseRecord(
+                    lease=lease,
+                    status=status,
+                    finished_at_ms=finished_at_ms,
+                    finish_reason=finish_reason,
+                )
+            if snapshots:
+                self._snapshot_version += 1
+
     def run_snapshot(self, run_id: str) -> RunPlacementSnapshot:
         with self._lock:
             context = self._run_contexts.get(run_id, _RunPlacementRecord(run_id))
@@ -1073,11 +1121,29 @@ class PlacementManager:
                         per_npu_reserved=tuple(per_npu),
                     )
                 )
+            active_leases = tuple(
+                LeaseSnapshot(
+                    lease=record.lease,
+                    status=record.status,
+                    finished_at_ms=record.finished_at_ms,
+                    finish_reason=record.finish_reason,
+                )
+                for _, record in sorted(self._leases.items())
+                if record.status in ACTIVE_LEASE_STATUSES
+            )
             return ClusterSnapshot(
                 snapshot_version=self._snapshot_version,
                 nodes=tuple(nodes),
-                active_lease_count=self.active_lease_count(),
+                active_lease_count=len(active_leases),
+                active_leases=active_leases,
+                host_mem_headroom_mb=self.host_mem_headroom_mb,
+                npu_hbm_headroom_mb=self.npu_hbm_headroom_mb,
             )
+
+    @property
+    def snapshot_version(self) -> int:
+        with self._lock:
+            return self._snapshot_version
 
     def _reservation_vector(self, anchor: ResourceAnchor) -> ReservationVector:
         local_npu = (

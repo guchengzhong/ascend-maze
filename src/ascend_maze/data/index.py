@@ -35,6 +35,21 @@ class RunDataTombstone:
     errors: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RunDataIndexCheckpoint:
+    reference: RunDataIndexRef
+    state: RunDataState
+    workflow_inputs: tuple[tuple[str, DataHandle], ...]
+    task_outputs: tuple[tuple[str, str, DataHandle], ...]
+    tombstone: RunDataTombstone | None
+
+    def __post_init__(self) -> None:
+        if self.state is RunDataState.DESTROYED and self.tombstone is None:
+            raise RunDataIndexError("destroyed checkpoint requires a tombstone")
+        if self.state is not RunDataState.DESTROYED and self.tombstone is not None:
+            raise RunDataIndexError("active checkpoint cannot contain a tombstone")
+
+
 class RunDataIndex:
     """Map logical workflow names to handles while keeping values in DataStore."""
 
@@ -43,10 +58,14 @@ class RunDataIndex:
         *,
         reference: RunDataIndexRef,
         data_store: DataStore,
+        data_owner_generation: str,
         workflow_inputs: Mapping[str, DataHandle],
     ) -> None:
+        if not data_owner_generation:
+            raise ValueError("data_owner_generation is required")
         self.reference = reference
         self._data_store = data_store
+        self._data_owner_generation = data_owner_generation
         self._state = RunDataState.ACTIVE
         self._workflow_inputs = dict(workflow_inputs)
         self._task_outputs: dict[tuple[str, str], DataHandle] = {}
@@ -173,7 +192,7 @@ class RunDataIndex:
             owner = DataOwner(
                 owner_kind="run_index",
                 owner_id=f"{self.reference.run_id}:{self.reference.index_generation}",
-                owner_generation=self.reference.controller_generation,
+                owner_generation=self._data_owner_generation,
             )
             self._data_store.adopt(handles, owner)
             for name, handle in zip(expected_output_names, handles, strict=True):
@@ -201,6 +220,23 @@ class RunDataIndex:
     def handle_count(self) -> int:
         with self._lock:
             return len(self._workflow_inputs) + len(self._task_outputs)
+
+    def checkpoint(self) -> RunDataIndexCheckpoint:
+        with self._lock:
+            if self._state is RunDataState.DESTROYING:
+                raise RunDataIndexError("cannot checkpoint a destroying data index")
+            return RunDataIndexCheckpoint(
+                reference=self.reference,
+                state=self._state,
+                workflow_inputs=tuple(sorted(self._workflow_inputs.items())),
+                task_outputs=tuple(
+                    (task_id, output_name, handle)
+                    for (task_id, output_name), handle in sorted(
+                        self._task_outputs.items()
+                    )
+                ),
+                tombstone=self._tombstone,
+            )
 
     def destroy(
         self,
@@ -253,11 +289,13 @@ class RunDataIndexRegistry:
         self,
         *,
         controller_generation: str,
+        data_owner_generation: str | None = None,
         data_store: DataStore,
     ) -> None:
         if not controller_generation:
             raise ValueError("controller_generation is required")
         self.controller_generation = controller_generation
+        self.data_owner_generation = data_owner_generation or controller_generation
         self.data_store = data_store
         self._indexes: dict[str, RunDataIndex] = {}
         self._next_generation: dict[str, int] = {}
@@ -283,14 +321,56 @@ class RunDataIndexRegistry:
             owner = DataOwner(
                 owner_kind="run_index",
                 owner_id=f"{run_id}:{generation}",
-                owner_generation=self.controller_generation,
+                owner_generation=self.data_owner_generation,
             )
             self.data_store.adopt(handles, owner)
             index = RunDataIndex(
                 reference=reference,
                 data_store=self.data_store,
+                data_owner_generation=self.data_owner_generation,
                 workflow_inputs=workflow_inputs,
             )
+            self._indexes[run_id] = index
+            self._next_generation[run_id] = generation
+            return index
+
+    def restore(self, checkpoint: RunDataIndexCheckpoint) -> RunDataIndex:
+        """Rebind a persisted index to this Controller without re-adopting data."""
+
+        with self._lock:
+            run_id = checkpoint.reference.run_id
+            if run_id in self._indexes:
+                raise RunDataIndexError(f"run data index already restored: {run_id}")
+            generation = max(
+                self._next_generation.get(run_id, 0),
+                checkpoint.reference.index_generation,
+            ) + 1
+            reference = RunDataIndexRef(
+                run_id=run_id,
+                controller_generation=self.controller_generation,
+                index_generation=generation,
+            )
+            index = RunDataIndex(
+                reference=reference,
+                data_store=self.data_store,
+                data_owner_generation=self.data_owner_generation,
+                workflow_inputs=dict(checkpoint.workflow_inputs),
+            )
+            index._task_outputs = {
+                (task_id, output_name): handle
+                for task_id, output_name, handle in checkpoint.task_outputs
+            }
+            index._state = checkpoint.state
+            if checkpoint.tombstone is not None:
+                index._tombstone = RunDataTombstone(
+                    run_id=run_id,
+                    controller_generation=self.controller_generation,
+                    index_generation=generation,
+                    released_handle_count=checkpoint.tombstone.released_handle_count,
+                    destroy_succeeded=checkpoint.tombstone.destroy_succeeded,
+                    completed_at_ms=checkpoint.tombstone.completed_at_ms,
+                    errors=checkpoint.tombstone.errors,
+                )
             self._indexes[run_id] = index
             self._next_generation[run_id] = generation
             return index

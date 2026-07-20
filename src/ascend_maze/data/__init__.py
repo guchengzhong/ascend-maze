@@ -3,6 +3,7 @@
 from ascend_maze.data.in_memory import InMemoryDataStore
 from ascend_maze.data.index import (
     RunDataIndex,
+    RunDataIndexCheckpoint,
     RunDataIndexRef,
     RunDataIndexRegistry,
     RunDataState,
@@ -12,6 +13,7 @@ from ascend_maze.data.index import (
 __all__ = [
     "InMemoryDataStore",
     "RunDataIndex",
+    "RunDataIndexCheckpoint",
     "RunDataIndexRef",
     "RunDataIndexRegistry",
     "RunDataState",

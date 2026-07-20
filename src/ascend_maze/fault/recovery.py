@@ -67,6 +67,9 @@ class RecoveryDecision:
     reason: str
     next_attempt: int | None
     eligible_at_ms: int | None
+    reanchor_required: bool
+    avoid_node_id: str | None
+    avoid_device_id: str | None
     cleanup_requirements: tuple[str, ...]
     retry_budget_before: int
     retry_budget_after: int
@@ -75,12 +78,15 @@ class RecoveryDecision:
 _PERMANENT_ERRORS = frozenset(
     {
         "data_binding_failed",
+        "data_handle_invalid",
         "environment_mismatch",
         "invalid_task_output",
         "model_catalog_invalid",
+        "model_protocol_failed",
         "resource_request_unsatisfiable",
         "serialization_failed",
         "task_definition_invalid",
+        "unknown_error",
         "user_code_failed",
     }
 )
@@ -183,6 +189,27 @@ class RecoveryPolicy:
                 reason=reason,
                 next_attempt=attempt_count + 1 if retry else None,
                 eligible_at_ms=eligible_at,
+                reanchor_required=retry and error.error_code == "npu_oom",
+                avoid_node_id=(
+                    error.node_id
+                    if retry
+                    and error.error_code
+                    in {
+                        "device_unhealthy",
+                        "node_offline",
+                        "npu_async_error",
+                        "runtime_node_unavailable",
+                        "worker_lost",
+                    }
+                    else None
+                ),
+                avoid_device_id=(
+                    error.device_id
+                    if retry
+                    and error.error_code
+                    in {"device_unhealthy", "npu_async_error"}
+                    else None
+                ),
                 cleanup_requirements=cleanup_requirements,
                 retry_budget_before=budget_before,
                 retry_budget_after=budget_before - 1 if retry else budget_before,
@@ -202,3 +229,10 @@ class RecoveryPolicy:
     def count_for_run(self, run_id: str) -> int:
         with self._lock:
             return sum(key[0] == run_id for key in self._decisions)
+
+    def destroy_run(self, run_id: str) -> int:
+        with self._lock:
+            keys = [key for key in self._decisions if key[0] == run_id]
+            for key in keys:
+                del self._decisions[key]
+            return len(keys)

@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from ascend_maze import Workflow
 from ascend_maze.contracts.errors import ErrorInfo
-from ascend_maze.fault import CleanupBarrier, RecoveryAction, RecoveryPolicy
+from ascend_maze.core.errors import StateTransitionError
+from ascend_maze.fault import (
+    CleanupBarrier,
+    RecoveryAction,
+    RecoveryCoordinator,
+    RecoveryPolicy,
+)
+import pytest
 from task_fixtures import finish
 
 
@@ -93,3 +100,56 @@ def test_recovery_requires_cleanup_and_rejects_permanent_or_expired_cases() -> N
     )
     assert expired.action is RecoveryAction.FAIL_TASK
     assert expired.reason == "run_deadline_exhausted"
+
+
+def test_recovery_coordinator_commits_one_safe_cleanup_barrier() -> None:
+    coordinator = RecoveryCoordinator()
+    barrier = coordinator.finalize_cleanup(
+        run_id="run_cleanup",
+        task_id="task_cleanup",
+        attempt=1,
+        dispatch_invalidated=True,
+        worker_released=False,
+        unpublished_data_released=True,
+        route_released=True,
+        placement_released=True,
+        node_or_device_quarantined=True,
+    )
+    assert barrier.quarantined
+    assert coordinator.finalize_cleanup(
+        run_id="run_cleanup",
+        task_id="task_cleanup",
+        attempt=1,
+        dispatch_invalidated=True,
+        worker_released=False,
+        unpublished_data_released=True,
+        route_released=True,
+        placement_released=True,
+        node_or_device_quarantined=True,
+    ) is barrier
+    with pytest.raises(StateTransitionError, match="conflicting cleanup"):
+        coordinator.finalize_cleanup(
+            run_id="run_cleanup",
+            task_id="task_cleanup",
+            attempt=1,
+            dispatch_invalidated=True,
+            worker_released=True,
+            unpublished_data_released=True,
+            route_released=True,
+            placement_released=True,
+            node_or_device_quarantined=False,
+        )
+    with pytest.raises(StateTransitionError, match="cannot be reusable"):
+        coordinator.finalize_cleanup(
+            run_id="run_unsafe",
+            task_id="task_cleanup",
+            attempt=1,
+            dispatch_invalidated=True,
+            worker_released=False,
+            unpublished_data_released=True,
+            route_released=True,
+            placement_released=True,
+            node_or_device_quarantined=False,
+        )
+    assert coordinator.destroy_run("run_cleanup") == 1
+    assert coordinator.count_for_run("run_cleanup") == 0
