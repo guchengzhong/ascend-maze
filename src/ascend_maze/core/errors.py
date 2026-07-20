@@ -33,6 +33,10 @@ class ContractValidationError(AscendMazeError, ValueError):
     """Raised when a cross-component contract object is invalid."""
 
 
+class ExperimentValidationError(ContractValidationError):
+    """Raised when a C14 experiment cannot be planned deterministically."""
+
+
 class EnvironmentValidationError(ContractValidationError):
     """Raised when the local cluster environment fails a hard check."""
 

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ascend-maze.local/schemas/report.v1.schema.json",
+  "title": "Ascend-Maze Benchmark Report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "study", "provenance", "experiment", "metrics", "comparisons", "validity", "counts", "resources", "known_warnings", "unavailable_baselines", "unsupported_conclusions", "generator"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "study": {"type": "object", "required": ["study_id", "cell_ids", "trial_attempt_ids"], "properties": {"study_id": {"type": "string"}, "cell_ids": {"type": "array", "items": {"type": "string"}}, "trial_attempt_ids": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": false},
+    "provenance": {"type": "object", "required": ["source_commits", "config_fingerprints", "environment_fingerprints", "workflow_fingerprint", "model_artifact_digest"], "properties": {"source_commits": {"type": "array", "items": {"type": "string"}}, "config_fingerprints": {"type": "array", "items": {"type": "string"}}, "environment_fingerprints": {"type": "array", "items": {"type": "string"}}, "workflow_fingerprint": {"type": "string"}, "model_artifact_digest": {"type": "string"}}, "additionalProperties": false},
+    "experiment": {"type": "object", "required": ["workload_digest", "arrival", "windows", "base_seed", "block_count"], "properties": {"workload_digest": {"type": "string"}, "arrival": {"type": "object"}, "windows": {"type": "object"}, "base_seed": {"type": "integer"}, "block_count": {"type": "integer"}}, "additionalProperties": false},
+    "metrics": {"type": "array", "items": {"$ref": "#/$defs/metric"}},
+    "comparisons": {"type": "array", "items": {"$ref": "#/$defs/comparison"}},
+    "validity": {"type": "array", "items": {"type": "object", "required": ["trial_attempt_id", "trial_valid", "metric_valid", "reasons"], "properties": {"trial_attempt_id": {"type": "string"}, "trial_valid": {"type": "boolean"}, "metric_valid": {"type": "object", "additionalProperties": {"type": "boolean"}}, "reasons": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": false}},
+    "counts": {"type": "object", "required": ["offered", "admitted", "terminal", "succeeded", "failed", "timed_out"], "properties": {"offered": {"type": "integer", "minimum": 0}, "admitted": {"type": "integer", "minimum": 0}, "terminal": {"type": "integer", "minimum": 0}, "succeeded": {"type": "integer", "minimum": 0}, "failed": {"type": "integer", "minimum": 0}, "timed_out": {"type": "integer", "minimum": 0}}, "additionalProperties": false},
+    "resources": {"type": "object", "required": ["before", "after", "recovered"], "properties": {"before": {"type": "object"}, "after": {"type": "object"}, "recovered": {"type": "boolean"}}, "additionalProperties": false},
+    "known_warnings": {"type": "array", "items": {"type": "string"}},
+    "unavailable_baselines": {"type": "array", "items": {"type": "string"}},
+    "unsupported_conclusions": {"type": "array", "items": {"type": "string"}},
+    "generator": {"type": "object", "required": ["name", "version", "schema_digests", "analysis_seed"], "properties": {"name": {"const": "ascend-maze"}, "version": {"type": "string"}, "schema_digests": {"type": "object", "additionalProperties": {"type": "string"}}, "analysis_seed": {"type": "integer"}}, "additionalProperties": false}
+  },
+  "$defs": {
+    "metric": {"type": "object", "additionalProperties": false, "required": ["measurement_id", "name", "unit", "valid_trial_count", "sample_count", "estimate", "confidence_interval"], "properties": {"measurement_id": {"type": "string"}, "name": {"type": "string"}, "unit": {"type": "string"}, "valid_trial_count": {"type": "integer"}, "sample_count": {"type": "integer"}, "estimate": {"type": ["number", "null"]}, "confidence_interval": {"type": ["object", "null"]}}},
+    "comparison": {"type": "object", "additionalProperties": false, "required": ["baseline_cell_id", "candidate_cell_id", "paired_blocks", "effect", "confidence_interval", "budget", "decision"], "properties": {"baseline_cell_id": {"type": "string"}, "candidate_cell_id": {"type": "string"}, "paired_blocks": {"type": "integer"}, "effect": {"type": ["number", "null"]}, "confidence_interval": {"type": ["object", "null"]}, "budget": {"type": ["object", "null"]}, "decision": {"enum": ["pass", "fail", "borderline", "insufficient_sample", "not_available"]}}}
+  }
+}

@@ -30,6 +30,7 @@ dependencies = [
 
 [project.scripts]
 maze = "ascend_maze.cli.main:main"
+maze-bench = "ascend_maze.benchmark.cli:main"
 
 [project.optional-dependencies]
 test = [
@@ -60,7 +61,11 @@ where = ["src"]
 include = ["ascend_maze*"]
 
 [tool.setuptools.package-data]
-ascend_maze = ["py.typed", "control/proto/*.proto"]
+ascend_maze = [
+    "py.typed",
+    "benchmark/schemas/*.json",
+    "control/proto/*.proto",
+]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"

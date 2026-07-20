@@ -7,7 +7,7 @@ import importlib.metadata
 import os
 from pathlib import Path
 import sys
-from typing import Any, Mapping, TypeVar, cast
+from typing import Any, Mapping, Sequence, TypeVar, cast
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -82,6 +82,7 @@ def load_config(
     *,
     build_revision: str = "uncommitted",
     created_at_ms: int | None = None,
+    config_overrides: Sequence[tuple[str, object]] = (),
 ) -> LoadedConfig:
     source = resolve_config_path(path)
     raw_bytes = source.read_bytes()
@@ -89,6 +90,7 @@ def load_config(
         document = tomllib.loads(raw_bytes.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise ContractValidationError(f"config: invalid TOML: {exc}") from exc
+    _apply_config_overrides(document, config_overrides)
     _reject_unknown(document, _ROOT_KEYS, "")
     schema_version = _integer(document.get("schema_version", 1), "schema_version")
     profile = _string(document.get("profile", "correctness"), "profile")
@@ -138,13 +140,20 @@ def load_config(
     )
     workflow = _construct(WorkflowConfig, workflow_raw, "workflow")
     shared_roots = data_raw.get("shared_filesystem_roots", [])
-    if not isinstance(shared_roots, list) or any(not isinstance(item, str) for item in shared_roots):
+    if not isinstance(shared_roots, list) or any(
+        not isinstance(item, str) for item in shared_roots
+    ):
         raise ContractValidationError(
             "data.shared_filesystem_roots: must be an array of paths"
         )
     _reject_unknown(data_raw, frozenset({"shared_filesystem_roots"}), "data")
     data = DataConfig(
-        tuple(sorted(_path(base, item, "data.shared_filesystem_roots") for item in shared_roots))
+        tuple(
+            sorted(
+                _path(base, item, "data.shared_filesystem_roots")
+                for item in shared_roots
+            )
+        )
     )
     cluster = _construct(ClusterConfig, cluster_raw, "cluster")
     ray = _construct(
@@ -211,6 +220,38 @@ def load_config(
     from hashlib import sha256
 
     return LoadedConfig(config, snapshot, sha256(raw_bytes).hexdigest())
+
+
+def _apply_config_overrides(
+    document: dict[str, Any], overrides: Sequence[tuple[str, object]]
+) -> None:
+    seen: set[str] = set()
+    for path, value in overrides:
+        if not isinstance(path, str) or not path:
+            raise ContractValidationError(
+                "config override path must be a non-empty dotted string"
+            )
+        if path in seen:
+            raise ContractValidationError(f"config override is duplicated: {path}")
+        seen.add(path)
+        parts = path.split(".")
+        if any(not part or not part.replace("_", "a").isalnum() for part in parts):
+            raise ContractValidationError(f"invalid config override path: {path}")
+        target: dict[str, Any] = document
+        for index, part in enumerate(parts[:-1]):
+            existing = target.get(part)
+            if existing is None:
+                nested: dict[str, Any] = {}
+                target[part] = nested
+                target = nested
+                continue
+            if not isinstance(existing, dict):
+                prefix = ".".join(parts[: index + 1])
+                raise ContractValidationError(
+                    f"config override traverses non-table field: {prefix}"
+                )
+            target = existing
+        target[parts[-1]] = value
 
 
 def _construct(
