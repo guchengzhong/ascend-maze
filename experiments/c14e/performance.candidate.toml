@@ -25,7 +25,7 @@ head_node_ip = "127.0.0.1"
 
 [runtime.ray]
 namespace = "ascend-maze-c14e"
-temp_directory = "../../benchmark_output/c14e/ray_tmp"
+temp_directory = "/tmp/am14e-ray"
 object_store_memory_bytes = 2147483648
 include_dashboard = false
 local_num_cpus = 64

@@ -122,6 +122,13 @@ def test_qwen_workload_dataset_and_candidate_profile_are_consistent(
     assert loaded.config.placement.task_slots_total == 2
     assert loaded.config.worker.standby_min_idle == 2
     assert loaded.config.worker.standby_max_idle == 2
+    longest_socket = (
+        Path(loaded.config.ray.temp_directory)
+        / "session_2026-07-21_23-59-59_999999_9999999"
+        / "sockets"
+        / "plasma_store"
+    )
+    assert len(str(longest_socket).encode("utf-8")) <= 107
 
 
 def test_task_code_hash_uses_version_neutral_ast_payload() -> None:
