@@ -221,7 +221,10 @@ def test_ray_host_merges_controller_and_node_parquet_shards(
             page = controller.get_run_events(outcome.run_id, limit=100)
             assert page.exhausted
             producer_ids = {event.producer_id for event in page.events}
-            assert producer_ids == {"controller", identity.producer_id}
+            assert producer_ids == {
+                controller.controller_producer_id,
+                identity.producer_id,
+            }
             node_runtime_events = tuple(
                 event
                 for event in page.events

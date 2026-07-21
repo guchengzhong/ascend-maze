@@ -176,6 +176,51 @@ def test_post_flush_destroy_request_does_not_gap_next_run_recording() -> None:
     asyncio.run(scenario())
 
 
+def test_controller_producer_identity_is_scoped_to_owner_generation() -> None:
+    async def execute(controller: InMemoryController, submission_id: str) -> str:
+        await controller.start()
+        workflow = Workflow(submission_id)
+        workflow.add_task(
+            finish,
+            inputs={"summary": submission_id},
+            task_name="result",
+        )
+        outcome = await InMemoryRuntimeClient(controller).submit(
+            workflow,
+            inputs={},
+            submission_id=submission_id,
+        )
+        assert outcome.run_id is not None
+        terminal = await controller.wait_run(outcome.run_id, timeout_seconds=2)
+        assert terminal.status is RunStatus.SUCCEEDED
+        events = controller.recorder.events(outcome.run_id)
+        assert events
+        assert {event.producer_id for event in events} == {
+            controller.controller_producer_id
+        }
+        assert [event.producer_sequence for event in events] == list(
+            range(1, len(events) + 1)
+        )
+        await controller.destroy_run(outcome.run_id)
+        await controller.close()
+        return controller.controller_producer_id
+
+    async def scenario() -> None:
+        first = await execute(
+            _controller(nodes=(_node("node_a"),)),
+            "producer_generation_first",
+        )
+        second = await execute(
+            _controller(nodes=(_node("node_a"),)),
+            "producer_generation_second",
+        )
+        assert first.startswith("controller:")
+        assert second.startswith("controller:")
+        assert first != second
+
+    asyncio.run(scenario())
+
+
 def test_submission_response_loss_replays_original_run_and_conflict_releases_upload() -> None:
     async def scenario() -> None:
         controller = _controller()

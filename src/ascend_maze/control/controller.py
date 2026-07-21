@@ -206,6 +206,7 @@ class InMemoryController:
             if recovered is not None
             else (data_owner_generation or self.controller_generation)
         )
+        self.controller_producer_id = f"controller:{self.data_owner_generation}"
         self.data_store_descriptor = (
             recovered.data_store_descriptor
             if recovered is not None
@@ -276,6 +277,7 @@ class InMemoryController:
             max_bypass_count=max_bypass_count,
             dispatch_timeout_ms=dispatch_timeout_ms,
             recorder_flush_timeout_ms=recorder_flush_timeout_ms,
+            controller_producer_id=self.controller_producer_id,
             inference=inference,
             checkpoint_sink=(
                 self._save_checkpoint if recovery_store is not None else None
@@ -776,7 +778,7 @@ class InMemoryController:
                     environment_fingerprint=self.environment_fingerprint,
                     build_revision=self.build_revision,
                     started_wall_time_ms=self.clock.wall_ms(),
-                    initial_expected_producer_ids=("controller",),
+                    initial_expected_producer_ids=(self.controller_producer_id,),
                 )
                 self.recorder.open_run(recording_context)
                 recording_open = True
