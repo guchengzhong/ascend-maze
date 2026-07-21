@@ -6,6 +6,7 @@ from dataclasses import replace
 import pytest
 
 from ascend_maze import Workflow, task
+from ascend_maze.benchmark.indexes import build_indexes
 from ascend_maze.control import InMemoryController, InMemoryRuntimeClient
 from ascend_maze.contracts.data import DataHandle
 from ascend_maze.contracts.errors import ErrorInfo
@@ -295,6 +296,12 @@ def test_c8_links_error_decision_cleanup_attempt_lease_and_recovery_result() -> 
             item for item in events if item.event_type == "recovery_succeeded"
         )
         first_attempt = terminal.task(node.task_id).attempts[0]
+        dispatch_events = [
+            item for item in events if item.event_type == "task_dispatched"
+        ]
+        assert [item.attempt for item in dispatch_events] == [1, 2]
+        assert dispatch_events[0].payload["dispatch_id"] == first_attempt.dispatch_id
+        assert dispatch_events[0].lease_id == first_attempt.lease_id
         assert error_event.task_id == node.task_id
         assert error_event.attempt == 1
         assert error_event.lease_id == first_attempt.lease_id
@@ -306,6 +313,14 @@ def test_c8_links_error_decision_cleanup_attempt_lease_and_recovery_result() -> 
             "decision_id"
         ]
         assert recovered_event.payload["recovered_attempt"] == 2
+        indexed = build_indexes(
+            run_ids=(outcome.run_id,),
+            events=events,
+            expected_producers={
+                outcome.run_id: frozenset({controller.core.controller_producer_id})
+            },
+        )
+        assert indexed.issues == ()
         await controller.destroy_run(outcome.run_id)
         await controller.close()
 

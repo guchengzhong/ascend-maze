@@ -1196,6 +1196,32 @@ class SchedulerCore:
                         dispatch_id,
                         route_lease,
                     )
+                    self._record(
+                        key.run_id,
+                        "task_dispatched",
+                        task_id=key.task_id,
+                        attempt=attempt.attempt,
+                        lease_id=placement.lease.lease_id,
+                        route_lease_id=(
+                            None
+                            if route_lease is None
+                            else route_lease.route_lease_id
+                        ),
+                        model_instance_id=(
+                            None if route_lease is None else route_lease.instance_id
+                        ),
+                        payload={
+                            "dispatch_id": dispatch_id,
+                            "model_id": (
+                                None if route_lease is None else route_lease.model_id
+                            ),
+                            "instance_generation": (
+                                None
+                                if route_lease is None
+                                else route_lease.instance_generation
+                            ),
+                        },
+                    )
                     try:
                         handle = await self.runtime.dispatch(request, placement.lease)
                     except Exception as exc:
@@ -1233,36 +1259,6 @@ class SchedulerCore:
                             task_id=key.task_id,
                             attempt=attempt.attempt,
                             due_at_ms=placement.lease.dispatch_deadline_ms,
-                        )
-                        self._record(
-                            key.run_id,
-                            "task_dispatched",
-                            task_id=key.task_id,
-                            attempt=attempt.attempt,
-                            lease_id=placement.lease.lease_id,
-                            route_lease_id=(
-                                None
-                                if route_lease is None
-                                else route_lease.route_lease_id
-                            ),
-                            model_instance_id=(
-                                None
-                                if route_lease is None
-                                else route_lease.instance_id
-                            ),
-                            payload={
-                                "dispatch_id": dispatch_id,
-                                "model_id": (
-                                    None
-                                    if route_lease is None
-                                    else route_lease.model_id
-                                ),
-                                "instance_generation": (
-                                    None
-                                    if route_lease is None
-                                    else route_lease.instance_generation
-                                ),
-                            },
                         )
                         for blocked_key in blocked_before:
                             blocked = self._blocked.get(blocked_key)

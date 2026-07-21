@@ -14,6 +14,7 @@ from ascend_maze.contracts.recording import (
     RunRecordingContext,
 )
 from ascend_maze.core.canonical import FrozenMap
+from ascend_maze.core.clock import ManualClock
 from ascend_maze.placement import (
     NodeCapacity,
     NodeObservation,
@@ -614,10 +615,12 @@ def test_node_local_parquet_recorder_owns_worker_events_and_remote_flush(
             cursor_signing_key=b"n" * 32,
         )
         endpoint = await controller.start()
+        clock = ManualClock(monotonic_ms=100, wall_ms=1_000)
         agent = NodeAgent(
             identity=identity,
             authorization_token=b"test-token",
             recorder=node_recorder,
+            clock=clock,
         )
         try:
             agent_endpoint = await agent.start(controller_endpoint=endpoint)
@@ -633,6 +636,7 @@ def test_node_local_parquet_recorder_owns_worker_events_and_remote_flush(
                 context=context,
                 timeout_seconds=2,
             )
+            clock.advance(25)
             await asyncio.to_thread(
                 report_worker_event,
                 endpoint=agent_endpoint,
@@ -668,6 +672,9 @@ def test_node_local_parquet_recorder_owns_worker_events_and_remote_flush(
                 RuntimeEventKind.TASK_FAILED.value,
             ]
             assert all(event.producer_id == identity.producer_id for event in page.events)
+            assert [event.producer_sequence for event in page.events] == [1, 2]
+            assert [event.monotonic_time_ms for event in page.events] == [100, 125]
+            assert page.events[1].payload["source_occurred_at_ms"] == 11
         finally:
             await agent.close(grace_seconds=0)
             await controller.close(grace_seconds=0)

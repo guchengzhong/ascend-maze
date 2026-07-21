@@ -132,11 +132,15 @@ def _execution_event_from_runtime(
     *,
     producer_id: str,
     producer_sequence: int,
+    producer_monotonic_time_ms: int,
     node_id: str,
     event: RuntimeEvent,
     wall_time_ms: int,
 ) -> ExecutionEvent:
-    payload_items: list[tuple[str, object]] = [("dispatch_id", event.dispatch_id)]
+    payload_items: list[tuple[str, object]] = [
+        ("dispatch_id", event.dispatch_id),
+        ("source_occurred_at_ms", event.occurred_at_ms),
+    ]
     if event.worker_pid is not None:
         payload_items.append(("worker_pid", event.worker_pid))
     if event.device_id is not None:
@@ -212,7 +216,7 @@ def _execution_event_from_runtime(
         producer_sequence=producer_sequence,
         node_id=node_id,
         device_id=event.device_id,
-        monotonic_time_ms=event.occurred_at_ms,
+        monotonic_time_ms=producer_monotonic_time_ms,
         wall_time_ms=wall_time_ms,
         duration_ms=None if request is None else request.duration_ms,
         payload=payload,
@@ -620,6 +624,7 @@ class NodeControlServer:
             _execution_event_from_runtime(
                 producer_id=binding.producer_id,
                 producer_sequence=producer_sequence,
+                producer_monotonic_time_ms=self.clock.monotonic_ms(),
                 node_id=binding.node_id,
                 event=event,
                 wall_time_ms=self.clock.wall_ms(),
@@ -1428,6 +1433,7 @@ class NodeAgent:
             _execution_event_from_runtime(
                 producer_id=self.identity.producer_id,
                 producer_sequence=producer_sequence,
+                producer_monotonic_time_ms=self.clock.monotonic_ms(),
                 node_id=self.identity.node_id,
                 event=event,
                 wall_time_ms=self.clock.wall_ms(),
