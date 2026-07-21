@@ -493,7 +493,6 @@ class TrialOrchestrator:
                         )
                 except Exception as exc:
                     cleanup_errors.append((f"flush:{run_id}", _exception_text(exc)))
-                    continue
             if not current.destroyed:
                 try:
                     await runtime.destroy_run(
@@ -501,6 +500,7 @@ class TrialOrchestrator:
                         request_id=_request_id(
                             journal.state.trial_attempt_id, "destroy", run_id
                         ),
+                        force=True,
                     )
                     await journal.mutate_run(
                         current.phase,
@@ -782,6 +782,7 @@ class TrialOrchestrator:
                     request_id=_request_id(
                         journal.state.trial_attempt_id, "destroy", current.run_id
                     ),
+                    force=current.recording_complete is not True,
                 )
                 await journal.mutate_run(
                     current.phase,

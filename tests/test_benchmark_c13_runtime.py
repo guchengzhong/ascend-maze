@@ -120,7 +120,11 @@ def test_maze_bench_run_and_resume_emit_structured_results(
 def test_formal_adapter_maps_only_public_c13_runtime_operations() -> None:
     class PublicClient:
         def __init__(self) -> None:
-            self.actions: list[tuple[str, str, str | None]] = []
+            self.actions: list[tuple[str, str, str | None, bool]] = []
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
 
         async def get_controller_status(self, **kwargs: object) -> object:
             del kwargs
@@ -170,14 +174,17 @@ def test_formal_adapter_maps_only_public_c13_runtime_operations() -> None:
             request_id: str | None = None,
             **kwargs: object,
         ) -> dict[str, object]:
-            del kwargs
-            self.actions.append((operation, run_id, request_id))
+            self.actions.append(
+                (operation, run_id, request_id, bool(kwargs.get("force", False)))
+            )
             if operation == "FlushRun":
                 return {"recording_complete": True, "committed_files": []}
             return {}
 
         async def shutdown_controller(self, **kwargs: object) -> dict[str, object]:
-            self.actions.append(("ShutdownController", "", str(kwargs["request_id"])))
+            self.actions.append(
+                ("ShutdownController", "", str(kwargs["request_id"]), False)
+            )
             return {"cleanup_confirmed": True, "timed_out": False}
 
     async def scenario() -> None:
@@ -205,7 +212,11 @@ def test_formal_adapter_maps_only_public_c13_runtime_operations() -> None:
         flushed = await adapter.flush_run(receipt.run_id, request_id="flush-id")
         assert flushed.recording_complete
         await adapter.cancel_run(receipt.run_id, request_id="cancel-id")
-        await adapter.destroy_run(receipt.run_id, request_id="destroy-id")
+        await adapter.destroy_run(
+            receipt.run_id,
+            request_id="destroy-id",
+            force=True,
+        )
         _, recovery = await adapter.wait_for_recovery(
             before,
             run_ids=(receipt.run_id,),
@@ -213,12 +224,14 @@ def test_formal_adapter_maps_only_public_c13_runtime_operations() -> None:
         )
         assert recovery.recovered
         await adapter.shutdown(request_id="shutdown-id")
+        assert public.closed
         assert [item[0] for item in public.actions] == [
             "FlushRun",
             "CancelRun",
             "DestroyRun",
             "ShutdownController",
         ]
+        assert public.actions[2][3] is True
 
     asyncio.run(scenario())
 
@@ -241,6 +254,10 @@ def test_formal_adapter_maps_only_public_c13_runtime_operations() -> None:
 def test_shutdown_rpc_failure_still_reaps_managed_controller_process() -> None:
     class Client:
         calls = 0
+        closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
 
         async def shutdown_controller(self, **kwargs: object) -> dict[str, object]:
             del kwargs
@@ -282,6 +299,7 @@ def test_shutdown_rpc_failure_still_reaps_managed_controller_process() -> None:
 
         assert repeated is result
         assert client.calls == 1
+        assert client.closed == 1
         assert process.terminated and not process.killed
         assert result["cleanup_confirmed"] is False
         assert result["exit_code"] == -15

@@ -9,6 +9,10 @@ from ascend_maze.contracts.data import DataHandle
 from ascend_maze.contracts.errors import ErrorInfo
 from ascend_maze.contracts.resources import ResourceObservation
 from ascend_maze.core.identifiers import new_id
+from ascend_maze.inference.contracts import (
+    AttemptInferenceSummary,
+    InferenceRequestRecord,
+)
 
 
 class RuntimeEventKind(str, Enum):
@@ -17,6 +21,18 @@ class RuntimeEventKind(str, Enum):
     TASK_FAILED = "task_failed"
     DISPATCH_FAILED = "dispatch_failed"
     TASK_CANCELLED = "task_cancelled"
+    INFERENCE_REQUEST_STARTED = "inference_request_started"
+    INFERENCE_REQUEST_FINISHED = "inference_request_finished"
+
+
+TERMINAL_RUNTIME_EVENT_KINDS = frozenset(
+    {
+        RuntimeEventKind.TASK_RESULT,
+        RuntimeEventKind.TASK_FAILED,
+        RuntimeEventKind.DISPATCH_FAILED,
+        RuntimeEventKind.TASK_CANCELLED,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +52,9 @@ class RuntimeEvent:
     device_id: str | None = None
     binding_verified: bool = False
     resource_observation: ResourceObservation | None = None
+    inference_call_index: int | None = None
+    inference_request: InferenceRequestRecord | None = None
+    inference_summary: AttemptInferenceSummary | None = None
 
     @classmethod
     def create(
@@ -55,6 +74,9 @@ class RuntimeEvent:
         device_id: str | None = None,
         binding_verified: bool = False,
         resource_observation: ResourceObservation | None = None,
+        inference_call_index: int | None = None,
+        inference_request: InferenceRequestRecord | None = None,
+        inference_summary: AttemptInferenceSummary | None = None,
     ) -> "RuntimeEvent":
         return cls(
             event_id=new_id("event"),
@@ -72,4 +94,7 @@ class RuntimeEvent:
             device_id=device_id,
             binding_verified=binding_verified,
             resource_observation=resource_observation,
+            inference_call_index=inference_call_index,
+            inference_request=inference_request,
+            inference_summary=inference_summary,
         )

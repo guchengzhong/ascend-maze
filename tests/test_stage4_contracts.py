@@ -33,6 +33,7 @@ from ascend_maze.core.canonical import (
 )
 from ascend_maze.core.errors import ContractValidationError
 from ascend_maze.lifecycle import RunStatus
+from ascend_maze.inference import AttemptInferenceSummary, InferenceRequestRecord
 from ascend_maze.placement import (
     NodeCapacity,
     NodeObservation,
@@ -400,6 +401,50 @@ def test_resource_observation_survives_protobuf_boundary() -> None:
     )
     decoded = decode_runtime_event(encode_runtime_event(event))
     assert decoded == event
+
+
+def test_inference_lifecycle_survives_worker_rpc_protobuf_boundary() -> None:
+    record = InferenceRequestRecord(
+        route_lease_id="route_1",
+        call_index=1,
+        run_id="run",
+        task_id="task",
+        attempt=1,
+        model_id="model",
+        instance_id="instance",
+        instance_generation=1,
+        instance_placement_lease_id="model_placement",
+        started_at_ms=10,
+        duration_ms=5,
+        status="succeeded",
+        input_tokens=2,
+        output_tokens=3,
+        engine_queue_depth=None,
+        prefix_cache_hit=None,
+        ttft_ms=None,
+        error_code=None,
+    )
+    summary = AttemptInferenceSummary(
+        route_lease_id="route_1",
+        request_count=1,
+        request_inflight=False,
+        context_cleared=True,
+    )
+    event = RuntimeEvent.create(
+        kind=RuntimeEventKind.TASK_RESULT,
+        dispatch_id="dispatch",
+        run_id="run",
+        task_id="task",
+        attempt=1,
+        lease_id="lease",
+        route_lease_id="route_1",
+        occurred_at_ms=15,
+        inference_call_index=1,
+        inference_request=record,
+        inference_summary=summary,
+    )
+
+    assert decode_runtime_event(encode_runtime_event(event)) == event
 
 
 def test_scheduler_fails_impossible_npu_request_before_attempt() -> None:

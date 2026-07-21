@@ -60,7 +60,7 @@ class FakeBenchmarkRuntime(BenchmarkRuntimeClient):
         self.submit_calls: list[str] = []
         self.flush_calls: list[tuple[str, str]] = []
         self.cancel_calls: list[tuple[str, str]] = []
-        self.destroy_calls: list[tuple[str, str]] = []
+        self.destroy_calls: list[tuple[str, str, bool]] = []
         self.shutdown_calls: list[str] = []
         self.max_active_runs = 0
         self._lost_responses: set[str] = set()
@@ -174,11 +174,21 @@ class FakeBenchmarkRuntime(BenchmarkRuntimeClient):
         self.cancel_calls.append((run_id, request_id))
         self._run(run_id).cancelled = True
 
-    async def destroy_run(self, run_id: str, *, request_id: str) -> None:
+    async def destroy_run(
+        self,
+        run_id: str,
+        *,
+        request_id: str,
+        force: bool = False,
+    ) -> None:
         run = self._run(run_id)
-        self.destroy_calls.append((run_id, request_id))
-        if not run.flushed:
+        self.destroy_calls.append((run_id, request_id, force))
+        if not run.flushed and not force:
             raise ExperimentValidationError("fake Run must be flushed before destroy")
+        if not self.recording_complete and not force:
+            raise ExperimentValidationError(
+                "recording is incomplete; force is required"
+            )
         run.destroyed = True
 
     async def wait_for_recovery(

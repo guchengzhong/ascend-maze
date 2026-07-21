@@ -10,9 +10,11 @@ import pytest
 from ascend_maze.core.clock import ManualClock
 from ascend_maze.core.errors import StateTransitionError
 from ascend_maze.inference import (
+    AttemptInferenceSummary,
     ChatRequest,
     InMemoryPortLeaseManager,
     InferenceCallError,
+    InferenceRequestRecord,
     ModelInstanceState,
     ModelRouteLeaseStatus,
 )
@@ -144,6 +146,80 @@ def test_instance_route_and_sequential_request_lifecycle(tmp_path) -> None:
         assert inference.model_instances()[0].state is ModelInstanceState.STOPPED
         assert placement.active_lease_count() == 0
         assert adapter.stop_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_distributed_worker_request_lifecycle_updates_c11_authority(tmp_path) -> None:
+    async def scenario() -> None:
+        clock = ManualClock(monotonic_ms=100, wall_ms=1_000)
+        spec = make_spec(
+            tmp_path / "model",
+            scale_down_idle_ms=0,
+            scale_cooldown_ms=0,
+        )
+        inference, placement, _ = make_inference(spec, clock=clock)
+        placement.register_node(make_node())
+        inference.register_demand(
+            run_id="run_worker", task_id="task_worker", model_id=spec.model_id
+        )
+        await inference.reconcile()
+        await inference.replicas.wait_for_background()
+        acquired = await inference.acquire_route(
+            run_id="run_worker",
+            task_id="task_worker",
+            attempt=1,
+            model_id=spec.model_id,
+            session_key_hash=None,
+            dispatch_deadline_ms=200,
+        )
+        assert acquired.lease is not None
+        route = acquired.lease
+        config = inference.worker_config(route)
+        assert config.instance_placement_lease_id
+        assert inference.activate_route(route.route_lease_id)
+
+        inference.worker_request_started(
+            route,
+            call_index=1,
+            started_at_ms=110,
+        )
+        assert inference.model_instances()[0].actual_request_inflight == 1
+        record = InferenceRequestRecord(
+            route_lease_id=route.route_lease_id,
+            call_index=1,
+            run_id=route.run_id,
+            task_id=route.task_id,
+            attempt=route.attempt,
+            model_id=route.model_id,
+            instance_id=route.instance_id,
+            instance_generation=route.instance_generation,
+            instance_placement_lease_id=config.instance_placement_lease_id,
+            started_at_ms=109,
+            duration_ms=5,
+            status="succeeded",
+            input_tokens=2,
+            output_tokens=3,
+            engine_queue_depth=0,
+            prefix_cache_hit=False,
+            ttft_ms=1,
+            error_code=None,
+        )
+        inference.worker_request_finished(route, record)
+        assert inference.model_instances()[0].actual_request_inflight == 0
+        summary = AttemptInferenceSummary(
+            route.route_lease_id,
+            request_count=1,
+            request_inflight=False,
+            context_cleared=True,
+        )
+        inference.worker_attempt_finished(route, summary)
+        assert inference.attempt_summary(route.route_lease_id) == summary
+        assert inference.request_records(route.route_lease_id) == (record,)
+
+        assert await inference.release_route(route, reason="succeeded")
+        await inference.replicas.wait_for_background()
+        assert placement.active_lease_count() == 0
 
     asyncio.run(scenario())
 
@@ -493,7 +569,9 @@ def test_port_lease_is_node_scoped_atomic_and_released_after_stop(tmp_path) -> N
         )
 
         assert sorted(item.state.value for item in results) == ["ready", "stopped"]
-        failed = next(item for item in results if item.state is ModelInstanceState.STOPPED)
+        failed = next(
+            item for item in results if item.state is ModelInstanceState.STOPPED
+        )
         assert failed.failure_reason is not None
         assert "no service port is available" in failed.failure_reason
         assert ports.active_count() == 1
@@ -507,7 +585,9 @@ def test_port_lease_is_node_scoped_atomic_and_released_after_stop(tmp_path) -> N
     asyncio.run(scenario())
 
 
-def test_starting_is_not_ready_or_duplicated_and_stop_barrier_keeps_lease(tmp_path) -> None:
+def test_starting_is_not_ready_or_duplicated_and_stop_barrier_keeps_lease(
+    tmp_path,
+) -> None:
     async def scenario() -> None:
         spec = make_spec(
             tmp_path / "model",
@@ -649,9 +729,10 @@ def test_replica_controller_scales_in_bounded_steps_without_counting_starting_re
         assert states.count(ModelInstanceState.READY) == 1
         assert states.count(ModelInstanceState.STARTING) == 1
         await inference.replicas.wait_for_background()
-        assert [
-            instance.state for instance in inference.model_instances()
-        ] == [ModelInstanceState.READY, ModelInstanceState.READY]
+        assert [instance.state for instance in inference.model_instances()] == [
+            ModelInstanceState.READY,
+            ModelInstanceState.READY,
+        ]
         assert adapter.launch_count == 2
         await inference.close()
         assert placement.active_lease_count() == 0
@@ -718,10 +799,13 @@ def test_periodic_reconcile_retries_after_start_cooldown(tmp_path) -> None:
         assert inference.model_instances()[-1].state is ModelInstanceState.STOPPED
         adapter.set_plan(spec.model_id, FakeAdapterPlan())
 
-        while not any(
-            item.state is ModelInstanceState.READY
-            for item in inference.model_instances()
-        ) and time.monotonic() < deadline:
+        while (
+            not any(
+                item.state is ModelInstanceState.READY
+                for item in inference.model_instances()
+            )
+            and time.monotonic() < deadline
+        ):
             await asyncio.sleep(0.005)
         assert any(
             item.state is ModelInstanceState.READY
@@ -773,10 +857,13 @@ def test_periodic_reconcile_continues_after_one_runner_failure(
         )
 
         deadline = time.monotonic() + 1
-        while not any(
-            item.state is ModelInstanceState.READY
-            for item in inference.model_instances()
-        ) and time.monotonic() < deadline:
+        while (
+            not any(
+                item.state is ModelInstanceState.READY
+                for item in inference.model_instances()
+            )
+            and time.monotonic() < deadline
+        ):
             await asyncio.sleep(0.005)
 
         assert calls >= 2
@@ -808,10 +895,13 @@ def test_periodic_reconcile_does_not_hot_retry_pending_placement(tmp_path) -> No
         )
 
         deadline = time.monotonic() + 1
-        while not any(
-            event.event_type == "model_placement_pending"
-            for event in inference.events()
-        ) and time.monotonic() < deadline:
+        while (
+            not any(
+                event.event_type == "model_placement_pending"
+                for event in inference.events()
+            )
+            and time.monotonic() < deadline
+        ):
             await asyncio.sleep(0.005)
         first_count = sum(
             event.event_type == "model_placement_pending"
@@ -819,10 +909,13 @@ def test_periodic_reconcile_does_not_hot_retry_pending_placement(tmp_path) -> No
         )
         assert first_count == 1
         await asyncio.sleep(0.02)
-        assert sum(
-            event.event_type == "model_placement_pending"
-            for event in inference.events()
-        ) == first_count
+        assert (
+            sum(
+                event.event_type == "model_placement_pending"
+                for event in inference.events()
+            )
+            == first_count
+        )
 
         inference.replicas.remove_run("run_1")
         await inference.close()
@@ -851,20 +944,26 @@ def test_periodic_reconcile_does_not_hot_retry_blocked_cleanup(tmp_path) -> None
         )
 
         deadline = time.monotonic() + 1
-        while not any(
-            item.state is ModelInstanceState.READY
-            for item in inference.model_instances()
-        ) and time.monotonic() < deadline:
+        while (
+            not any(
+                item.state is ModelInstanceState.READY
+                for item in inference.model_instances()
+            )
+            and time.monotonic() < deadline
+        ):
             await asyncio.sleep(0.005)
         adapter.set_plan(
             spec.model_id,
             FakeAdapterPlan(stop_hbm_recovered=False),
         )
         assert inference.replicas.remove_run("run_1") == 1
-        while not any(
-            event.event_type == "model_resource_release_blocked"
-            for event in inference.events()
-        ) and time.monotonic() < deadline:
+        while (
+            not any(
+                event.event_type == "model_resource_release_blocked"
+                for event in inference.events()
+            )
+            and time.monotonic() < deadline
+        ):
             await asyncio.sleep(0.005)
         first_count = sum(
             event.event_type == "model_resource_release_blocked"
@@ -872,10 +971,13 @@ def test_periodic_reconcile_does_not_hot_retry_blocked_cleanup(tmp_path) -> None
         )
         assert first_count == 1
         await asyncio.sleep(0.02)
-        assert sum(
-            event.event_type == "model_resource_release_blocked"
-            for event in inference.events()
-        ) == first_count
+        assert (
+            sum(
+                event.event_type == "model_resource_release_blocked"
+                for event in inference.events()
+            )
+            == first_count
+        )
 
         adapter.set_plan(spec.model_id, FakeAdapterPlan())
         await inference.close()
@@ -903,17 +1005,23 @@ def test_periodic_reconcile_stops_idle_replica_without_new_events(tmp_path) -> N
         )
 
         deadline = time.monotonic() + 1
-        while not any(
-            item.state is ModelInstanceState.READY
-            for item in inference.model_instances()
-        ) and time.monotonic() < deadline:
+        while (
+            not any(
+                item.state is ModelInstanceState.READY
+                for item in inference.model_instances()
+            )
+            and time.monotonic() < deadline
+        ):
             await asyncio.sleep(0.005)
         assert inference.replicas.remove_run("run_1") == 1
 
-        while not any(
-            item.state is ModelInstanceState.STOPPED
-            for item in inference.model_instances()
-        ) and time.monotonic() < deadline:
+        while (
+            not any(
+                item.state is ModelInstanceState.STOPPED
+                for item in inference.model_instances()
+            )
+            and time.monotonic() < deadline
+        ):
             await asyncio.sleep(0.005)
         assert inference.model_instances()[-1].state is ModelInstanceState.STOPPED
         assert inference.instances.port_leases.active_count() == 0
@@ -953,7 +1061,9 @@ def test_scale_down_prefers_instance_without_affinity_mapping(tmp_path) -> None:
         await inference.replicas.wait_for_background()
         await inference.reconcile()
         await inference.replicas.wait_for_background()
-        assert len(inference.instances.ready_instances(spec.model_id, "catalog_v1")) == 2
+        assert (
+            len(inference.instances.ready_instances(spec.model_id, "catalog_v1")) == 2
+        )
 
         acquired = await inference.acquire_route(
             run_id="run_1",
@@ -981,18 +1091,17 @@ def test_scale_down_prefers_instance_without_affinity_mapping(tmp_path) -> None:
         clock.advance(10)
         inference.instances.reserve_route(other.instance_id, other.generation)
         inference.instances.release_route(other.instance_id, other.generation)
-        assert other.last_used_at_ms < inference.instances.snapshot(
-            other.instance_id
-        ).last_used_at_ms
+        assert (
+            other.last_used_at_ms
+            < inference.instances.snapshot(other.instance_id).last_used_at_ms
+        )
         assert inference.replicas.remove_demand(
             run_id="run_1", task_id="task_1", model_id=spec.model_id
         )
 
         await inference.reconcile()
         await inference.replicas.wait_for_background()
-        states = {
-            item.instance_id: item.state for item in inference.model_instances()
-        }
+        states = {item.instance_id: item.state for item in inference.model_instances()}
         assert states[sticky.instance_id] is ModelInstanceState.READY
         assert states[other.instance_id] is ModelInstanceState.STOPPED
 
@@ -1060,9 +1169,7 @@ def test_draining_waits_for_route_occupancy_and_actual_request_inflight(
         future.result(timeout=1)
 
     no_inflight = asyncio.run(
-        inference.instances.stop_if_drained(
-            instance.instance_id, instance.generation
-        )
+        inference.instances.stop_if_drained(instance.instance_id, instance.generation)
     )
     assert no_inflight.state is ModelInstanceState.DRAINING
     assert no_inflight.route_occupancy == 1
@@ -1075,9 +1182,7 @@ def test_draining_waits_for_route_occupancy_and_actual_request_inflight(
         reason="done",
     )
     stopped = asyncio.run(
-        inference.instances.stop_if_drained(
-            instance.instance_id, instance.generation
-        )
+        inference.instances.stop_if_drained(instance.instance_id, instance.generation)
     )
     assert stopped.state is ModelInstanceState.STOPPED
     assert placement.active_lease_count() == 0
@@ -1105,11 +1210,14 @@ def test_instance_invalidation_is_generation_exact_and_releases_route_capacity(
         )
         assert result.lease is not None
         route = result.lease
-        assert inference.router.invalidate_instance(
-            route.instance_id,
-            route.instance_generation + 1,
-            reason="stale",
-        ) == ()
+        assert (
+            inference.router.invalidate_instance(
+                route.instance_id,
+                route.instance_generation + 1,
+                reason="stale",
+            )
+            == ()
+        )
         assert inference.model_instances()[0].route_occupancy == 1
         assert inference.router.invalidate_instance(
             route.instance_id,
@@ -1206,13 +1314,16 @@ def test_ready_process_failure_defers_inflight_route_release_and_reports_timeout
     )
     assert inference.model_instances()[0].route_occupancy == 0
     assert inference.model_instances()[0].actual_request_inflight == 0
-    assert len(
-        [
-            event
-            for event in inference.events()
-            if event.event_type == "model_drain_timed_out"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                event
+                for event in inference.events()
+                if event.event_type == "model_drain_timed_out"
+            ]
+        )
+        == 1
+    )
     inference.replicas.remove_run("run_1")
 
     async def reconcile_and_wait() -> None:
@@ -1236,17 +1347,23 @@ def test_node_generation_loss_is_exact_and_cleans_ready_instance(tmp_path) -> No
         await inference.reconcile()
         await inference.replicas.wait_for_background()
         instance = inference.model_instances()[0]
-        assert inference.report_node_generation_lost(
-            instance.node_id or "",
-            "stale_boot",
-        ) == ()
+        assert (
+            inference.report_node_generation_lost(
+                instance.node_id or "",
+                "stale_boot",
+            )
+            == ()
+        )
         assert inference.model_instances()[0].state is ModelInstanceState.READY
 
         adapter.crash_instance(instance.instance_id, instance.generation)
-        assert inference.report_node_generation_lost(
-            instance.node_id or "",
-            instance.boot_id or "",
-        ) == ()
+        assert (
+            inference.report_node_generation_lost(
+                instance.node_id or "",
+                instance.boot_id or "",
+            )
+            == ()
+        )
         assert inference.model_instances()[0].state is ModelInstanceState.FAILED
         inference.replicas.remove_run("run_1")
         await inference.reconcile()

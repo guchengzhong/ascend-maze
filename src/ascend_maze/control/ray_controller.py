@@ -190,6 +190,7 @@ class RayHostController(InMemoryController):
             environment_fingerprint=environment_fingerprint,
             authorization_token=authorization_token,
             recording_error_sink=effective_recorder.record_writer_error,
+            inference=inference,
         )
         super().__init__(
             config_fingerprint=config_fingerprint,
@@ -226,9 +227,7 @@ class RayHostController(InMemoryController):
             recovered_checkpoint.controller_generation
             if recovered_checkpoint is not None
             else (
-                None
-                if recovery_claim is None
-                else recovery_claim.previous_generation
+                None if recovery_claim is None else recovery_claim.previous_generation
             )
         )
         self._old_code_registry_released = False
@@ -270,7 +269,9 @@ class RayHostController(InMemoryController):
         self._recovery_tasks: dict[str, asyncio.Task[None]] = {}
         active_recovery_nodes = {
             item.lease.node_id
-            for item in (() if recovered_checkpoint is None else recovered_checkpoint.leases)
+            for item in (
+                () if recovered_checkpoint is None else recovered_checkpoint.leases
+            )
             if item.status in {LeaseStatus.RESERVED, LeaseStatus.BOUND}
         }
         if recovered_checkpoint is not None:
@@ -473,12 +474,15 @@ class RayHostController(InMemoryController):
             RuntimeNodeStatus.DRAINED,
         }:
             raise StateTransitionError("NodeAgent disconnected during drain")
-        if not self.node_registry.set_status(
-            node_id,
-            RuntimeNodeStatus.DRAINED,
-            boot_id=boot_id,
-            agent_generation=binding.agent_generation,
-        ) and self.node_registry.status(node_id) is not RuntimeNodeStatus.DRAINED:
+        if (
+            not self.node_registry.set_status(
+                node_id,
+                RuntimeNodeStatus.DRAINED,
+                boot_id=boot_id,
+                agent_generation=binding.agent_generation,
+            )
+            and self.node_registry.status(node_id) is not RuntimeNodeStatus.DRAINED
+        ):
             raise StateTransitionError("NodeAgent could not enter drained state")
         self._node_drain_states[node_id] = (boot_id, NodeStatus.DRAINED)
 
@@ -496,7 +500,9 @@ class RayHostController(InMemoryController):
         ):
             raise StateTransitionError("NodeAgent environment fingerprint changed")
         if node.capacity.npus and node.observation_sequence < 1:
-            raise StateTransitionError("current physical NPU observation is unavailable")
+            raise StateTransitionError(
+                "current physical NPU observation is unavailable"
+            )
         inventory = self._recovery_inventory.get(node_id)
         if inventory is None:
             raise StateTransitionError("current NodeAgent inventory is unavailable")
@@ -606,9 +612,7 @@ class RayHostController(InMemoryController):
                     },
                 )
             )
-        return tuple(
-            sorted(resources, key=lambda item: (item.kind, item.resource_id))
-        )
+        return tuple(sorted(resources, key=lambda item: (item.kind, item.resource_id)))
 
     def get_run_events(
         self,
@@ -717,7 +721,10 @@ class RayHostController(InMemoryController):
             ):
                 raise ValueError("NodeAgent capacity conflicts with configured node")
             return
-        if capacity.capabilities.get("environment_fingerprint") != self.environment_fingerprint:
+        if (
+            capacity.capabilities.get("environment_fingerprint")
+            != self.environment_fingerprint
+        ):
             raise ValueError("NodeAgent capacity environment fingerprint mismatch")
         self._node_capacities[capacity.node_id] = capacity
         self.placement.register_node(capacity, status=NodeStatus.JOINING)
@@ -761,9 +768,7 @@ class RayHostController(InMemoryController):
     ) -> None:
         self._recovery_inventory[binding.node_id] = inventory
         reported = inventory.reported_controller_generation
-        old_generation = (
-            reported is not None and reported != self.controller_generation
-        )
+        old_generation = reported is not None and reported != self.controller_generation
         recovery_active = (
             binding.node_id in self._recovery_pending_nodes or old_generation
         )

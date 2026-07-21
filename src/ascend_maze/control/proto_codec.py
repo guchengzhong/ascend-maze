@@ -15,6 +15,10 @@ from ascend_maze.core.canonical import (
 )
 from ascend_maze.core.errors import ContractValidationError
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
+from ascend_maze.inference.contracts import (
+    AttemptInferenceSummary,
+    InferenceRequestRecord,
+)
 
 from ascend_maze.control.proto import control_pb2 as _control_pb2
 
@@ -70,7 +74,9 @@ def decode_data_handle(message: Any) -> DataHandle:
     return DataHandle(
         owner_generation=str(message.owner_generation),
         staged_handle_id=str(message.staged_handle_id),
-        stable_digest=(str(message.stable_digest) if message.has_stable_digest else None),
+        stable_digest=(
+            str(message.stable_digest) if message.has_stable_digest else None
+        ),
         size_bytes=(int(message.size_bytes) if message.has_size_bytes else None),
         metadata=FrozenMap(tuple(metadata)),
     )
@@ -160,9 +166,7 @@ def encode_resource_observation(observation: ResourceObservation) -> Any:
         peak_npu_reserved_mb=observation.peak_npu_reserved_mb or 0,
         has_peak_npu_reserved_mb=observation.peak_npu_reserved_mb is not None,
         peak_npu_process_hbm_mb=observation.peak_npu_process_hbm_mb or 0,
-        has_peak_npu_process_hbm_mb=(
-            observation.peak_npu_process_hbm_mb is not None
-        ),
+        has_peak_npu_process_hbm_mb=(observation.peak_npu_process_hbm_mb is not None),
         npu_metric_source=observation.npu_metric_source or "",
         npu_metric_quality=observation.npu_metric_quality or "",
         error_type=observation.error_type or "",
@@ -195,9 +199,7 @@ def decode_resource_observation(message: Any) -> ResourceObservation:
         status=str(message.status),
         input_features=features,
         peak_host_rss_mb=(
-            int(message.peak_host_rss_mb)
-            if message.has_peak_host_rss_mb
-            else None
+            int(message.peak_host_rss_mb) if message.has_peak_host_rss_mb else None
         ),
         peak_npu_allocated_mb=(
             int(message.peak_npu_allocated_mb)
@@ -224,6 +226,7 @@ def decode_resource_observation(message: Any) -> ResourceObservation:
 
 
 def encode_runtime_event(event: RuntimeEvent) -> Any:
+    inference_payload = _encode_inference_payload(event)
     message = control_pb2.RuntimeEventMessage(
         event_id=event.event_id,
         kind=event.kind.value,
@@ -240,6 +243,9 @@ def encode_runtime_event(event: RuntimeEvent) -> Any:
         device_id=event.device_id or "",
         binding_verified=event.binding_verified,
         has_resource_observation=event.resource_observation is not None,
+        canonical_inference_payload=(
+            b"" if inference_payload is None else canonical_bytes(inference_payload)
+        ),
     )
     for name, handle in event.output_handles:
         message.output_handles.add(name=name, handle=encode_data_handle(handle))
@@ -259,6 +265,7 @@ def decode_runtime_event(message: Any) -> RuntimeEvent:
         raise ContractValidationError(
             f"unsupported runtime event kind: {message.kind}"
         ) from exc
+    inference = _decode_inference_payload(bytes(message.canonical_inference_payload))
     return RuntimeEvent(
         event_id=str(message.event_id),
         kind=kind,
@@ -282,4 +289,154 @@ def decode_runtime_event(message: Any) -> RuntimeEvent:
             if message.has_resource_observation
             else None
         ),
+        inference_call_index=inference[0],
+        inference_request=inference[1],
+        inference_summary=inference[2],
     )
+
+
+def _encode_inference_payload(event: RuntimeEvent) -> dict[str, object] | None:
+    payload: dict[str, object] = {}
+    if event.inference_call_index is not None:
+        payload["call_index"] = event.inference_call_index
+    if event.inference_request is not None:
+        record = event.inference_request
+        payload["request"] = {
+            "route_lease_id": record.route_lease_id,
+            "call_index": record.call_index,
+            "run_id": record.run_id,
+            "task_id": record.task_id,
+            "attempt": record.attempt,
+            "model_id": record.model_id,
+            "instance_id": record.instance_id,
+            "instance_generation": record.instance_generation,
+            "instance_placement_lease_id": record.instance_placement_lease_id,
+            "started_at_ms": record.started_at_ms,
+            "duration_ms": record.duration_ms,
+            "status": record.status,
+            "input_tokens": record.input_tokens,
+            "output_tokens": record.output_tokens,
+            "engine_queue_depth": record.engine_queue_depth,
+            "prefix_cache_hit": record.prefix_cache_hit,
+            "ttft_ms": record.ttft_ms,
+            "error_code": record.error_code,
+        }
+    if event.inference_summary is not None:
+        summary = event.inference_summary
+        payload["summary"] = {
+            "route_lease_id": summary.route_lease_id,
+            "request_count": summary.request_count,
+            "request_inflight": summary.request_inflight,
+            "context_cleared": summary.context_cleared,
+        }
+    return payload or None
+
+
+def _decode_inference_payload(
+    payload: bytes,
+) -> tuple[int | None, InferenceRequestRecord | None, AttemptInferenceSummary | None]:
+    if not payload:
+        return None, None, None
+    decoded = decode_canonical_bytes(payload)
+    if not isinstance(decoded, FrozenMap):
+        raise ContractValidationError("Runtime inference payload must be a mapping")
+    call_index_value = decoded.get("call_index")
+    call_index = (
+        None
+        if call_index_value is None
+        else _required_int(call_index_value, "call_index")
+    )
+    request_value = decoded.get("request")
+    request = None
+    if request_value is not None:
+        request_map = _required_frozen_map(request_value, "request")
+        request = InferenceRequestRecord(
+            route_lease_id=_required_string(
+                request_map.get("route_lease_id"), "route_lease_id"
+            ),
+            call_index=_required_int(request_map.get("call_index"), "call_index"),
+            run_id=_required_string(request_map.get("run_id"), "run_id"),
+            task_id=_required_string(request_map.get("task_id"), "task_id"),
+            attempt=_required_int(request_map.get("attempt"), "attempt"),
+            model_id=_required_string(request_map.get("model_id"), "model_id"),
+            instance_id=_required_string(request_map.get("instance_id"), "instance_id"),
+            instance_generation=_required_int(
+                request_map.get("instance_generation"), "instance_generation"
+            ),
+            instance_placement_lease_id=_required_string(
+                request_map.get("instance_placement_lease_id"),
+                "instance_placement_lease_id",
+            ),
+            started_at_ms=_required_int(
+                request_map.get("started_at_ms"), "started_at_ms"
+            ),
+            duration_ms=_required_int(request_map.get("duration_ms"), "duration_ms"),
+            status=_required_string(request_map.get("status"), "status"),
+            input_tokens=_optional_int(request_map.get("input_tokens"), "input_tokens"),
+            output_tokens=_optional_int(
+                request_map.get("output_tokens"), "output_tokens"
+            ),
+            engine_queue_depth=_optional_int(
+                request_map.get("engine_queue_depth"), "engine_queue_depth"
+            ),
+            prefix_cache_hit=_optional_bool(
+                request_map.get("prefix_cache_hit"), "prefix_cache_hit"
+            ),
+            ttft_ms=_optional_int(request_map.get("ttft_ms"), "ttft_ms"),
+            error_code=_optional_string(request_map.get("error_code"), "error_code"),
+        )
+    summary_value = decoded.get("summary")
+    summary = None
+    if summary_value is not None:
+        summary_map = _required_frozen_map(summary_value, "summary")
+        summary = AttemptInferenceSummary(
+            route_lease_id=_required_string(
+                summary_map.get("route_lease_id"), "route_lease_id"
+            ),
+            request_count=_required_int(
+                summary_map.get("request_count"), "request_count"
+            ),
+            request_inflight=_required_bool(
+                summary_map.get("request_inflight"), "request_inflight"
+            ),
+            context_cleared=_required_bool(
+                summary_map.get("context_cleared"), "context_cleared"
+            ),
+        )
+    return call_index, request, summary
+
+
+def _required_frozen_map(value: object, name: str) -> FrozenMap[Any, Any]:
+    if not isinstance(value, FrozenMap):
+        raise ContractValidationError(f"Runtime inference {name} must be a mapping")
+    return value
+
+
+def _required_string(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ContractValidationError(f"Runtime inference {name} must be a string")
+    return value
+
+
+def _optional_string(value: object, name: str) -> str | None:
+    return None if value is None else _required_string(value, name)
+
+
+def _required_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ContractValidationError(f"Runtime inference {name} must be an integer")
+    return value
+
+
+def _optional_int(value: object, name: str) -> int | None:
+    return None if value is None else _required_int(value, name)
+
+
+def _required_bool(value: object, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ContractValidationError(f"Runtime inference {name} must be a boolean")
+    return value
+
+
+def _optional_bool(value: object, name: str) -> bool | None:
+    return None if value is None else _required_bool(value, name)

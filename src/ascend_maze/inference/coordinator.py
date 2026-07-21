@@ -16,6 +16,7 @@ from ascend_maze.inference.context import AttemptInferenceSession
 from ascend_maze.inference.contracts import (
     AttemptInferenceSummary,
     InferenceRequestRecord,
+    InferenceWorkerConfig,
     ModelControlEvent,
     ModelInstance,
     ModelInstanceState,
@@ -49,11 +50,12 @@ class InferenceCoordinator:
         self._events: list[ModelControlEvent] = []
         self._request_records: dict[str, list[InferenceRequestRecord]] = {}
         self._sessions: dict[str, AttemptInferenceSession] = {}
+        self._worker_configs: dict[str, InferenceWorkerConfig] = {}
+        self._worker_request_started: dict[str, tuple[int, int]] = {}
+        self._worker_summaries: dict[str, AttemptInferenceSummary] = {}
         self._capacity_sink: Callable[[str, str | None], object] | None = None
         self._state_change_sink: Callable[[], object] | None = None
-        self._route_failure_sink: (
-            Callable[[ModelRouteLease, str], object] | None
-        ) = None
+        self._route_failure_sink: Callable[[ModelRouteLease, str], object] | None = None
         self._lock = RLock()
         self._model_changed = asyncio.Event()
         self.instances = ModelInstanceManager(
@@ -190,9 +192,7 @@ class InferenceCoordinator:
     def validate_workflow(self, compiled: CompiledWorkflow) -> None:
         self.catalog.validate_workflow(compiled)
 
-    def register_demand(
-        self, *, run_id: str, task_id: str, model_id: str
-    ) -> None:
+    def register_demand(self, *, run_id: str, task_id: str, model_id: str) -> None:
         self.replicas.register_demand(
             run_id=run_id,
             task_id=task_id,
@@ -275,9 +275,7 @@ class InferenceCoordinator:
             reason=reason,
         )
 
-    def create_attempt_session(
-        self, lease: ModelRouteLease
-    ) -> AttemptInferenceSession:
+    def create_attempt_session(self, lease: ModelRouteLease) -> AttemptInferenceSession:
         with self._lock:
             existing = self._sessions.get(lease.route_lease_id)
             if existing is not None:
@@ -300,12 +298,162 @@ class InferenceCoordinator:
             self._sessions[lease.route_lease_id] = session
             return session
 
-    def attempt_summary(
-        self, route_lease_id: str
-    ) -> AttemptInferenceSummary | None:
+    def worker_config(self, lease: ModelRouteLease) -> InferenceWorkerConfig:
+        snapshot = self.router.snapshot(lease.route_lease_id)
+        if snapshot.lease != lease:
+            raise RuntimeError("ModelRouteLease payload does not match C11 authority")
+        instance = self.instances.snapshot(lease.instance_id)
+        if (
+            instance.generation != lease.instance_generation
+            or instance.placement_lease_id is None
+        ):
+            raise RuntimeError("ModelRouteLease instance resources are stale")
+        adapter = self.catalog.adapter(lease.model_id)
+        config = adapter.worker_config(
+            self.catalog.get(lease.model_id),
+            instance_placement_lease_id=instance.placement_lease_id,
+        )
+        if config.adapter_name != lease.adapter_name:
+            raise RuntimeError("Worker adapter does not match ModelRouteLease")
+        with self._lock:
+            existing = self._worker_configs.get(lease.route_lease_id)
+            if existing is not None and existing != config:
+                raise RuntimeError("Worker inference config changed within an Attempt")
+            self._worker_configs[lease.route_lease_id] = config
+        return config
+
+    def worker_request_started(
+        self,
+        lease: ModelRouteLease,
+        *,
+        call_index: int,
+        started_at_ms: int,
+    ) -> None:
+        if call_index < 1 or started_at_ms < 0:
+            raise RuntimeError("Worker inference request identity is invalid")
+        self._require_worker_route(lease)
+        with self._lock:
+            route_id = lease.route_lease_id
+            if route_id in self._worker_request_started:
+                raise RuntimeError("Worker route already has a request inflight")
+            expected = len(self._request_records.get(route_id, ())) + 1
+            if call_index != expected:
+                raise RuntimeError("Worker inference call_index is not monotonic")
+            self.router.request_started(route_id)
+            self._worker_request_started[route_id] = (call_index, started_at_ms)
+
+    def worker_request_finished(
+        self,
+        lease: ModelRouteLease,
+        record: InferenceRequestRecord,
+    ) -> None:
+        self._require_worker_route(lease)
+        route_id = lease.route_lease_id
+        if (
+            record.route_lease_id != route_id
+            or record.run_id != lease.run_id
+            or record.task_id != lease.task_id
+            or record.attempt != lease.attempt
+            or record.model_id != lease.model_id
+            or record.instance_id != lease.instance_id
+            or record.instance_generation != lease.instance_generation
+        ):
+            raise RuntimeError("Worker InferenceRequestRecord identity is stale")
+        with self._lock:
+            started = self._worker_request_started.get(route_id)
+            if started is None or started[0] != record.call_index:
+                raise RuntimeError("Worker inference finish does not match its start")
+            config = self._worker_configs.get(route_id)
+            if (
+                config is None
+                or record.instance_placement_lease_id
+                != config.instance_placement_lease_id
+            ):
+                raise RuntimeError("Worker inference instance Placement is stale")
+            self.router.request_finished(route_id)
+            del self._worker_request_started[route_id]
+            self._request_records.setdefault(route_id, []).append(record)
+
+    def worker_attempt_finished(
+        self,
+        lease: ModelRouteLease,
+        summary: AttemptInferenceSummary,
+    ) -> None:
+        self._require_worker_route(lease)
+        route_id = lease.route_lease_id
+        with self._lock:
+            if summary.route_lease_id != route_id:
+                raise RuntimeError("Worker inference summary route is stale")
+            if route_id in self._worker_request_started or summary.request_inflight:
+                raise RuntimeError("Worker inference request remained inflight")
+            records = self._request_records.get(route_id, ())
+            if summary.request_count != len(records):
+                raise RuntimeError("Worker inference summary count is incomplete")
+            if not summary.context_cleared:
+                raise RuntimeError("Worker inference context was not cleared")
+            existing = self._worker_summaries.get(route_id)
+            if existing is not None and existing != summary:
+                raise RuntimeError("Worker inference summary payload conflict")
+            self._worker_summaries[route_id] = summary
+
+    def abort_worker_attempt(
+        self,
+        lease: ModelRouteLease,
+        *,
+        error_code: str,
+    ) -> AttemptInferenceSummary:
+        route_id = lease.route_lease_id
+        with self._lock:
+            active = self._worker_request_started.pop(route_id, None)
+            if active is not None:
+                call_index, started_at_ms = active
+                try:
+                    self.router.request_finished(route_id)
+                except Exception:
+                    pass
+                config = self._worker_configs.get(route_id)
+                if config is not None:
+                    self._request_records.setdefault(route_id, []).append(
+                        InferenceRequestRecord(
+                            route_lease_id=route_id,
+                            call_index=call_index,
+                            run_id=lease.run_id,
+                            task_id=lease.task_id,
+                            attempt=lease.attempt,
+                            model_id=lease.model_id,
+                            instance_id=lease.instance_id,
+                            instance_generation=lease.instance_generation,
+                            instance_placement_lease_id=(
+                                config.instance_placement_lease_id
+                            ),
+                            started_at_ms=started_at_ms,
+                            duration_ms=max(
+                                0, self.clock.monotonic_ms() - started_at_ms
+                            ),
+                            status="failed",
+                            input_tokens=None,
+                            output_tokens=None,
+                            engine_queue_depth=None,
+                            prefix_cache_hit=None,
+                            ttft_ms=None,
+                            error_code=error_code,
+                        )
+                    )
+            summary = AttemptInferenceSummary(
+                route_lease_id=route_id,
+                request_count=len(self._request_records.get(route_id, ())),
+                request_inflight=False,
+                context_cleared=True,
+            )
+            self._worker_summaries[route_id] = summary
+            return summary
+
+    def attempt_summary(self, route_lease_id: str) -> AttemptInferenceSummary | None:
         with self._lock:
             session = self._sessions.get(route_lease_id)
-            return None if session is None else session.summary()
+            if session is not None:
+                return session.summary()
+            return self._worker_summaries.get(route_lease_id)
 
     def request_records(
         self, route_lease_id: str | None = None
@@ -439,16 +587,35 @@ class InferenceCoordinator:
             }
             route_ids.update(
                 route_id
+                for route_id in self._worker_configs
+                if self.router.snapshot(route_id).lease.run_id == run_id
+            )
+            route_ids.update(
+                route_id
+                for route_id in self._worker_summaries
+                if self.router.snapshot(route_id).lease.run_id == run_id
+            )
+            route_ids.update(
+                route_id
                 for route_id, records in self._request_records.items()
                 if records and records[0].run_id == run_id
             )
             for route_id in route_ids:
                 self._sessions.pop(route_id, None)
+                self._worker_configs.pop(route_id, None)
+                self._worker_request_started.pop(route_id, None)
+                self._worker_summaries.pop(route_id, None)
                 self._request_records.pop(route_id, None)
-            self._events = [
-                event for event in self._events if event.run_id != run_id
-            ]
+            self._events = [event for event in self._events if event.run_id != run_id]
         return self.router.destroy_run(run_id)
+
+    def _require_worker_route(self, lease: ModelRouteLease) -> None:
+        snapshot = self.router.snapshot(lease.route_lease_id)
+        if snapshot.lease != lease:
+            raise RuntimeError("Worker ModelRouteLease payload is stale")
+        with self._lock:
+            if lease.route_lease_id not in self._worker_configs:
+                raise RuntimeError("Worker inference config is not registered")
 
     def _record_event(self, event: ModelControlEvent) -> None:
         with self._lock:

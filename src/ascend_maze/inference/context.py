@@ -6,7 +6,7 @@ import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from threading import RLock
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Protocol
 
 from ascend_maze.contracts.runtime import ModelRouteLease
 from ascend_maze.core.clock import Clock, SystemClock
@@ -15,11 +15,23 @@ from ascend_maze.inference.contracts import (
     ChatRequest,
     ChatResponse,
     InferenceCallError,
-    InferenceEngineAdapter,
     InferenceRequestRecord,
     ModelRouteContext,
 )
-from ascend_maze.inference.router import InferenceRouter
+
+
+class InferenceRequestLifecycle(Protocol):
+    def request_started(self, route_lease_id: str) -> object: ...
+
+    def request_finished(self, route_lease_id: str) -> None: ...
+
+
+class InferenceChatAdapter(Protocol):
+    async def invoke_chat(
+        self,
+        context: ModelRouteContext,
+        request: ChatRequest,
+    ) -> ChatResponse: ...
 
 
 class AttemptInferenceSession:
@@ -27,8 +39,8 @@ class AttemptInferenceSession:
         self,
         *,
         lease: ModelRouteLease,
-        router: InferenceRouter,
-        adapter: InferenceEngineAdapter,
+        router: InferenceRequestLifecycle,
+        adapter: InferenceChatAdapter,
         instance_placement_lease_id: str,
         record_sink: Callable[[InferenceRequestRecord], None],
         clock: Clock | None = None,

@@ -112,6 +112,7 @@ message RuntimeEventMessage {
   bool binding_verified = 16;
   ResourceObservationMessage resource_observation = 17;
   bool has_resource_observation = 18;
+  bytes canonical_inference_payload = 19;
 }
 
 message RegisterNode {

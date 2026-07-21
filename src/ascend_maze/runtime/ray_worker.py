@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import importlib
 import os
@@ -17,6 +18,7 @@ import ray
 from ascend_maze.contracts.data import DataHandle
 from ascend_maze.contracts.errors import ErrorInfo
 from ascend_maze.contracts.resources import (
+    ExecutionTarget,
     PlacementLease,
     ResourceObservation,
     ResourceSpec,
@@ -36,6 +38,14 @@ from ascend_maze.contracts.worker import (
 from ascend_maze.core.canonical import FrozenMap
 from ascend_maze.core.time import monotonic_time_ms
 from ascend_maze.data.ray_store import RayDataStore, RayDataStoreDescriptor
+from ascend_maze.inference.context import AttemptInferenceSession, install_route_session
+from ascend_maze.inference.contracts import (
+    AttemptInferenceSummary,
+    InferenceCallError,
+    InferenceRequestRecord,
+    InferenceWorkerConfig,
+)
+from ascend_maze.inference.worker_client import create_worker_inference_client
 from ascend_maze.runtime.code_loader import load_code_package
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 from ascend_maze.ascend.torch_runtime import (
@@ -65,6 +75,89 @@ class RayWorkerOutcome:
     binding_verified: bool = False
     reuse_safe: bool = False
     cleanup_reason: str | None = None
+
+
+class _WorkerRouteReporter:
+    def __init__(
+        self,
+        *,
+        request: ExecutionRequest,
+        placement_lease: PlacementLease,
+        binding: RuntimeNodeBinding,
+        agent_identity: NodeAgentIdentity,
+        controller_generation: str,
+        event_timeout_seconds: float,
+    ) -> None:
+        self.request = request
+        self.placement_lease = placement_lease
+        self.binding = binding
+        self.agent_identity = agent_identity
+        self.controller_generation = controller_generation
+        self.event_timeout_seconds = event_timeout_seconds
+        self._call_index = 0
+
+    def request_started(self, route_lease_id: str) -> object:
+        self._validate_route(route_lease_id)
+        self._call_index += 1
+        self._report(
+            RuntimeEvent.create(
+                kind=RuntimeEventKind.INFERENCE_REQUEST_STARTED,
+                dispatch_id=self.request.dispatch_id,
+                run_id=self.request.run_id,
+                task_id=self.request.task_id,
+                attempt=self.request.attempt,
+                lease_id=self.placement_lease.lease_id,
+                route_lease_id=route_lease_id,
+                occurred_at_ms=monotonic_time_ms(),
+                worker_pid=os.getpid(),
+                inference_call_index=self._call_index,
+            )
+        )
+        assert self.request.model_route is not None
+        return self.request.model_route
+
+    def request_finished(self, route_lease_id: str) -> None:
+        self._validate_route(route_lease_id)
+
+    def record(self, record: InferenceRequestRecord) -> None:
+        self._validate_route(record.route_lease_id)
+        if record.call_index != self._call_index:
+            raise RuntimeError("Worker inference record call_index mismatch")
+        self._report(
+            RuntimeEvent.create(
+                kind=RuntimeEventKind.INFERENCE_REQUEST_FINISHED,
+                dispatch_id=self.request.dispatch_id,
+                run_id=self.request.run_id,
+                task_id=self.request.task_id,
+                attempt=self.request.attempt,
+                lease_id=self.placement_lease.lease_id,
+                route_lease_id=record.route_lease_id,
+                occurred_at_ms=monotonic_time_ms(),
+                worker_pid=os.getpid(),
+                inference_request=record,
+            )
+        )
+
+    def _validate_route(self, route_lease_id: str) -> None:
+        route = self.request.model_route
+        if route is None or route.route_lease_id != route_lease_id:
+            raise RuntimeError("Worker inference route identity mismatch")
+
+    def _report(self, event: RuntimeEvent) -> None:
+        try:
+            report_worker_event(
+                endpoint=self.binding.agent_endpoint,
+                identity=self.agent_identity,
+                controller_generation=self.controller_generation,
+                runtime_generation=self.binding.runtime_generation,
+                event=event,
+                timeout_seconds=self.event_timeout_seconds,
+            )
+        except Exception as exc:
+            raise InferenceCallError(
+                "model_route_reporting_failed",
+                f"NodeAgent rejected inference lifecycle event: {type(exc).__name__}: {exc}",
+            ) from exc
 
 
 def _current_rss_mb() -> int:
@@ -173,7 +266,9 @@ class _RayStandbyWorker:
                     sorted(
                         device.physical_device_id
                         for device in devices
-                        if any(process.pid == os.getpid() for process in device.processes)
+                        if any(
+                            process.pid == os.getpid() for process in device.processes
+                        )
                     )
                 )
                 npu_used_hbm_mb = tuple(
@@ -286,6 +381,7 @@ def _execute_one_shot(
     code_package_handle: DataHandle,
     event_timeout_seconds: float,
     device_binding: DeviceBinding | None,
+    inference_config: InferenceWorkerConfig | None,
 ) -> RayWorkerOutcome:
     worker_pid = os.getpid()
     ray_node_id = ray.get_runtime_context().get_node_id()
@@ -329,7 +425,11 @@ def _execute_one_shot(
         )
 
     npu_runtime: BoundTorchNpuRuntime | None = None
-    if request.task_kind == "npu":
+    local_npu = (
+        request.execution_target is ExecutionTarget.LOCAL_WORKER
+        and request.task_kind == "npu"
+    )
+    if local_npu:
         if device_binding is None:
             terminal = _failure_event(
                 request=request,
@@ -428,6 +528,73 @@ def _execute_one_shot(
             False,
         )
 
+    if request.execution_target is ExecutionTarget.MODEL_SERVICE and (
+        request.model_route is None
+        or inference_config is None
+        or request.model_route.adapter_name != inference_config.adapter_name
+    ):
+        terminal = _failure_event(
+            request=request,
+            lease=placement_lease,
+            worker_lease=worker_lease,
+            binding=binding,
+            kind=RuntimeEventKind.DISPATCH_FAILED,
+            error_code="model_route_invalidated",
+            category="model",
+            phase="dispatched",
+            message="service Worker did not receive a matching inference config",
+        )
+        delivered = _try_report(
+            binding.agent_endpoint,
+            agent_identity,
+            controller_generation,
+            binding.runtime_generation,
+            terminal,
+            event_timeout_seconds,
+        )
+        return RayWorkerOutcome(
+            request.dispatch_id,
+            ray_node_id,
+            worker_pid,
+            False,
+            terminal,
+            delivered,
+        )
+    if (
+        request.execution_target is ExecutionTarget.LOCAL_WORKER
+        and inference_config is not None
+    ):
+        terminal = _failure_event(
+            request=request,
+            lease=placement_lease,
+            worker_lease=worker_lease,
+            binding=binding,
+            kind=RuntimeEventKind.DISPATCH_FAILED,
+            error_code="model_protocol_failed",
+            category="model",
+            phase="dispatched",
+            message="local Worker unexpectedly received an inference config",
+            device_binding=device_binding,
+            npu_runtime=npu_runtime,
+        )
+        delivered = _try_report(
+            binding.agent_endpoint,
+            agent_identity,
+            controller_generation,
+            binding.runtime_generation,
+            terminal,
+            event_timeout_seconds,
+        )
+        return RayWorkerOutcome(
+            request.dispatch_id,
+            ray_node_id,
+            worker_pid,
+            False,
+            terminal,
+            delivered,
+            None if device_binding is None else device_binding.physical_device_id,
+            npu_runtime is not None,
+        )
     started = RuntimeEvent.create(
         kind=RuntimeEventKind.WORKER_STARTED,
         dispatch_id=request.dispatch_id,
@@ -435,7 +602,7 @@ def _execute_one_shot(
         task_id=request.task_id,
         attempt=request.attempt,
         lease_id=placement_lease.lease_id,
-        route_lease_id=None,
+        route_lease_id=_route_lease_id(request),
         occurred_at_ms=monotonic_time_ms(),
         worker_pid=worker_pid,
         device_id=(
@@ -485,6 +652,10 @@ def _execute_one_shot(
         code_package_handle=code_package_handle,
         device_binding=device_binding,
         npu_runtime=npu_runtime,
+        inference_config=inference_config,
+        agent_identity=agent_identity,
+        controller_generation=controller_generation,
+        event_timeout_seconds=event_timeout_seconds,
     )
     delivered = _try_report(
         binding.agent_endpoint,
@@ -516,6 +687,10 @@ def _run_user_code(
     code_package_handle: DataHandle,
     device_binding: DeviceBinding | None,
     npu_runtime: BoundTorchNpuRuntime | None,
+    inference_config: InferenceWorkerConfig | None,
+    agent_identity: NodeAgentIdentity,
+    controller_generation: str,
+    event_timeout_seconds: float,
 ) -> RuntimeEvent:
     try:
         package = store.get(code_package_handle)
@@ -550,15 +725,54 @@ def _run_user_code(
             device_binding=device_binding,
             npu_runtime=npu_runtime,
         )
+    inference_summary: AttemptInferenceSummary | None = None
+    inference_client: Any | None = None
+    session: AttemptInferenceSession | None = None
     try:
-        result = func(**kwargs)
+        if request.execution_target is ExecutionTarget.MODEL_SERVICE:
+            assert request.model_route is not None
+            assert inference_config is not None
+            reporter = _WorkerRouteReporter(
+                request=request,
+                placement_lease=placement_lease,
+                binding=binding,
+                agent_identity=agent_identity,
+                controller_generation=controller_generation,
+                event_timeout_seconds=event_timeout_seconds,
+            )
+            inference_client = create_worker_inference_client(inference_config)
+            session = AttemptInferenceSession(
+                lease=request.model_route,
+                router=reporter,
+                adapter=inference_client,
+                instance_placement_lease_id=(
+                    inference_config.instance_placement_lease_id
+                ),
+                record_sink=reporter.record,
+            )
+            with install_route_session(session):
+                result = func(**kwargs)
+            inference_summary = session.summary()
+        else:
+            result = func(**kwargs)
     except Exception as exc:
+        if session is not None:
+            inference_summary = session.summary()
+        if inference_client is not None:
+            try:
+                asyncio.run(inference_client.close())
+            except Exception:
+                pass
         oom_confidence = (
             None
             if npu_runtime is None
             else npu_runtime.oom_classification_confidence(exc)
         )
-        if oom_confidence is not None:
+        if isinstance(exc, InferenceCallError):
+            error_code = exc.error_code
+            category = "model"
+            confidence = "exact"
+        elif oom_confidence is not None:
             error_code = "npu_oom"
             category = "resource"
             confidence = oom_confidence
@@ -584,7 +798,27 @@ def _run_user_code(
             classification_confidence=confidence,
             device_binding=device_binding,
             npu_runtime=npu_runtime,
+            inference_summary=inference_summary,
         )
+    if inference_client is not None:
+        try:
+            asyncio.run(inference_client.close())
+        except Exception as exc:
+            return _failure_event(
+                request=request,
+                lease=placement_lease,
+                worker_lease=worker_lease,
+                binding=binding,
+                kind=RuntimeEventKind.TASK_FAILED,
+                error_code="model_client_cleanup_failed",
+                category="model",
+                phase="cleanup",
+                message=f"{type(exc).__name__}: {exc}",
+                exception=exc,
+                device_binding=device_binding,
+                npu_runtime=npu_runtime,
+                inference_summary=inference_summary,
+            )
     if npu_runtime is not None:
         try:
             npu_runtime.synchronize()
@@ -603,6 +837,7 @@ def _run_user_code(
                 classification_confidence="mapped",
                 device_binding=device_binding,
                 npu_runtime=npu_runtime,
+                inference_summary=inference_summary,
             )
     if not isinstance(result, dict) or tuple(sorted(result)) != tuple(
         sorted(request.expected_outputs)
@@ -619,6 +854,7 @@ def _run_user_code(
             message="Task returned keys that do not match its output contract",
             device_binding=device_binding,
             npu_runtime=npu_runtime,
+            inference_summary=inference_summary,
         )
     if npu_runtime is not None and contains_npu_tensor(result):
         return _failure_event(
@@ -633,6 +869,7 @@ def _run_user_code(
             message="NPU Tensor outputs must be moved to host memory before return",
             device_binding=device_binding,
             npu_runtime=npu_runtime,
+            inference_summary=inference_summary,
         )
     output_handles: list[tuple[str, DataHandle]] = []
     try:
@@ -664,6 +901,7 @@ def _run_user_code(
             exception=exc,
             device_binding=device_binding,
             npu_runtime=npu_runtime,
+            inference_summary=inference_summary,
         )
     observation = _resource_observation(
         request=request,
@@ -680,7 +918,7 @@ def _run_user_code(
         task_id=request.task_id,
         attempt=request.attempt,
         lease_id=placement_lease.lease_id,
-        route_lease_id=None,
+        route_lease_id=_route_lease_id(request),
         occurred_at_ms=monotonic_time_ms(),
         output_handles=tuple(output_handles),
         worker_pid=os.getpid(),
@@ -689,6 +927,7 @@ def _run_user_code(
         ),
         binding_verified=npu_runtime is not None,
         resource_observation=observation,
+        inference_summary=inference_summary,
     )
 
 
@@ -711,6 +950,7 @@ def _failure_event(
     classification_confidence: str = "exact",
     device_binding: DeviceBinding | None = None,
     npu_runtime: BoundTorchNpuRuntime | None = None,
+    inference_summary: AttemptInferenceSummary | None = None,
 ) -> RuntimeEvent:
     observation = _resource_observation(
         request=request,
@@ -735,9 +975,13 @@ def _failure_event(
         attempt=request.attempt,
         dispatch_id=request.dispatch_id,
         lease_id=lease.lease_id,
+        route_lease_id=_route_lease_id(request),
         node_id=binding.node_id,
         boot_id=binding.boot_id,
         worker_id=worker_lease.worker_id,
+        model_instance_id=(
+            None if request.model_route is None else request.model_route.instance_id
+        ),
         device_id=(
             None if device_binding is None else device_binding.physical_device_id
         ),
@@ -760,7 +1004,7 @@ def _failure_event(
         task_id=request.task_id,
         attempt=request.attempt,
         lease_id=lease.lease_id,
-        route_lease_id=None,
+        route_lease_id=_route_lease_id(request),
         occurred_at_ms=error.occurred_at_ms,
         error=error,
         worker_pid=os.getpid(),
@@ -769,7 +1013,12 @@ def _failure_event(
         ),
         binding_verified=npu_runtime is not None,
         resource_observation=observation,
+        inference_summary=inference_summary,
     )
+
+
+def _route_lease_id(request: ExecutionRequest) -> str | None:
+    return None if request.model_route is None else request.model_route.route_lease_id
 
 
 def _resource_observation(

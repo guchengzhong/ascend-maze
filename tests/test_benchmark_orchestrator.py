@@ -311,6 +311,39 @@ def test_commit_response_loss_replays_same_submission_without_second_run(
     asyncio.run(scenario())
 
 
+def test_recording_incomplete_is_preserved_and_force_destroyed(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        plan = load_study_plan(
+            _execution_spec(
+                tmp_path / "spec",
+                warmup_runs=0,
+                measurement_run_count=1,
+            )
+        )
+        trial = plan.trials[0]
+        cell = next(item for item in plan.cells if item.cell_id == trial.cell_id)
+        clock = VirtualBenchmarkClock()
+        runtime = FakeBenchmarkRuntime(clock, recording_complete=False)
+
+        state = await TrialOrchestrator(
+            runtime_factory=FakeBenchmarkRuntimeFactory(runtime),
+            clock=clock,
+        ).execute(
+            plan=plan,
+            cell=cell,
+            trial=trial,
+            paths=TrialPaths(tmp_path / "trial"),
+        )
+
+        assert state.state == "invalid"
+        assert "recording_incomplete" in state.invalid_reasons
+        assert runtime.destroy_calls
+        assert all(force for _, _, force in runtime.destroy_calls)
+        assert all(run.destroyed for run in runtime.runs_by_id.values())
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "stage",
     (

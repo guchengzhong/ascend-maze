@@ -159,7 +159,10 @@ class ModelSpec:
             not isinstance(self.required_capabilities, tuple)
             or tuple(sorted(set(self.required_capabilities)))
             != self.required_capabilities
-            or any(not isinstance(item, str) or not item for item in self.required_capabilities)
+            or any(
+                not isinstance(item, str) or not item
+                for item in self.required_capabilities
+            )
         ):
             raise ContractValidationError(
                 "required_capabilities must be sorted unique strings"
@@ -181,10 +184,7 @@ class ModelSpec:
         )
 
     def canonical_payload(self) -> dict[str, object]:
-        return {
-            name: getattr(self, name)
-            for name in self.__dataclass_fields__
-        }
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
 
 
 class ModelInstanceState(str, Enum):
@@ -334,6 +334,25 @@ class ModelRouteContext:
         ):
             _required_string(name, getattr(self, name))
         _positive_int("instance_generation", self.instance_generation)
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceWorkerConfig:
+    adapter_name: str
+    instance_placement_lease_id: str
+    request_timeout_ms: int
+    adapter_options: FrozenMap[CanonicalValue, CanonicalValue] = FrozenMap(())
+
+    def __post_init__(self) -> None:
+        _required_string("adapter_name", self.adapter_name)
+        _required_string(
+            "instance_placement_lease_id", self.instance_placement_lease_id
+        )
+        _positive_int("request_timeout_ms", self.request_timeout_ms)
+        frozen = freeze_canonical(self.adapter_options)
+        if not isinstance(frozen, FrozenMap):
+            raise ContractValidationError("adapter_options must be a mapping")
+        object.__setattr__(self, "adapter_options", frozen)
 
 
 @dataclass(frozen=True, slots=True)
@@ -529,7 +548,10 @@ class ServiceLaunchRequest:
         if (
             not isinstance(self.argv, tuple)
             or not self.argv
-            or any(not isinstance(item, str) or not item or "\0" in item for item in self.argv)
+            or any(
+                not isinstance(item, str) or not item or "\0" in item
+                for item in self.argv
+            )
         ):
             raise ContractValidationError("service argv must contain non-empty strings")
         if self.working_directory is not None:
@@ -661,9 +683,7 @@ class EngineMetrics:
 
     def __post_init__(self) -> None:
         _non_negative_int("queue_depth", self.queue_depth)
-        _non_negative_int(
-            "actual_request_inflight", self.actual_request_inflight
-        )
+        _non_negative_int("actual_request_inflight", self.actual_request_inflight)
 
 
 @dataclass(frozen=True, slots=True)
@@ -731,6 +751,13 @@ class InferenceEngineAdapter(Protocol):
 
     def validate_model_spec(self, spec: ModelSpec) -> None: ...
 
+    def worker_config(
+        self,
+        spec: ModelSpec,
+        *,
+        instance_placement_lease_id: str,
+    ) -> InferenceWorkerConfig: ...
+
     def build_launch_request(
         self,
         spec: ModelSpec,
@@ -740,9 +767,7 @@ class InferenceEngineAdapter(Protocol):
 
     async def probe(self, handle: ServiceHandle, spec: ModelSpec) -> EngineProbe: ...
 
-    async def warmup(
-        self, handle: ServiceHandle, spec: ModelSpec
-    ) -> WarmupResult: ...
+    async def warmup(self, handle: ServiceHandle, spec: ModelSpec) -> WarmupResult: ...
 
     async def invoke_chat(
         self,
@@ -750,9 +775,7 @@ class InferenceEngineAdapter(Protocol):
         request: ChatRequest,
     ) -> ChatResponse: ...
 
-    async def read_metrics(
-        self, handle: ServiceHandle
-    ) -> EngineMetrics: ...
+    async def read_metrics(self, handle: ServiceHandle) -> EngineMetrics: ...
 
 
 @runtime_checkable

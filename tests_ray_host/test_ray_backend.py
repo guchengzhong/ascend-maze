@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+from pathlib import Path
 from uuid import uuid4
 
 import ray
@@ -17,6 +18,13 @@ from ascend_maze.contracts.resources import (
 )
 from ascend_maze.contracts.runtime import ExecutionRequest, RuntimeArgument
 from ascend_maze.data.ray_store import RayDataStore
+from ascend_maze.inference import (
+    InferenceCoordinator,
+    ModelCatalog,
+    ModelSpec,
+)
+from ascend_maze.inference.adapters.fake import FakeInferenceEngineAdapter
+from ascend_maze.placement import NodeCapacity, NpuCapacity, PlacementManager
 from ascend_maze.recording import InMemoryRecorder
 from ascend_maze.runtime.events import RuntimeEventKind
 from ascend_maze.runtime.packaging import build_code_packages
@@ -192,6 +200,259 @@ def test_ray_backend_executes_one_shot_worker_on_hard_bound_node(
     asyncio.run(scenario())
 
 
+def test_ray_backend_executes_model_service_worker_without_device_binding(
+    ray_namespace: str,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        @task(task_kind="npu", resources={"cpu_num": 1, "mem": 64})
+        def service_chat(value: str) -> dict[str, object]:
+            from ascend_maze.inference import chat
+
+            first = chat([{"role": "user", "content": value}], max_tokens=8)
+            second = chat([{"role": "user", "content": first.text}], max_tokens=8)
+            return {"result": second.text}
+
+        generation = f"controller-{uuid4().hex}"
+        store = RayDataStore.start(
+            owner_generation=generation,
+            namespace=ray_namespace,
+        )
+        registry = RayNodeRegistry()
+        placement = PlacementManager()
+        capacity = NodeCapacity(
+            node_id="node_a",
+            boot_id="boot_1",
+            node_ip="127.0.0.1",
+            cpu_total=8,
+            mem_total_mb=8_192,
+            cpu_system_reserved=0,
+            mem_system_reserved_mb=0,
+            io_slots_total=4,
+            npus=(
+                NpuCapacity(
+                    device_id="0",
+                    chip_type="fake_npu",
+                    total_hbm_mb=8_192,
+                    system_reserved_hbm_mb=0,
+                    task_slots_total=1,
+                    observed_free_hbm_mb=8_192,
+                ),
+            ),
+            observed_free_mem_mb=8_192,
+            capabilities={"environment_fingerprint": ENVIRONMENT},
+        )
+        placement.register_node(capacity)
+        artifact = tmp_path / "model"
+        artifact.mkdir()
+        spec = ModelSpec(
+            model_id="ray_model",
+            catalog_revision="catalog_v1",
+            artifact_path=str(artifact),
+            tokenizer_path=None,
+            artifact_revision="artifact_v1",
+            backend="fake",
+            dtype="float16",
+            quantization=None,
+            tensor_parallel_size=1,
+            max_model_len=2_048,
+            instance_cpu_num=1,
+            instance_host_mem_mb=256,
+            weight_hbm_mb=512,
+            runtime_hbm_mb=128,
+            kv_cache_hbm_mb=128,
+            instance_hbm_mb=1_024,
+            npu_slots=1,
+            allow_colocation=False,
+            request_capacity=1,
+            required_capabilities=(),
+            environment_fingerprint=ENVIRONMENT,
+            launch_options={"response_prefix": "ray_model"},
+            warmup_request={"prompt": "warmup"},
+            min_replicas=0,
+            max_replicas=1,
+            target_route_utilization=1.0,
+            scale_up_pending_threshold=1,
+            scale_up_sustain_ms=0,
+            scale_down_idle_ms=0,
+            scale_cooldown_ms=0,
+            max_parallel_starts=1,
+            startup_timeout_ms=5_000,
+            drain_timeout_ms=5_000,
+        )
+        adapter = FakeInferenceEngineAdapter()
+        inference = InferenceCoordinator(
+            catalog=ModelCatalog(
+                (spec,),
+                adapters={"fake": adapter},
+                max_single_npu_hbm_mb=8_192,
+            ),
+            placement=placement,
+            service_backend=adapter,
+        )
+        broker = ColdWorkerBroker(
+            node_registry=registry,
+            environment_fingerprint=ENVIRONMENT,
+        )
+        events = []
+        backend = RayRuntimeBackend(
+            data_store=store,
+            node_registry=registry,
+            worker_broker=broker,
+            cluster_id="cluster_service",
+            owner_generation=generation,
+            environment_fingerprint=ENVIRONMENT,
+            event_sink=events.append,
+            inference=inference,
+        )
+        recorder = InMemoryRecorder()
+        controller_rpc = NodeControlServer(
+            cluster_id="cluster_service",
+            authorization_token=b"test-token",
+            controller_generation=generation,
+            environment_fingerprint=ENVIRONMENT,
+            registry=registry,
+            recorder=recorder,
+            event_sink=backend.post_node_event,
+            on_binding_replaced=backend.invalidate_binding,
+            on_binding_disconnected=backend.invalidate_binding,
+        )
+        controller_endpoint = await controller_rpc.start()
+        identity = NodeAgentIdentity(
+            cluster_id="cluster_service",
+            node_id="node_a",
+            boot_id="boot_1",
+            ray_node_id=ray.get_runtime_context().get_node_id(),
+            agent_generation="agent_service",
+            environment_fingerprint=ENVIRONMENT,
+            producer_id="node_agent:node_a:agent_service",
+        )
+        agent = NodeAgent(identity=identity, authorization_token=b"test-token")
+        await agent.start(controller_endpoint=controller_endpoint)
+        code_handles = ()
+        result_handle = None
+        route = None
+        try:
+            await backend.start()
+            workflow = Workflow("ray-model-service")
+            node = workflow.add_task(
+                service_chat,
+                inputs={"value": "unused"},
+                model_anchor={"model": spec.model_id, "mode": "service"},
+            )
+            compiled = workflow.compile()
+            code_handles = await backend.prepare(
+                build_code_packages(
+                    compiled,
+                    environment_fingerprint=ENVIRONMENT,
+                    callables_by_definition={
+                        compiled.tasks[node.task_id].definition_id: service_chat,
+                    },
+                )
+            )
+            inference.register_demand(
+                run_id="run_service",
+                task_id=node.task_id,
+                model_id=spec.model_id,
+            )
+            await inference.reconcile()
+            await inference.replicas.wait_for_background()
+            acquired = await inference.acquire_route(
+                run_id="run_service",
+                task_id=node.task_id,
+                attempt=1,
+                model_id=spec.model_id,
+                session_key_hash=None,
+                dispatch_deadline_ms=10**15,
+            )
+            assert acquired.lease is not None
+            route = acquired.lease
+            lease = PlacementLease(
+                lease_id="lease_service",
+                reservation_kind="model_request",
+                run_id="run_service",
+                task_id=node.task_id,
+                attempt=1,
+                node_id="node_a",
+                boot_id="boot_1",
+                npu_device_id=None,
+                resources=ReservationVector(1, 64, 0, 0, 0),
+                snapshot_version=1,
+                created_at_ms=1,
+                dispatch_deadline_ms=10**15,
+            )
+            request = ExecutionRequest(
+                dispatch_id="dispatch_service",
+                run_id="run_service",
+                task_id=node.task_id,
+                attempt=1,
+                task_kind="npu",
+                execution_target=ExecutionTarget.MODEL_SERVICE,
+                model_route=route,
+                code_handle=code_handles[0],
+                arguments=(RuntimeArgument("value", "literal", literal="hello"),),
+                expected_outputs=("result",),
+                timeout_ms=None,
+                environment_fingerprint=ENVIRONMENT,
+            )
+            dispatch = await backend.dispatch(request, lease)
+            assert dispatch.route_lease_id == route.route_lease_id
+            await asyncio.wait_for(backend.wait_idle(), timeout=15)
+            for _ in range(1_000):
+                if len(events) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            worker_outcome = backend.worker_outcome("dispatch_service")
+            assert [event.kind for event in events] == [
+                RuntimeEventKind.WORKER_STARTED,
+                RuntimeEventKind.TASK_RESULT,
+            ], (
+                tuple(
+                    (
+                        event.kind,
+                        None if event.error is None else event.error.error_code,
+                        None if event.error is None else event.error.message,
+                    )
+                    for event in events
+                ),
+                None
+                if worker_outcome is None
+                else (
+                    worker_outcome.terminal_event.kind,
+                    worker_outcome.terminal_event.inference_summary,
+                    None
+                    if worker_outcome.terminal_event.error is None
+                    else worker_outcome.terminal_event.error.error_code,
+                    None
+                    if worker_outcome.terminal_event.error is None
+                    else worker_outcome.terminal_event.error.message,
+                ),
+            )
+            assert all(event.device_id is None for event in events)
+            result_handle = events[-1].output_handles[0][1]
+            assert store.get(result_handle) == "ray_model:ray_model:hello"
+            records = inference.request_records(route.route_lease_id)
+            assert [record.call_index for record in records] == [1, 2]
+            assert all(record.status == "succeeded" for record in records)
+            assert inference.attempt_summary(route.route_lease_id).context_cleared
+            assert inference.model_instances()[0].actual_request_inflight == 0
+        finally:
+            if result_handle is not None:
+                store.release(result_handle)
+            if route is not None:
+                await inference.release_route(route, reason="test_complete")
+                await inference.replicas.wait_for_background()
+            if code_handles:
+                await backend.release_code(code_handles)
+            await backend.close()
+            await inference.close()
+            await agent.close(grace_seconds=0)
+            await controller_rpc.close(grace_seconds=0)
+            store.close(kill_owner=True)
+
+    asyncio.run(scenario())
+
+
 def test_hard_unavailable_ray_node_never_migrates_to_a_live_node(
     ray_namespace: str,
     ray_node_ids: tuple[str, str],
@@ -283,7 +544,8 @@ def test_hard_unavailable_ray_node_never_migrates_to_a_live_node(
             await asyncio.sleep(0.5)
             assert backend.worker_outcome(dispatch.dispatch_id) is None
             assert not any(
-                event.kind in {
+                event.kind
+                in {
                     RuntimeEventKind.WORKER_STARTED,
                     RuntimeEventKind.TASK_RESULT,
                 }

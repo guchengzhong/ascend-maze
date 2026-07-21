@@ -35,7 +35,11 @@ from ascend_maze.placement import (
     NpuCapacity,
     NpuObservation,
 )
-from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
+from ascend_maze.runtime.events import (
+    TERMINAL_RUNTIME_EVENT_KINDS,
+    RuntimeEvent,
+    RuntimeEventKind,
+)
 from ascend_maze.runtime.ray_node_registry import (
     RayNodeRegistry,
     RuntimeNodeStatus,
@@ -157,6 +161,39 @@ def _execution_event_from_runtime(
                 ("npu_metric_quality", observation.npu_metric_quality),
             )
         )
+    request = event.inference_request
+    if event.inference_call_index is not None:
+        payload_items.append(("call_index", event.inference_call_index))
+    if request is not None:
+        payload_items.extend(
+            (
+                ("call_index", request.call_index),
+                ("model_id", request.model_id),
+                ("instance_generation", request.instance_generation),
+                (
+                    "instance_placement_lease_id",
+                    request.instance_placement_lease_id,
+                ),
+                ("started_at_ms", request.started_at_ms),
+                ("duration_ms", request.duration_ms),
+                ("status", request.status),
+                ("input_tokens", request.input_tokens),
+                ("output_tokens", request.output_tokens),
+                ("engine_queue_depth", request.engine_queue_depth),
+                ("prefix_cache_hit", request.prefix_cache_hit),
+                ("ttft_ms", request.ttft_ms),
+                ("error_code", request.error_code),
+            )
+        )
+    summary = event.inference_summary
+    if summary is not None:
+        payload_items.extend(
+            (
+                ("request_count", summary.request_count),
+                ("request_inflight", summary.request_inflight),
+                ("context_cleared", summary.context_cleared),
+            )
+        )
     payload = freeze_canonical(dict(payload_items))
     if not isinstance(payload, FrozenMap):
         raise AssertionError("node event payload must be a mapping")
@@ -169,7 +206,7 @@ def _execution_event_from_runtime(
         attempt=event.attempt,
         lease_id=event.lease_id,
         route_lease_id=event.route_lease_id,
-        model_instance_id=None,
+        model_instance_id=None if request is None else request.instance_id,
         event_type=event.kind.value,
         producer_id=producer_id,
         producer_sequence=producer_sequence,
@@ -177,7 +214,7 @@ def _execution_event_from_runtime(
         device_id=event.device_id,
         monotonic_time_ms=event.occurred_at_ms,
         wall_time_ms=wall_time_ms,
-        duration_ms=None,
+        duration_ms=None if request is None else request.duration_ms,
         payload=payload,
     )
 
@@ -263,12 +300,8 @@ class _NodeControlServicer:
             npu_system_reserved_hbm_mb=(
                 self.owner.node_runtime_policy.npu_system_reserved_hbm_mb
             ),
-            npu_hbm_headroom_mb=(
-                self.owner.node_runtime_policy.npu_hbm_headroom_mb
-            ),
-            host_mem_headroom_mb=(
-                self.owner.node_runtime_policy.host_mem_headroom_mb
-            ),
+            npu_hbm_headroom_mb=(self.owner.node_runtime_policy.npu_hbm_headroom_mb),
+            host_mem_headroom_mb=(self.owner.node_runtime_policy.host_mem_headroom_mb),
             io_slots_total=self.owner.node_runtime_policy.io_slots_total,
             hbm_recovery_tolerance_mb=(
                 self.owner.node_runtime_policy.hbm_recovery_tolerance_mb
@@ -280,9 +313,7 @@ class _NodeControlServicer:
             recording_telemetry_queue_capacity=(
                 self.owner.node_runtime_policy.recording_telemetry_queue_capacity
             ),
-            recording_batch_size=(
-                self.owner.node_runtime_policy.recording_batch_size
-            ),
+            recording_batch_size=(self.owner.node_runtime_policy.recording_batch_size),
             recording_flush_interval_ms=(
                 self.owner.node_runtime_policy.recording_flush_interval_ms
             ),
@@ -302,10 +333,14 @@ class _NodeControlServicer:
         try:
             first = await anext(request_iterator)
         except StopAsyncIteration:
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "registration required")
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, "registration required"
+            )
             return
         if first.WhichOneof("body") != "register":
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "registration must be first")
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, "registration must be first"
+            )
             return
         registration = first.register
         try:
@@ -449,9 +484,8 @@ class NodeControlServer:
         capacity: NodeCapacity | None = None
         if registration.has_capacity:
             capacity = _decode_node_capacity(registration.capacity)
-            if (
-                capacity.node_id != str(meta.node_id)
-                or capacity.boot_id != str(meta.boot_id)
+            if capacity.node_id != str(meta.node_id) or capacity.boot_id != str(
+                meta.boot_id
             ):
                 raise ContractValidationError(
                     "NodeAgent capacity identity does not match registration"
@@ -462,8 +496,7 @@ class NodeControlServer:
             self.on_node_capacity(capacity)
         status = (
             RuntimeNodeStatus.HEALTHY
-            if str(registration.environment_fingerprint)
-            == self.environment_fingerprint
+            if str(registration.environment_fingerprint) == self.environment_fingerprint
             else RuntimeNodeStatus.UNSCHEDULABLE
         )
         binding, previous = self.registry.register(
@@ -483,9 +516,7 @@ class NodeControlServer:
                 binding,
                 NodeRecoveryInventory(
                     active_lease_ids=tuple(sorted(registration.active_lease_ids)),
-                    service_handle_ids=tuple(
-                        sorted(registration.service_handle_ids)
-                    ),
+                    service_handle_ids=tuple(sorted(registration.service_handle_ids)),
                     reported_controller_generation=(
                         str(registration.meta.controller_generation) or None
                     ),
@@ -556,9 +587,7 @@ class NodeControlServer:
                     binding,
                     NodeRecoveryInventory(
                         active_lease_ids=tuple(sorted(value.active_lease_ids)),
-                        service_handle_ids=tuple(
-                            sorted(value.service_handle_ids)
-                        ),
+                        service_handle_ids=tuple(sorted(value.service_handle_ids)),
                         reported_controller_generation=(
                             str(value.meta.controller_generation) or None
                         ),
@@ -692,7 +721,9 @@ class _ServiceProcessServicer:
             return _port_error(error[0], error[1])
         manager = self.owner.service_process_manager
         if manager is None:
-            return _port_error("service_process_disabled", "service process manager is disabled")
+            return _port_error(
+                "service_process_disabled", "service process manager is disabled"
+            )
         try:
             lease = await manager.acquire_port(
                 node_id=self.owner.identity.node_id,
@@ -701,7 +732,9 @@ class _ServiceProcessServicer:
                 generation=int(request.generation),
             )
         except Exception as exc:
-            return _port_error("service_port_acquire_failed", f"{type(exc).__name__}: {exc}")
+            return _port_error(
+                "service_port_acquire_failed", f"{type(exc).__name__}: {exc}"
+            )
         return control_pb2.PortLeaseResponse(
             accepted=True,
             lease=encode_port_lease(lease),
@@ -715,11 +748,15 @@ class _ServiceProcessServicer:
             return _port_error(error[0], error[1])
         manager = self.owner.service_process_manager
         if manager is None:
-            return _port_error("service_process_disabled", "service process manager is disabled")
+            return _port_error(
+                "service_process_disabled", "service process manager is disabled"
+            )
         try:
             released = await manager.release_port(decode_port_lease(request.lease))
         except Exception as exc:
-            return _port_error("service_port_release_failed", f"{type(exc).__name__}: {exc}")
+            return _port_error(
+                "service_port_release_failed", f"{type(exc).__name__}: {exc}"
+            )
         if not released:
             return _port_error("port_lease_not_found", "PortLease is already released")
         return control_pb2.PortLeaseResponse(accepted=True)
@@ -731,14 +768,18 @@ class _ServiceProcessServicer:
             return _launch_error(error[0], error[1])
         manager = self.owner.service_process_manager
         if manager is None:
-            return _launch_error("service_process_disabled", "service process manager is disabled")
+            return _launch_error(
+                "service_process_disabled", "service process manager is disabled"
+            )
         try:
             handle = await manager.launch(
                 decode_service_launch(request.request),
                 decode_model_placement(request.lease),
             )
         except Exception as exc:
-            return _launch_error("service_launch_failed", f"{type(exc).__name__}: {exc}")
+            return _launch_error(
+                "service_launch_failed", f"{type(exc).__name__}: {exc}"
+            )
         return control_pb2.ServiceLaunchResponse(
             accepted=True,
             handle=encode_service_handle(handle),
@@ -752,7 +793,9 @@ class _ServiceProcessServicer:
             return _probe_error(error[0], error[1])
         manager = self.owner.service_process_manager
         if manager is None:
-            return _probe_error("service_process_disabled", "service process manager is disabled")
+            return _probe_error(
+                "service_process_disabled", "service process manager is disabled"
+            )
         try:
             probe = await manager.probe_process(
                 decode_service_handle(request.handle),
@@ -779,7 +822,9 @@ class _ServiceProcessServicer:
             return _stop_error(error[0], error[1])
         manager = self.owner.service_process_manager
         if manager is None:
-            return _stop_error("service_process_disabled", "service process manager is disabled")
+            return _stop_error(
+                "service_process_disabled", "service process manager is disabled"
+            )
         try:
             result = await manager.stop(
                 decode_service_handle(request.handle),
@@ -975,28 +1020,26 @@ class NodeAgent:
                 for item in await self.service_process_manager.active_handles()
             )
         registration = control_pb2.RegisterNode(
-                meta=self._next_meta(),
-                ray_node_id=self.identity.ray_node_id,
-                agent_endpoint=self.endpoint,
-                producer_id=self.identity.producer_id,
-                environment_fingerprint=self.identity.environment_fingerprint,
-                authorization_token=self.authorization_token,
-                records_locally=self.recorder is not None,
-                active_lease_ids=tuple(
-                    sorted(
-                        lease_id
-                        for leases in self._active_leases.values()
-                        for lease_id in leases
-                    )
-                ),
-                service_handle_ids=tuple(sorted(service_handle_ids)),
-            )
+            meta=self._next_meta(),
+            ray_node_id=self.identity.ray_node_id,
+            agent_endpoint=self.endpoint,
+            producer_id=self.identity.producer_id,
+            environment_fingerprint=self.identity.environment_fingerprint,
+            authorization_token=self.authorization_token,
+            records_locally=self.recorder is not None,
+            active_lease_ids=tuple(
+                sorted(
+                    lease_id
+                    for leases in self._active_leases.values()
+                    for lease_id in leases
+                )
+            ),
+            service_handle_ids=tuple(sorted(service_handle_ids)),
+        )
         if self.node_capacity is not None:
             registration.capacity.CopyFrom(_encode_node_capacity(self.node_capacity))
             registration.has_capacity = True
-        yield control_pb2.AgentStreamMessage(
-            register=registration
-        )
+        yield control_pb2.AgentStreamMessage(register=registration)
         await self._registered.wait()
         while not self._closed:
             try:
@@ -1163,7 +1206,7 @@ class NodeAgent:
                     runtime_generation=int(request.runtime_generation),
                 )
             )
-        else:
+        elif event.kind in TERMINAL_RUNTIME_EVENT_KINDS:
             self._remove_active_worker_lease(event.run_id, event.lease_id)
         self._event_ids.add(event_id)
         self._event_id_order.append(event_id)
@@ -1177,15 +1220,14 @@ class NodeAgent:
             event = decode_runtime_event(request.event)
         except Exception:
             return
-        if event.kind is RuntimeEventKind.WORKER_STARTED:
+        if event.kind not in TERMINAL_RUNTIME_EVENT_KINDS:
             return
         active = self._active_leases.get(event.run_id, {}).get(event.lease_id)
         if active is None:
             return
-        if (
-            active.controller_generation != str(request.controller_generation)
-            or active.runtime_generation != int(request.runtime_generation)
-        ):
+        if active.controller_generation != str(
+            request.controller_generation
+        ) or active.runtime_generation != int(request.runtime_generation):
             return
         self._remove_active_worker_lease(event.run_id, event.lease_id)
 

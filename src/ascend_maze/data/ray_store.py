@@ -67,7 +67,10 @@ class _DataStoreOwner:
             raise TypeError("stage requires one nested ObjectRef")
         existing = self._entries.get(handle.staged_handle_id)
         if existing is not None:
-            if existing.handle != handle or existing.object_ref.hex() != boxed_ref[0].hex():
+            if (
+                existing.handle != handle
+                or existing.object_ref.hex() != boxed_ref[0].hex()
+            ):
                 raise RuntimeError("staged_handle_id payload conflict")
             return
         self._entries[handle.staged_handle_id] = _OwnerEntry(
@@ -170,7 +173,9 @@ class _DataStoreOwner:
         return {
             "owner_generation": self.owner_generation,
             "active_count": len(self._entries),
-            "staged_count": sum(entry.state == "staged" for entry in self._entries.values()),
+            "staged_count": sum(
+                entry.state == "staged" for entry in self._entries.values()
+            ),
             "adopted_count": sum(
                 entry.state == "adopted" for entry in self._entries.values()
             ),
@@ -189,9 +194,7 @@ class _DataStoreOwner:
             entry = self._entries[handle.staged_handle_id]
         except KeyError as exc:
             state = (
-                "released"
-                if handle.staged_handle_id in self._tombstones
-                else "unknown"
+                "released" if handle.staged_handle_id in self._tombstones else "unknown"
             )
             raise RuntimeError(f"data handle is {state}") from exc
         if entry.handle != handle:
@@ -217,11 +220,14 @@ class RayDataStore:
         self,
         descriptor: RayDataStoreDescriptor,
         owner_actor: ray.actor.ActorHandle,
+        *,
+        shutdown_ray_on_close: bool = False,
     ) -> None:
         self.descriptor = descriptor
         self._owner_actor = owner_actor
         self._local_get_count = 0
         self._local_lock = RLock()
+        self._shutdown_ray_on_close = shutdown_ray_on_close
 
     @classmethod
     def start(
@@ -256,12 +262,17 @@ class RayDataStore:
     def connect_client(cls, descriptor: RayDataStoreDescriptor) -> "RayDataStore":
         """Join the managed Head cluster before resolving its detached owner."""
 
-        if not ray.is_initialized():
+        initialized_here = not ray.is_initialized()
+        if initialized_here:
             ray.init(address="auto", namespace=descriptor.owner_namespace)
-        return cls.connect(descriptor)
+        store = cls.connect(descriptor)
+        store._shutdown_ray_on_close = initialized_here
+        return store
 
     def put_staged(self, value: Any, owner_generation: str) -> DataHandle:
-        return self._put_staged(value, owner_generation, FrozenMap((("backend", "ray"),)))
+        return self._put_staged(
+            value, owner_generation, FrozenMap((("backend", "ray"),))
+        )
 
     def put_staged_for_runtime_node(
         self,
@@ -335,7 +346,9 @@ class RayDataStore:
             object_ref = ray.get(self._owner_actor.resolve.remote(handle))
             return ray.get(object_ref)
         except Exception as exc:
-            raise DataHandleInvalidError(f"Ray data handle cannot be read: {exc}") from exc
+            raise DataHandleInvalidError(
+                f"Ray data handle cannot be read: {exc}"
+            ) from exc
 
     def adopt(self, handles: tuple[DataHandle, ...], owner: DataOwner) -> None:
         if not isinstance(handles, tuple):
@@ -361,14 +374,18 @@ class RayDataStore:
         try:
             return str(ray.get(self._owner_actor.state_of.remote(handle)))
         except Exception as exc:
-            raise DataHandleInvalidError(f"Ray data handle state is unavailable: {exc}") from exc
+            raise DataHandleInvalidError(
+                f"Ray data handle state is unavailable: {exc}"
+            ) from exc
 
     def owner_of(self, handle: DataHandle) -> DataOwner | None:
         self._validate_generation(handle)
         try:
             value = ray.get(self._owner_actor.owner_of.remote(handle))
         except Exception as exc:
-            raise DataHandleInvalidError(f"Ray data owner is unavailable: {exc}") from exc
+            raise DataHandleInvalidError(
+                f"Ray data owner is unavailable: {exc}"
+            ) from exc
         return value if isinstance(value, DataOwner) else None
 
     def stats(self) -> dict[str, int | str]:
@@ -405,7 +422,9 @@ class RayDataStore:
         try:
             ray.get(self._owner_actor.fail_on_stage_number.remote(put_number))
         except Exception as exc:
-            raise DataStoreWriteError(f"failed to inject Ray put failure: {exc}") from exc
+            raise DataStoreWriteError(
+                f"failed to inject Ray put failure: {exc}"
+            ) from exc
 
     def release_staged_for_runtime_node(
         self,
@@ -431,9 +450,7 @@ class RayDataStore:
         try:
             return int(
                 ray.get(
-                    self._owner_actor.release_staged_for_node.remote(
-                        node_id, boot_id
-                    )
+                    self._owner_actor.release_staged_for_node.remote(node_id, boot_id)
                 )
             )
         except Exception as exc:
@@ -444,9 +461,7 @@ class RayDataStore:
     def release_owner(self, *, owner_kind: str, owner_id: str) -> int:
         try:
             return int(
-                ray.get(
-                    self._owner_actor.release_owner.remote(owner_kind, owner_id)
-                )
+                ray.get(self._owner_actor.release_owner.remote(owner_kind, owner_id))
             )
         except Exception as exc:
             raise DataHandleInvalidError(
@@ -456,6 +471,10 @@ class RayDataStore:
     def close(self, *, kill_owner: bool) -> None:
         if kill_owner:
             ray.kill(self._owner_actor, no_restart=True)
+        if self._shutdown_ray_on_close:
+            self._shutdown_ray_on_close = False
+            if ray.is_initialized():
+                ray.shutdown()
 
     def _validate_generation(self, handle: DataHandle) -> None:
         if handle.owner_generation != self.descriptor.owner_generation:

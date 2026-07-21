@@ -129,7 +129,10 @@ class C13BenchmarkRuntimeFactory(BenchmarkRuntimeFactory):
                 study_directory=_find_study_root(root),
             )
             host_baseline = evidence.host_baseline
-        _prepare_runtime_security(loaded.config.control.runtime_directory, loaded.config.control.cluster_token_file)
+        _prepare_runtime_security(
+            loaded.config.control.runtime_directory,
+            loaded.config.control.cluster_token_file,
+        )
         model_readiness: list[tuple[str, int, int]] = []
         catalog_path = loaded.config.inference.model_catalog_path
         if catalog_path is not None:
@@ -223,12 +226,13 @@ class C13BenchmarkRuntimeFactory(BenchmarkRuntimeFactory):
             model_readiness=tuple(model_readiness),
             standby_min_idle=loaded.config.worker.standby_min_idle,
             preparation_timeout_ms=max(
-                [loaded.config.worker.binding_deadline_ms, *[item[2] for item in model_readiness]]
+                [
+                    loaded.config.worker.binding_deadline_ms,
+                    *[item[2] for item in model_readiness],
+                ]
             ),
             host_baseline=host_baseline,
-            hbm_recovery_tolerance_mb=(
-                loaded.config.worker.hbm_recovery_tolerance_mb
-            ),
+            hbm_recovery_tolerance_mb=(loaded.config.worker.hbm_recovery_tolerance_mb),
         )
 
 
@@ -292,8 +296,7 @@ class C13BenchmarkRuntime(BenchmarkRuntimeClient):
                 if profile in ready_by_profile and state == "idle":
                     ready_by_profile[cast(str, profile)] += 1
             if all(
-                value >= self.standby_min_idle
-                for value in ready_by_profile.values()
+                value >= self.standby_min_idle for value in ready_by_profile.values()
             ):
                 return {
                     "target_per_profile": self.standby_min_idle,
@@ -410,8 +413,19 @@ class C13BenchmarkRuntime(BenchmarkRuntimeClient):
     async def cancel_run(self, run_id: str, *, request_id: str) -> None:
         await self.client.run_action("CancelRun", run_id, request_id=request_id)
 
-    async def destroy_run(self, run_id: str, *, request_id: str) -> None:
-        await self.client.run_action("DestroyRun", run_id, request_id=request_id)
+    async def destroy_run(
+        self,
+        run_id: str,
+        *,
+        request_id: str,
+        force: bool = False,
+    ) -> None:
+        await self.client.run_action(
+            "DestroyRun",
+            run_id,
+            request_id=request_id,
+            force=force,
+        )
 
     async def wait_for_recovery(
         self,
@@ -462,6 +476,11 @@ class C13BenchmarkRuntime(BenchmarkRuntimeClient):
             return self._shutdown_result
         normalized: dict[str, object]
         try:
+            detach_error: str | None = None
+            try:
+                self.client.close()
+            except Exception as exc:
+                detach_error = _exception_text(exc)
             try:
                 result = await self.client.shutdown_controller(
                     request_id=request_id,
@@ -478,6 +497,9 @@ class C13BenchmarkRuntime(BenchmarkRuntimeClient):
                     "exit_code": 1,
                     "rpc_error": _exception_text(exc),
                 }
+            if detach_error is not None:
+                normalized["cleanup_confirmed"] = False
+                normalized["client_detach_error"] = detach_error
             if self.process is not None:
                 try:
                     await asyncio.wait_for(self.process.wait(), timeout=10.0)

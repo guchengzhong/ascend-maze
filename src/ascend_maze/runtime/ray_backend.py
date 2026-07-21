@@ -38,6 +38,7 @@ from ascend_maze.runtime.ray_cluster import validate_ray_version
 from ascend_maze.runtime.ray_worker import RAY_ONE_SHOT_WORKER, RayWorkerOutcome
 from ascend_maze.runtime.worker_broker import ColdWorkerBroker
 from ascend_maze.runtime.worker_pool import StandbyWorkerBroker
+from ascend_maze.inference.coordinator import InferenceCoordinator
 
 from ascend_maze.control.node_rpc import (
     NodeAgentIdentity,
@@ -70,6 +71,7 @@ class _DispatchRecord:
     outcome: RayWorkerOutcome | None = None
     node_terminal_event: RuntimeEvent | None = None
     node_terminal_received: asyncio.Event = field(default_factory=asyncio.Event)
+    inference_protocol_error: str | None = None
 
 
 class RayRuntimeBackend:
@@ -89,6 +91,7 @@ class RayRuntimeBackend:
         event_timeout_seconds: float = 2.0,
         event_sink: Callable[[RuntimeEvent], None] | None = None,
         recording_error_sink: Callable[[str, str], None] | None = None,
+        inference: InferenceCoordinator | None = None,
     ) -> None:
         if event_timeout_seconds <= 0:
             raise ValueError("event_timeout_seconds must be positive")
@@ -103,14 +106,13 @@ class RayRuntimeBackend:
         self.event_timeout_seconds = event_timeout_seconds
         self._event_sink = event_sink
         self._recording_error_sink = recording_error_sink
+        self.inference = inference
         self._code: dict[str, _CodeRecord] = {}
         self._dispatches: dict[str, _DispatchRecord] = {}
         self._attempt_dispatches: dict[tuple[str, str, int], str] = {}
         self._emitted_events: dict[str, str] = {}
         self._retired_runs: set[str] = set()
-        self._run_recording_bindings: dict[
-            str, dict[str, RuntimeNodeBinding]
-        ] = {}
+        self._run_recording_bindings: dict[str, dict[str, RuntimeNodeBinding]] = {}
         self._opened_run_recordings: set[tuple[str, str]] = set()
         self._started = False
         self._closed = False
@@ -120,6 +122,13 @@ class RayRuntimeBackend:
 
     def post_node_event(self, event: RuntimeEvent) -> None:
         record = self._dispatches.get(event.dispatch_id)
+        if event.kind in {
+            RuntimeEventKind.INFERENCE_REQUEST_STARTED,
+            RuntimeEventKind.INFERENCE_REQUEST_FINISHED,
+        }:
+            if record is not None and not record.terminal:
+                self._handle_inference_event(record, event)
+            return
         if (
             event.kind is RuntimeEventKind.WORKER_STARTED
             and record is not None
@@ -134,6 +143,7 @@ class RayRuntimeBackend:
             and record is not None
             and not record.terminal
         ):
+            self._ingest_inference_summary(record, event)
             record.node_terminal_event = event
             record.node_terminal_received.set()
             return
@@ -164,8 +174,7 @@ class RayRuntimeBackend:
                 if existing is not None:
                     if (
                         existing.handle.code_hash != package.code_hash
-                        or existing.handle
-                        != self._code_handle_for_package(package)
+                        or existing.handle != self._code_handle_for_package(package)
                     ):
                         raise ContractValidationError("definition code hash conflict")
                     prepared.append((package, existing.handle, None))
@@ -228,8 +237,18 @@ class RayRuntimeBackend:
             raise ContractValidationError("PlacementLease does not match request")
         if request.environment_fingerprint != self.environment_fingerprint:
             raise ContractValidationError("execution environment mismatch")
-        if request.execution_target is not ExecutionTarget.LOCAL_WORKER:
-            raise ContractValidationError("Ray Host backend only supports local Worker tasks")
+        inference_config = None
+        if request.execution_target is ExecutionTarget.MODEL_SERVICE:
+            if self.inference is None or request.model_route is None:
+                raise ContractValidationError("Ray model service dispatch requires C11")
+            if (
+                self.inference.route_snapshot(request.model_route.route_lease_id).lease
+                != request.model_route
+            ):
+                raise ContractValidationError(
+                    "ModelRouteLease payload does not match C11 authority"
+                )
+            inference_config = self.inference.worker_config(request.model_route)
         code = self._code.get(request.code_handle.definition_id)
         if code is None or code.handle != request.code_handle:
             raise ContractValidationError("CodeHandle is not prepared")
@@ -243,7 +262,10 @@ class RayRuntimeBackend:
             )
         )
         device_binding: DeviceBinding | None = None
-        if request.task_kind == "npu":
+        if (
+            request.execution_target is ExecutionTarget.LOCAL_WORKER
+            and request.task_kind == "npu"
+        ):
             device_binding = DeviceBinding.from_lease(lease, binding)
             if worker_lease.bound_device_id != device_binding.physical_device_id:
                 await self._maybe_await(
@@ -270,7 +292,11 @@ class RayRuntimeBackend:
             task_id=request.task_id,
             attempt=request.attempt,
             lease_id=lease.lease_id,
-            route_lease_id=None,
+            route_lease_id=(
+                None
+                if request.model_route is None
+                else request.model_route.route_lease_id
+            ),
             worker_endpoint_id=worker_lease.worker_endpoint_id,
         )
         identity = NodeAgentIdentity(
@@ -305,6 +331,7 @@ class RayRuntimeBackend:
                 code_package_handle=code.package_handle,
                 event_timeout_seconds=self.event_timeout_seconds,
                 device_binding=device_binding,
+                inference_config=inference_config,
             )
             if isinstance(self.worker_broker, StandbyWorkerBroker):
                 record.object_ref = self.worker_broker.submit(
@@ -318,7 +345,25 @@ class RayRuntimeBackend:
                     ),
                     name=f"maze:{request.dispatch_id}",
                 ).remote(**worker_kwargs)
+            if request.model_route is not None:
+                assert self.inference is not None
+                if not self.inference.activate_route(
+                    request.model_route.route_lease_id
+                ):
+                    raise ContractValidationError(
+                        "ModelRouteLease could not become active"
+                    )
         except Exception:
+            if record.object_ref is not None:
+                if isinstance(self.worker_broker, StandbyWorkerBroker):
+                    await self.worker_broker.cancel(worker_lease.worker_lease_id)
+                else:
+                    ray.cancel(record.object_ref, force=True, recursive=True)
+            if request.model_route is not None and self.inference is not None:
+                self.inference.abort_worker_attempt(
+                    request.model_route,
+                    error_code="model_dispatch_failed",
+                )
             self._drop_dispatch(request.dispatch_id)
             await self._maybe_await(
                 self.worker_broker.release(
@@ -341,9 +386,7 @@ class RayRuntimeBackend:
         record.cancel_requested = True
         if not record.terminal:
             if isinstance(self.worker_broker, StandbyWorkerBroker):
-                await self.worker_broker.cancel(
-                    record.worker_lease.worker_lease_id
-                )
+                await self.worker_broker.cancel(record.worker_lease.worker_lease_id)
             elif record.object_ref is not None:
                 ray.cancel(record.object_ref, force=True, recursive=True)
             if record.monitor is not None:
@@ -361,9 +404,7 @@ class RayRuntimeBackend:
             if record.reference_count > 0:
                 record.reference_count -= 1
             if record.reference_count == 0:
-                await asyncio.to_thread(
-                    self.data_store.release, record.package_handle
-                )
+                await asyncio.to_thread(self.data_store.release, record.package_handle)
                 del self._code[handle.definition_id]
 
     async def close(self) -> None:
@@ -374,9 +415,7 @@ class RayRuntimeBackend:
             if not record.terminal:
                 record.cancel_requested = True
                 if isinstance(self.worker_broker, StandbyWorkerBroker):
-                    await self.worker_broker.cancel(
-                        record.worker_lease.worker_lease_id
-                    )
+                    await self.worker_broker.cancel(record.worker_lease.worker_lease_id)
                 elif record.object_ref is not None:
                     ray.cancel(record.object_ref, force=True, recursive=True)
         monitors = [
@@ -387,9 +426,7 @@ class RayRuntimeBackend:
         if monitors:
             await asyncio.gather(*monitors, return_exceptions=True)
         for code_record in tuple(self._code.values()):
-            await asyncio.to_thread(
-                self.data_store.release, code_record.package_handle
-            )
+            await asyncio.to_thread(self.data_store.release, code_record.package_handle)
         self._code.clear()
         self._started = False
 
@@ -487,9 +524,7 @@ class RayRuntimeBackend:
         record = self._dispatches.get(dispatch_id)
         return record is None or (
             record.terminal
-            and self.worker_broker.is_released(
-                record.worker_lease.worker_lease_id
-            )
+            and self.worker_broker.is_released(record.worker_lease.worker_lease_id)
         )
 
     async def release_run(self, run_id: str) -> int:
@@ -656,9 +691,7 @@ class RayRuntimeBackend:
                 )
             except Exception as exc:
                 if record.outcome is not None:
-                    await self._release_staged_outputs(
-                        record.outcome.terminal_event
-                    )
+                    await self._release_staged_outputs(record.outcome.terminal_event)
                 terminal_to_publish = self._worker_cleanup_failed_event(
                     record,
                     message=f"{type(exc).__name__}: {exc}",
@@ -667,11 +700,27 @@ class RayRuntimeBackend:
                     record.request.run_id,
                     "Worker cleanup did not reach its process-exit barrier",
                 )
-                await self._deliver_synthesized_event(
-                    record, terminal_to_publish
-                )
+                await self._deliver_synthesized_event(record, terminal_to_publish)
             record.terminal = True
-            publish = terminal_to_publish or record.node_terminal_event
+            publish = record.node_terminal_event or terminal_to_publish
+            if record.request.model_route is not None and self.inference is not None:
+                route = record.request.model_route
+                if self.inference.attempt_summary(route.route_lease_id) is None:
+                    self.inference.abort_worker_attempt(
+                        route,
+                        error_code=(
+                            "model_protocol_failed"
+                            if record.inference_protocol_error is not None
+                            else "worker_lost"
+                        ),
+                    )
+                if record.inference_protocol_error is not None:
+                    if publish is not None:
+                        await self._release_staged_outputs(publish)
+                    publish = self._inference_protocol_failed_event(
+                        record,
+                        message=record.inference_protocol_error,
+                    )
             if publish is not None:
                 self._emit(publish)
             if record.request.run_id in self._retired_runs:
@@ -701,9 +750,19 @@ class RayRuntimeBackend:
                 attempt=record.request.attempt,
                 dispatch_id=record.request.dispatch_id,
                 lease_id=record.lease.lease_id,
+                route_lease_id=(
+                    None
+                    if record.request.model_route is None
+                    else record.request.model_route.route_lease_id
+                ),
                 node_id=record.binding.node_id,
                 boot_id=record.binding.boot_id,
                 worker_id=record.worker_lease.worker_id,
+                model_instance_id=(
+                    None
+                    if record.request.model_route is None
+                    else record.request.model_route.instance_id
+                ),
                 occurred_at_ms=monotonic_time_ms(),
             )
         return RuntimeEvent.create(
@@ -713,7 +772,11 @@ class RayRuntimeBackend:
             task_id=record.request.task_id,
             attempt=record.request.attempt,
             lease_id=record.lease.lease_id,
-            route_lease_id=None,
+            route_lease_id=(
+                None
+                if record.request.model_route is None
+                else record.request.model_route.route_lease_id
+            ),
             occurred_at_ms=monotonic_time_ms(),
             error=error,
         )
@@ -738,9 +801,19 @@ class RayRuntimeBackend:
             attempt=record.request.attempt,
             dispatch_id=record.request.dispatch_id,
             lease_id=record.lease.lease_id,
+            route_lease_id=(
+                None
+                if record.request.model_route is None
+                else record.request.model_route.route_lease_id
+            ),
             node_id=record.binding.node_id,
             boot_id=record.binding.boot_id,
             worker_id=record.worker_lease.worker_id,
+            model_instance_id=(
+                None
+                if record.request.model_route is None
+                else record.request.model_route.instance_id
+            ),
             device_id=record.worker_lease.bound_device_id,
             occurred_at_ms=monotonic_time_ms(),
         )
@@ -751,7 +824,128 @@ class RayRuntimeBackend:
             task_id=record.request.task_id,
             attempt=record.request.attempt,
             lease_id=record.lease.lease_id,
-            route_lease_id=None,
+            route_lease_id=(
+                None
+                if record.request.model_route is None
+                else record.request.model_route.route_lease_id
+            ),
+            occurred_at_ms=error.occurred_at_ms,
+            error=error,
+        )
+
+    def _handle_inference_event(
+        self,
+        record: _DispatchRecord,
+        event: RuntimeEvent,
+    ) -> None:
+        route = record.request.model_route
+        if route is None or self.inference is None:
+            record.inference_protocol_error = (
+                "Worker emitted inference lifecycle for a local Attempt"
+            )
+            return
+        if (
+            event.run_id != route.run_id
+            or event.task_id != route.task_id
+            or event.attempt != route.attempt
+            or event.route_lease_id != route.route_lease_id
+            or event.lease_id != record.lease.lease_id
+        ):
+            record.inference_protocol_error = (
+                "Worker inference lifecycle identity is stale"
+            )
+            return
+        try:
+            if event.kind is RuntimeEventKind.INFERENCE_REQUEST_STARTED:
+                if event.inference_call_index is None:
+                    raise RuntimeError("inference request start omitted call_index")
+                self.inference.worker_request_started(
+                    route,
+                    call_index=event.inference_call_index,
+                    started_at_ms=event.occurred_at_ms,
+                )
+            else:
+                if event.inference_request is None:
+                    raise RuntimeError("inference request finish omitted its record")
+                self.inference.worker_request_finished(
+                    route,
+                    event.inference_request,
+                )
+        except Exception as exc:
+            record.inference_protocol_error = f"{type(exc).__name__}: {exc}"
+            self.inference.abort_worker_attempt(
+                route,
+                error_code="model_protocol_failed",
+            )
+            self._record_delivery_error(
+                record.request.run_id,
+                "Worker inference lifecycle was rejected: "
+                + record.inference_protocol_error,
+            )
+
+    def _ingest_inference_summary(
+        self,
+        record: _DispatchRecord,
+        event: RuntimeEvent,
+    ) -> None:
+        route = record.request.model_route
+        if route is None or self.inference is None:
+            return
+        if (
+            event.kind is RuntimeEventKind.DISPATCH_FAILED
+            and event.inference_summary is None
+        ):
+            return
+        try:
+            if event.inference_summary is None:
+                raise RuntimeError(
+                    "service Worker terminal event omitted inference summary"
+                )
+            self.inference.worker_attempt_finished(route, event.inference_summary)
+        except Exception as exc:
+            record.inference_protocol_error = f"{type(exc).__name__}: {exc}"
+            self.inference.abort_worker_attempt(
+                route,
+                error_code="model_protocol_failed",
+            )
+
+    def _inference_protocol_failed_event(
+        self,
+        record: _DispatchRecord,
+        *,
+        message: str,
+    ) -> RuntimeEvent:
+        route = record.request.model_route
+        assert route is not None
+        error = ErrorInfo(
+            schema_version=1,
+            error_code="model_protocol_failed",
+            category="model",
+            origin="runtime",
+            message=message,
+            retryable_hint=False,
+            classification_confidence="exact",
+            execution_phase="cleanup",
+            run_id=record.request.run_id,
+            task_id=record.request.task_id,
+            attempt=record.request.attempt,
+            dispatch_id=record.request.dispatch_id,
+            lease_id=record.lease.lease_id,
+            route_lease_id=route.route_lease_id,
+            node_id=record.binding.node_id,
+            boot_id=record.binding.boot_id,
+            worker_id=record.worker_lease.worker_id,
+            model_instance_id=route.instance_id,
+            occurred_at_ms=monotonic_time_ms(),
+        )
+        return RuntimeEvent.create(
+            kind=RuntimeEventKind.TASK_FAILED,
+            dispatch_id=record.request.dispatch_id,
+            run_id=record.request.run_id,
+            task_id=record.request.task_id,
+            attempt=record.request.attempt,
+            lease_id=record.lease.lease_id,
+            route_lease_id=route.route_lease_id,
             occurred_at_ms=error.occurred_at_ms,
             error=error,
         )
@@ -811,9 +1005,7 @@ class RayRuntimeBackend:
             None,
         )
         run_id = record.request.run_id
-        if not any(
-            item.request.run_id == run_id for item in self._dispatches.values()
-        ):
+        if not any(item.request.run_id == run_id for item in self._dispatches.values()):
             self._retired_runs.discard(run_id)
 
     def _require_running(self) -> None:

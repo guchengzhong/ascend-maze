@@ -28,7 +28,9 @@ from ascend_maze.benchmark.runtime import (
     SubmissionReceipt,
     TerminalRunResult,
 )
-from ascend_maze.benchmark.workloads.component import build as build_microbenchmark_workflow
+from ascend_maze.benchmark.workloads.component import (
+    build as build_microbenchmark_workflow,
+)
 from ascend_maze.contracts.recording import (
     ExecutionEvent,
     ParquetRecorderConfig,
@@ -75,7 +77,9 @@ def prepare_microbenchmark_specs(output_directory: str | Path) -> Microbenchmark
     root = Path(output_directory).expanduser().resolve(strict=False)
     source_root = _repository_root(Path(__file__).resolve())
     build_revision = _clean_build_revision(source_root)
-    workflow_fingerprint = build_microbenchmark_workflow().compile().workflow_fingerprint
+    workflow_fingerprint = (
+        build_microbenchmark_workflow().compile().workflow_fingerprint
+    )
     spec_root = root / "microbenchmark_specs"
     config = spec_root / "performance.toml"
     dataset = spec_root / "dataset.json"
@@ -319,11 +323,19 @@ class MeasuredMicrobenchmarkRuntime(BenchmarkRuntimeClient):
         del request_id
         self._run(run_id)
 
-    async def destroy_run(self, run_id: str, *, request_id: str) -> None:
-        del request_id
+    async def destroy_run(
+        self,
+        run_id: str,
+        *,
+        request_id: str,
+        force: bool = False,
+    ) -> None:
+        del request_id, force
         run = self._run(run_id)
         if run.flushed is None:
-            raise ExperimentValidationError("microbenchmark Run must flush before destroy")
+            raise ExperimentValidationError(
+                "microbenchmark Run must flush before destroy"
+            )
         run.destroyed = True
 
     async def wait_for_recovery(
@@ -334,7 +346,9 @@ class MeasuredMicrobenchmarkRuntime(BenchmarkRuntimeClient):
         deadline_monotonic_ms: int,
     ) -> tuple[ResourceSnapshot, ResourceRecoveryResult]:
         del before, deadline_monotonic_ms
-        residual = tuple(run_id for run_id in run_ids if not self._run(run_id).destroyed)
+        residual = tuple(
+            run_id for run_id in run_ids if not self._run(run_id).destroyed
+        )
         after = await self.resource_snapshot()
         return after, ResourceRecoveryResult.create(
             recovered=not residual,
@@ -626,7 +640,9 @@ async def _measure_c8(cell_name: str) -> dict[str, tuple[float, ...]]:
                     )
                 )
                 if not accepted:
-                    raise ExperimentValidationError("C8 measured recorder dropped an event")
+                    raise ExperimentValidationError(
+                        "C8 measured recorder dropped an event"
+                    )
             elapsed_ms = (perf_counter_ns() - started) / 1_000_000
             dct.append(elapsed_ms)
             throughput.append(16_000.0 / elapsed_ms)
@@ -690,7 +706,9 @@ def _measure_c12(cell_name: str) -> dict[str, tuple[float, ...]]:
                     attempt=1,
                 )
         elapsed_ms = (perf_counter_ns() - started) / 1_000_000
-        if len(states) != 2_000 or any(value != "succeeded" for value in states.values()):
+        if len(states) != 2_000 or any(
+            value != "succeeded" for value in states.values()
+        ):
             raise ExperimentValidationError("C12 event replay state diverged")
         if with_bookkeeping and deadlines.active_count != 0:
             raise ExperimentValidationError("C12 no-fault timers were not cleared")
@@ -707,7 +725,9 @@ def _frozen_payload(
 ) -> FrozenMap[CanonicalValue, CanonicalValue]:
     frozen = freeze_canonical(payload)
     if not isinstance(frozen, FrozenMap):
-        raise ExperimentValidationError("microbenchmark event payload must be a mapping")
+        raise ExperimentValidationError(
+            "microbenchmark event payload must be a mapping"
+        )
     return frozen
 
 
@@ -828,9 +848,7 @@ def _microbenchmark_spec(
         "drain_deadline_ms = 60000",
         "",
         "[analysis]",
-        "metric_set = ["
-        + ", ".join(f'"{name}"' for name in metric_sets[suite])
-        + "]",
+        "metric_set = [" + ", ".join(f'"{name}"' for name in metric_sets[suite]) + "]",
         'validity_policy = "c14_v1"',
         'statistics_policy = "c14_v1"',
         'performance_budget_set = "c14_v1"',
@@ -952,7 +970,9 @@ def _repository_root(start: Path) -> Path:
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise ExperimentValidationError(f"cannot locate source repository: {exc}") from exc
+        raise ExperimentValidationError(
+            f"cannot locate source repository: {exc}"
+        ) from exc
     return Path(completed.stdout.strip()).resolve(strict=True)
 
 
@@ -982,7 +1002,9 @@ def _clean_build_revision(repository: Path) -> str:
             timeout=10,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError) as exc:
-        raise ExperimentValidationError(f"cannot freeze source revision: {exc}") from exc
+        raise ExperimentValidationError(
+            f"cannot freeze source revision: {exc}"
+        ) from exc
     if status.strip():
         raise ExperimentValidationError(
             "tracked worktree must be clean before formal microbenchmarks"

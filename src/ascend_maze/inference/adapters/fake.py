@@ -16,6 +16,7 @@ from ascend_maze.inference.contracts import (
     ChatResponse,
     EngineMetrics,
     EngineProbe,
+    InferenceWorkerConfig,
     ModelRouteContext,
     ModelSpec,
     PortLease,
@@ -103,6 +104,28 @@ class FakeInferenceEngineAdapter:
         if prefix is not None and not isinstance(prefix, str):
             raise ContractValidationError("response_prefix must be a string")
 
+    def worker_config(
+        self,
+        spec: ModelSpec,
+        *,
+        instance_placement_lease_id: str,
+    ) -> InferenceWorkerConfig:
+        plan = self._plan(spec.model_id)
+        prefix = spec.launch_options.get("response_prefix", spec.model_id)
+        assert isinstance(prefix, str)
+        return InferenceWorkerConfig(
+            adapter_name=self.name,
+            instance_placement_lease_id=instance_placement_lease_id,
+            request_timeout_ms=30_000,
+            adapter_options=FrozenMap(
+                (
+                    ("response_prefix", prefix),
+                    ("invoke_delay_ms", plan.invoke_delay_ms),
+                    ("fail_invoke", plan.fail_invoke),
+                )
+            ),
+        )
+
     def build_launch_request(
         self,
         spec: ModelSpec,
@@ -113,7 +136,9 @@ class FakeInferenceEngineAdapter:
         if plan.fail_build_launch is not None:
             raise RuntimeError(plan.fail_build_launch)
         if lease.npu_device_id is None:
-            raise ContractValidationError("model instance lease requires a physical NPU")
+            raise ContractValidationError(
+                "model instance lease requires a physical NPU"
+            )
         return ServiceLaunchRequest(
             instance_id=port_lease.owner_instance_id,
             generation=port_lease.generation,
@@ -200,9 +225,7 @@ class FakeInferenceEngineAdapter:
             request_capacity=spec.request_capacity,
         )
 
-    async def warmup(
-        self, handle: ServiceHandle, spec: ModelSpec
-    ) -> WarmupResult:
+    async def warmup(self, handle: ServiceHandle, spec: ModelSpec) -> WarmupResult:
         del handle
         plan = self._plan(spec.model_id)
         await self._delay(plan.warmup_delay_ms)
@@ -310,8 +333,7 @@ class FakeInferenceEngineAdapter:
                 (
                     item
                     for item in self._handles.values()
-                    if item.instance_id == instance_id
-                    and item.generation == generation
+                    if item.instance_id == instance_id and item.generation == generation
                 ),
                 None,
             )
@@ -325,8 +347,7 @@ class FakeInferenceEngineAdapter:
     def is_process_alive(self, instance_id: str, generation: int) -> bool:
         with self._lock:
             return any(
-                handle.instance_id == instance_id
-                and handle.generation == generation
+                handle.instance_id == instance_id and handle.generation == generation
                 for handle in self._handles.values()
             )
 

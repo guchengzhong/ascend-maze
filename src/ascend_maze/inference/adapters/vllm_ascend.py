@@ -22,6 +22,7 @@ from ascend_maze.inference.contracts import (
     EngineMetrics,
     EngineProbe,
     InferenceCallError,
+    InferenceWorkerConfig,
     ModelRouteContext,
     ModelSpec,
     PortLease,
@@ -280,6 +281,19 @@ class VllmAscendInferenceEngineAdapter:
         if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
             raise ContractValidationError("log_level is invalid")
         self._warmup_payload(spec)
+
+    def worker_config(
+        self,
+        spec: ModelSpec,
+        *,
+        instance_placement_lease_id: str,
+    ) -> InferenceWorkerConfig:
+        self.validate_model_spec(spec)
+        return InferenceWorkerConfig(
+            adapter_name=self.name,
+            instance_placement_lease_id=instance_placement_lease_id,
+            request_timeout_ms=self.request_timeout_ms,
+        )
 
     def build_launch_request(
         self,

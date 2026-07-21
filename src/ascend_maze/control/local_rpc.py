@@ -83,7 +83,9 @@ class _LocalControlServicer:
         context: grpc.aio.ServicerContext[Any, Any],
     ) -> Any:
         if int(request.schema_version) != 1 or not request.request_id:
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "invalid request envelope")
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, "invalid request envelope"
+            )
         status = self.owner.status_provider()
         return control_pb2.GetControllerStatusResponse(
             request_id=request.request_id,
@@ -168,7 +170,9 @@ class _LocalControlServicer:
         response_version = api.cluster_snapshot_version()
         kind = str(request.filter or "resources")
         if kind not in {"status", "nodes", "resources", "queues", "workers"}:
-            return self._error(request.meta, "invalid_argument", "unknown cluster snapshot kind")
+            return self._error(
+                request.meta, "invalid_argument", "unknown cluster snapshot kind"
+            )
         payload: object
         if kind == "status":
             runs = api.list_runs()
@@ -198,9 +202,7 @@ class _LocalControlServicer:
                 "tasks": queue.tasks,
             }
         elif kind == "workers":
-            payload = self._worker_pools_payload(
-                api, snapshot_version=response_version
-            )
+            payload = self._worker_pools_payload(api, snapshot_version=response_version)
         else:
             payload = {
                 "meta": api.snapshot_meta(snapshot_version=response_version),
@@ -226,9 +228,7 @@ class _LocalControlServicer:
                 "termination_failures",
             )
         )
-        instances = (
-            () if api.inference is None else api.inference.model_instances()
-        )
+        instances = () if api.inference is None else api.inference.model_instances()
         failed_instances = sum(
             str(getattr(item.state, "value", item.state)) == "failed"
             for item in instances
@@ -349,9 +349,7 @@ class _LocalControlServicer:
                 remaining = context.time_remaining()
                 if remaining is not None and remaining <= 0:
                     return
-                await asyncio.sleep(
-                    0.05 if remaining is None else min(0.05, remaining)
-                )
+                await asyncio.sleep(0.05 if remaining is None else min(0.05, remaining))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -364,9 +362,7 @@ class _LocalControlServicer:
             snapshot_version = api.cluster_snapshot_version()
             return self._query(
                 request.meta,
-                self._worker_pools_payload(
-                    api, snapshot_version=snapshot_version
-                ),
+                self._worker_pools_payload(api, snapshot_version=snapshot_version),
                 snapshot_version=snapshot_version,
             )
         except Exception as exc:
@@ -619,7 +615,8 @@ class _LocalControlServicer:
                     )
                     if operation == "cancel_run":
                         result = await self._api().cancel_run(
-                            payload["run_id"], reason=payload["reason"] or "user_cancelled"
+                            payload["run_id"],
+                            reason=payload["reason"] or "user_cancelled",
                         )
                     elif operation == "destroy_run":
                         result = await self._api().destroy_run(
@@ -699,10 +696,15 @@ class _LocalControlServicer:
             controller_generation=str(message.controller_generation) or None,
         )
         api = self._api()
-        if meta.config_fingerprint is not None and meta.config_fingerprint != api.config_fingerprint:
+        if (
+            meta.config_fingerprint is not None
+            and meta.config_fingerprint != api.config_fingerprint
+        ):
             raise StateTransitionError("config fingerprint changed")
         if write and meta.controller_generation != api.controller_generation:
-            raise StateTransitionError("Controller generation changed; reconnect before writing")
+            raise StateTransitionError(
+                "Controller generation changed; reconnect before writing"
+            )
         return meta
 
     def _response(
@@ -751,6 +753,7 @@ class _LocalControlServicer:
             raise RuntimeError("ControlService operation is not configured")
         return self.owner.control_api
 
+
 @dataclass(frozen=True, slots=True)
 class _RequestMeta:
     schema_version: int
@@ -764,7 +767,9 @@ class _RequestMeta:
         if self.schema_version != 1 or not self.request_id or not self.client_version:
             raise ContractValidationError("invalid control request envelope")
         if self.deadline_ms < 1:
-            raise ContractValidationError("control request deadline_ms must be positive")
+            raise ContractValidationError(
+                "control request deadline_ms must be positive"
+            )
 
 
 class LocalControlServer:
@@ -809,7 +814,9 @@ class LocalControlServer:
         except FileNotFoundError:
             await server.stop(0)
             self._server = None
-            raise RuntimeError("gRPC did not create the configured control socket") from None
+            raise RuntimeError(
+                "gRPC did not create the configured control socket"
+            ) from None
         if not stat.S_ISSOCK(info.st_mode):
             await server.stop(0)
             self._server = None
@@ -829,6 +836,7 @@ class LocalControlServer:
             return
         if info.st_ino == self._socket_inode and stat.S_ISSOCK(info.st_mode):
             self.socket_path.unlink()
+
 
 class UdsRuntimeClient:
     def __init__(
@@ -855,6 +863,15 @@ class UdsRuntimeClient:
         )
         self._compatibility_verified = False
         self._prepared: dict[str, PreparedSubmission] = {}
+
+    def close(self) -> None:
+        """Detach a client-owned Ray connection without stopping its owner."""
+
+        store = self.data_store
+        if isinstance(store, RayDataStore):
+            store.close(kill_owner=False)
+        self.data_store = None
+        self.data_owner_generation = None
 
     async def get_controller_status(
         self, *, timeout_seconds: float = 5.0
@@ -914,7 +931,9 @@ class UdsRuntimeClient:
             filter=filter,
             limit=limit,
         )
-        async with grpc.aio.insecure_channel(_grpc_uds_target(self.socket_path)) as channel:
+        async with grpc.aio.insecure_channel(
+            _grpc_uds_target(self.socket_path)
+        ) as channel:
             stub = control_pb2_grpc.LocalControlStub(channel)
             method = getattr(stub, operation)
             response = await method(request, timeout=timeout_seconds)
@@ -1008,9 +1027,7 @@ class UdsRuntimeClient:
             for name in sorted(inputs):
                 value = inputs[name]
                 if isinstance(value, SharedFileRef):
-                    validate_shared_file_ref(
-                        value, self.shared_filesystem_roots
-                    )
+                    validate_shared_file_ref(value, self.shared_filesystem_roots)
                 handle = await asyncio.to_thread(
                     self.data_store.put_staged,
                     value,
@@ -1022,8 +1039,7 @@ class UdsRuntimeClient:
                 self.data_store.release(handle)
             raise
         identities = tuple(
-            run_input_identity(name, inputs[name], handle)
-            for name, handle in handles
+            run_input_identity(name, inputs[name], handle) for name, handle in handles
         )
         contract = SubmissionContract.create(
             submission_id=resolved_submission_id,
@@ -1178,7 +1194,9 @@ class UdsRuntimeClient:
             reason=reason,
             force=force,
         )
-        async with grpc.aio.insecure_channel(_grpc_uds_target(self.socket_path)) as channel:
+        async with grpc.aio.insecure_channel(
+            _grpc_uds_target(self.socket_path)
+        ) as channel:
             stub = control_pb2_grpc.LocalControlStub(channel)
             response = await getattr(stub, operation)(request, timeout=timeout_seconds)
         return self._decode(response, resolved_id)
@@ -1198,7 +1216,9 @@ class UdsRuntimeClient:
             cursor=cursor or "",
             limit=limit,
         )
-        async with grpc.aio.insecure_channel(_grpc_uds_target(self.socket_path)) as channel:
+        async with grpc.aio.insecure_channel(
+            _grpc_uds_target(self.socket_path)
+        ) as channel:
             response = await control_pb2_grpc.LocalControlStub(channel).GetRunEvents(
                 request, timeout=timeout_seconds
             )
@@ -1221,7 +1241,11 @@ class UdsRuntimeClient:
         assert self.data_store is not None
         result: dict[str, object] = {}
         for item in raw_handles:
-            if not isinstance(item, list) or len(item) != 2 or not isinstance(item[0], str):
+            if (
+                not isinstance(item, list)
+                or len(item) != 2
+                or not isinstance(item[0], str)
+            ):
                 raise RuntimeError("Task result handle entry is invalid")
             payload = _require_mapping(item[1], "DataHandle")
             metadata = freeze_canonical(_decode_json_value(payload.get("metadata", {})))
@@ -1262,10 +1286,12 @@ class UdsRuntimeClient:
             boot_id=boot_id,
             force=force,
         )
-        async with grpc.aio.insecure_channel(_grpc_uds_target(self.socket_path)) as channel:
-            response = await getattr(control_pb2_grpc.LocalControlStub(channel), operation)(
-                request, timeout=timeout_seconds
-            )
+        async with grpc.aio.insecure_channel(
+            _grpc_uds_target(self.socket_path)
+        ) as channel:
+            response = await getattr(
+                control_pb2_grpc.LocalControlStub(channel), operation
+            )(request, timeout=timeout_seconds)
         return self._decode(response, resolved_id)
 
     async def wait_model_ready(
@@ -1281,7 +1307,9 @@ class UdsRuntimeClient:
             resource_id=model_id,
             limit=replicas,
         )
-        async with grpc.aio.insecure_channel(_grpc_uds_target(self.socket_path)) as channel:
+        async with grpc.aio.insecure_channel(
+            _grpc_uds_target(self.socket_path)
+        ) as channel:
             response = await control_pb2_grpc.LocalControlStub(channel).WaitModelReady(
                 request, timeout=timeout_seconds
             )
@@ -1301,10 +1329,12 @@ class UdsRuntimeClient:
             force=force,
             drain_timeout_ms=drain_timeout_ms,
         )
-        async with grpc.aio.insecure_channel(_grpc_uds_target(self.socket_path)) as channel:
-            response = await control_pb2_grpc.LocalControlStub(channel).ShutdownController(
-                request, timeout=timeout_seconds
-            )
+        async with grpc.aio.insecure_channel(
+            _grpc_uds_target(self.socket_path)
+        ) as channel:
+            response = await control_pb2_grpc.LocalControlStub(
+                channel
+            ).ShutdownController(request, timeout=timeout_seconds)
         return self._decode(response, resolved_id)
 
     async def watch_run(
@@ -1316,9 +1346,7 @@ class UdsRuntimeClient:
         timeout_seconds: float | None = None,
     ) -> AsyncIterator[dict[str, object]]:
         loop = asyncio.get_running_loop()
-        expires_at = (
-            None if timeout_seconds is None else loop.time() + timeout_seconds
-        )
+        expires_at = None if timeout_seconds is None else loop.time() + timeout_seconds
         after = after_sequence
         while True:
             remaining = None if expires_at is None else expires_at - loop.time()
@@ -1412,7 +1440,9 @@ class UdsRuntimeClient:
             after_snapshot_version=after_snapshot_version,
             limit=limit,
         )
-        async with grpc.aio.insecure_channel(_grpc_uds_target(self.socket_path)) as channel:
+        async with grpc.aio.insecure_channel(
+            _grpc_uds_target(self.socket_path)
+        ) as channel:
             call = control_pb2_grpc.LocalControlStub(channel).WatchCluster(
                 request,
                 timeout=timeout_seconds,
@@ -1486,7 +1516,10 @@ class UdsRuntimeClient:
         owner_name = descriptor.get("owner_actor_name")
         namespace = descriptor.get("owner_namespace")
         generation = descriptor.get("owner_generation")
-        if not all(isinstance(value, str) and value for value in (owner_name, namespace, generation)):
+        if not all(
+            isinstance(value, str) and value
+            for value in (owner_name, namespace, generation)
+        ):
             raise RuntimeError("Controller did not expose a RayDataStore descriptor")
         owner_name = cast(str, owner_name)
         namespace = cast(str, namespace)

@@ -241,7 +241,13 @@ class BenchmarkRuntimeClient(Protocol):
 
     async def cancel_run(self, run_id: str, *, request_id: str) -> None: ...
 
-    async def destroy_run(self, run_id: str, *, request_id: str) -> None: ...
+    async def destroy_run(
+        self,
+        run_id: str,
+        *,
+        request_id: str,
+        force: bool = False,
+    ) -> None: ...
 
     async def wait_for_recovery(
         self,
