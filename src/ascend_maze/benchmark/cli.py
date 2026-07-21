@@ -30,6 +30,14 @@ def build_parser() -> argparse.ArgumentParser:
         "validate", help="import and validate a completed Study"
     )
     validate.add_argument("study_directory")
+    aggregate = commands.add_parser(
+        "aggregate", help="compute deterministic Study metrics and statistics"
+    )
+    aggregate.add_argument("study_directory")
+    report = commands.add_parser(
+        "report", help="generate the machine report and offline-derived views"
+    )
+    report.add_argument("study_directory")
     return parser
 
 
@@ -68,6 +76,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             sys.stdout.write("\n")
             return 0 if result.get("study_valid") is True else 1
+        if args.command == "aggregate":
+            from ascend_maze.benchmark.aggregation import aggregate_study
+
+            result = aggregate_study(args.study_directory)
+            _write_result(result)
+            return 0
+        if args.command == "report":
+            from ascend_maze.benchmark.reporting import report_study
+
+            result = report_study(args.study_directory)
+            _write_result(result)
+            return 0
         parser.print_help(sys.stderr)
         return 2
     except ContractValidationError as exc:
@@ -122,6 +142,17 @@ def _run_or_resume(args: argparse.Namespace) -> dict[str, object]:
             resume_study(args.study_directory, runtime_factory=factory)
         )
     return result.canonical_payload()
+
+
+def _write_result(result: dict[str, object]) -> None:
+    json.dump(
+        result,
+        sys.stdout,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    sys.stdout.write("\n")
 
 
 if __name__ == "__main__":

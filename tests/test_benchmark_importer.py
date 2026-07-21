@@ -202,6 +202,120 @@ def _write_events(
     pq.write_table(pa.Table.from_pylist(rows, schema=schema or event_schema()), path)
 
 
+def _write_analysis_inputs(
+    trial: Path, *, trial_attempt_id: str, run_id: str, config_fingerprint: str
+) -> None:
+    run = {
+        "phase": "measurement",
+        "arrival_index": 0,
+        "record_id": "record-a",
+        "input_digest": "e" * 64,
+        "submission_id": "submission-validation-1",
+        "scheduled_offset_ms": 0,
+        "scheduled_at_monotonic_ms": 1_000,
+        "offered_at_monotonic_ms": 1_000,
+        "issued_at_monotonic_ms": 1_000,
+        "admitted_at_monotonic_ms": 1_001,
+        "arrival_lateness_ms": 0,
+        "run_id": run_id,
+        "submission_replayed": False,
+        "submission_error": None,
+        "terminal_status": "succeeded",
+        "terminal_at_monotonic_ms": 1_100,
+        "flushed": True,
+        "recording_complete": True,
+        "destroyed": True,
+    }
+    empty = {
+        "offered": 0,
+        "issued": 0,
+        "committed": 0,
+        "terminal": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "timed_out": 0,
+    }
+    measurement = {
+        "offered": 1,
+        "issued": 1,
+        "committed": 1,
+        "terminal": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "timed_out": 0,
+    }
+    atomic_write_json(
+        trial / "run_manifest.json",
+        {
+            "schema_version": 1,
+            "schema": "ascend-maze.run-manifest.v1",
+            "trial_attempt_id": trial_attempt_id,
+            "runs": [run],
+            "warmup_excluded_from_measurement": True,
+            "warmup_counters": empty,
+            "measurement_counters": measurement,
+        },
+    )
+    schedule_schema = pa.schema(
+        [
+            pa.field("schema_version", pa.int32(), nullable=False),
+            pa.field("trial_attempt_id", pa.string(), nullable=False),
+            pa.field("mode", pa.string(), nullable=False),
+            pa.field("phase", pa.string(), nullable=False),
+            pa.field("arrival_index", pa.int64(), nullable=False),
+            pa.field("scheduled_offset_ms", pa.int64(), nullable=True),
+            pa.field("record_id", pa.string(), nullable=False),
+            pa.field("input_digest", pa.string(), nullable=False),
+            pa.field("submission_id", pa.string(), nullable=False),
+        ],
+        metadata={
+            b"ascend_maze.schema": b"ascend-maze.arrival-schedule.v1",
+            b"ascend_maze.schema_version": b"1",
+            b"ascend_maze.schedule_digest": b"f" * 64,
+        },
+    )
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "schema_version": 1,
+                    "trial_attempt_id": trial_attempt_id,
+                    "mode": "poisson",
+                    "phase": "measurement",
+                    "arrival_index": 0,
+                    "scheduled_offset_ms": 0,
+                    "record_id": "record-a",
+                    "input_digest": "e" * 64,
+                    "submission_id": "submission-validation-1",
+                }
+            ],
+            schema=schedule_schema,
+        ),
+        trial / "arrival_schedule.parquet",
+    )
+    snapshot = {
+        "captured_at_wall_ms": 1_000,
+        "controller_generation": "controller-generation-1",
+        "config_fingerprint": config_fingerprint,
+        "snapshot_digest": canonical_json_digest({}),
+        "payload": {},
+    }
+    atomic_write_json(trial / "resource_before.json", snapshot)
+    atomic_write_json(
+        trial / "resource_after.json",
+        {
+            **snapshot,
+            "captured_at_wall_ms": 1_200,
+            "recovery": {
+                "recovered": True,
+                "checked_at_wall_ms": 1_200,
+                "reason_code": None,
+                "details": {},
+            },
+        },
+    )
+
+
 def _fixture(
     root: Path,
     *,
@@ -253,6 +367,12 @@ def _fixture(
         committed_files=committed,
     )
     atomic_write_json(trial / "trial_manifest.json", manifest.canonical_payload())
+    _write_analysis_inputs(
+        trial,
+        trial_attempt_id=attempt.trial_attempt_id,
+        run_id=run_id,
+        config_fingerprint=cell.config_snapshot.config_fingerprint,
+    )
     flush_payload: dict[str, object] = {
         "run_id": run_id,
         "committed_files": list(committed),
@@ -305,7 +425,7 @@ def _fixture(
 
 
 def _trial_validation(fixture: _Fixture) -> dict[str, object]:
-    return json.loads((fixture.trial / "validation.json").read_text(encoding="utf-8"))
+    return json.loads((fixture.trial / "validity.json").read_text(encoding="utf-8"))
 
 
 def test_validate_imports_only_committed_files_and_is_deterministic(
@@ -322,7 +442,7 @@ def test_validate_imports_only_committed_files_and_is_deterministic(
     atomic_write_json(private_flush, {"prompt": "private C8 state"})
     first = validate_study(fixture.study)
     first_summary = (fixture.study / "validation_summary.json").read_bytes()
-    first_trial = (fixture.trial / "validation.json").read_bytes()
+    first_trial = (fixture.trial / "validity.json").read_bytes()
     first_raw = (fixture.trial / "raw_files.json").read_bytes()
 
     assert first["study_valid"] is True
@@ -350,7 +470,7 @@ def test_validate_imports_only_committed_files_and_is_deterministic(
         assert item["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
     assert validate_study(fixture.study) == first
     assert (fixture.study / "validation_summary.json").read_bytes() == first_summary
-    assert (fixture.trial / "validation.json").read_bytes() == first_trial
+    assert (fixture.trial / "validity.json").read_bytes() == first_trial
     assert (fixture.trial / "raw_files.json").read_bytes() == first_raw
 
 
@@ -737,10 +857,10 @@ def test_missing_file_stays_missing_and_legal_slow_trial_remains_valid(
     assert all(item["valid"] is False for item in validation["metric_valid"])
     assert all("value" not in item for item in validation["metric_valid"])
     first_raw = (missing.trial / "raw_files.json").read_bytes()
-    first_validation = (missing.trial / "validation.json").read_bytes()
+    first_validation = (missing.trial / "validity.json").read_bytes()
     assert validate_study(missing.study) == first
     assert (missing.trial / "raw_files.json").read_bytes() == first_raw
-    assert (missing.trial / "validation.json").read_bytes() == first_validation
+    assert (missing.trial / "validity.json").read_bytes() == first_validation
     assert "committed_file_hash_changed" not in validation["reason_codes"]
 
     run_id = "run_validation_1"
@@ -749,3 +869,22 @@ def test_missing_file_stays_missing_and_legal_slow_trial_remains_valid(
         events=_valid_events(run_id, terminal_time=7 * 24 * 60 * 60 * 1_000),
     )
     assert validate_study(slow.study)["study_valid"] is True
+
+
+def test_arrival_lateness_only_invalidates_dct_and_throughput(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    run_manifest_path = fixture.trial / "run_manifest.json"
+    run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+    run_manifest["runs"][0]["arrival_lateness_ms"] = 11
+    atomic_write_json(run_manifest_path, run_manifest)
+
+    assert validate_study(fixture.study)["study_valid"] is True
+    validity = _trial_validation(fixture)
+    assert validity["trial_valid"] is True
+    metrics = {item["metric_name"]: item for item in validity["metric_valid"]}
+    assert metrics["dct_ms"] == {
+        "metric_name": "dct_ms",
+        "valid": False,
+        "reason_codes": ["arrival_lateness_exceeded"],
+    }
+    assert metrics["throughput_success_per_s"]["valid"] is False

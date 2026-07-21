@@ -27,7 +27,7 @@ SCHEMA_FILES = (
     "trace_schedule.v1.schema.json",
     "trial_manifest.v1.schema.json",
     "trial_state.v1.schema.json",
-    "trial_validation.v1.schema.json",
+    "trial_validity.v1.schema.json",
     "workload_dataset.v1.schema.json",
 )
 

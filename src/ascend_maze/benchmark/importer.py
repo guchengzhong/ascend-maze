@@ -9,6 +9,11 @@ from typing import cast
 from urllib.parse import quote
 
 from ascend_maze.benchmark.canonical import canonical_json_digest, thaw
+from ascend_maze.benchmark.analysis_inputs import (
+    AnalysisInputRecord,
+    ValidatedAnalysisInputs,
+    validate_analysis_inputs,
+)
 from ascend_maze.benchmark.contracts import (
     STUDY_PLAN_SCHEMA,
     TRIAL_MANIFEST_SCHEMA,
@@ -19,6 +24,7 @@ from ascend_maze.benchmark.indexes import (
     build_indexes,
     metric_validity,
 )
+from ascend_maze.benchmark.metrics import CORRECTNESS_GUARD_METRICS
 from ascend_maze.benchmark.parquet_import import (
     ParquetImportFailure,
     import_committed_parquet,
@@ -29,11 +35,13 @@ from ascend_maze.benchmark.persistence import (
     load_json_object,
 )
 from ascend_maze.benchmark.privacy import privacy_violations
+from ascend_maze.benchmark.statistics import type7_quantile
 from ascend_maze.benchmark.runtime import RunFlushResult
 from ascend_maze.benchmark.validity import (
     RAW_FILES_SCHEMA,
     STUDY_VALIDATION_SCHEMA,
     IgnoredFileRecord,
+    MetricValidity,
     RawFileRecord,
     ValidityIssue,
     raw_files_payload,
@@ -75,6 +83,10 @@ class _TrialImport:
     file_owners: dict[str, str] = field(default_factory=dict)
     indexes: AssociationIndexes | None = None
     raw_payload: dict[str, object] | None = None
+    analysis_inputs: tuple[AnalysisInputRecord, ...] = ()
+    analysis_inputs_digest: str = ""
+    formal_inputs_valid: bool = False
+    formal_inputs: ValidatedAnalysisInputs | None = None
 
 
 def validate_study(study_directory: str | Path) -> dict[str, object]:
@@ -141,9 +153,19 @@ def _parse_study_identity(
     workload = _mapping(spec.get("workload"), "Study workload")
     analysis = _mapping(spec.get("analysis"), "Study analysis")
     raw_metrics = _list(analysis.get("metric_set"), "Study metric set")
-    metrics = tuple(sorted(_string_value(item, "metric name") for item in raw_metrics))
-    if not metrics or len(metrics) != len(set(metrics)):
+    requested_metrics = tuple(
+        sorted(_string_value(item, "metric name") for item in raw_metrics)
+    )
+    if not requested_metrics or len(requested_metrics) != len(set(requested_metrics)):
         raise ExperimentValidationError("Study metric set is invalid")
+    metrics = tuple(
+        sorted(
+            {
+                *requested_metrics,
+                *CORRECTNESS_GUARD_METRICS,
+            }
+        )
+    )
     raw_cells = _list(plan.get("cells"), "Study cells")
     config_by_cell: dict[str, str] = {}
     for item in raw_cells:
@@ -224,6 +246,24 @@ def _parse_trial_entries(
 def _import_trial(entry: _TrialEntry, identity: _StudyIdentity) -> _TrialImport:
     manifest = _load_trial_manifest(entry.directory / "trial_manifest.json")
     imported = _TrialImport(entry=entry, manifest=manifest)
+    try:
+        formal = validate_analysis_inputs(
+            entry.directory,
+            trial_attempt_id=manifest.trial_attempt_id,
+            committed_run_ids=manifest.run_ids,
+        )
+    except ExperimentValidationError as exc:
+        reason = (
+            "analysis_input_missing"
+            if "unavailable" in str(exc)
+            else "analysis_input_invalid"
+        )
+        imported.issues.append(ValidityIssue(reason, source=str(exc)))
+    else:
+        imported.analysis_inputs = formal.records
+        imported.analysis_inputs_digest = formal.digest
+        imported.formal_inputs_valid = True
+        imported.formal_inputs = formal
     if (
         manifest.trial_id != entry.trial_id
         or manifest.trial_attempt_id != entry.trial_attempt_id
@@ -594,7 +634,22 @@ def _commit_trial_validation(
         run_ids=imported.manifest.run_ids,
         events=imported.events,
         trial_integrity_valid=trial_valid,
+        formal_inputs_valid=imported.formal_inputs_valid,
     )
+    if imported.formal_inputs is not None and _arrival_lateness_exceeded(
+        imported.formal_inputs
+    ):
+        metrics = tuple(
+            MetricValidity(
+                metric.metric_name,
+                False,
+                tuple(sorted({*metric.reason_codes, "arrival_lateness_exceeded"})),
+            )
+            if metric.metric_name == "dct_ms"
+            or metric.metric_name.startswith("throughput_")
+            else metric
+            for metric in metrics
+        )
     raw_digest = _string(imported.raw_payload, "content_digest", "raw files manifest")
     validation = trial_validation_payload(
         trial_attempt_id=imported.manifest.trial_attempt_id,
@@ -603,10 +658,14 @@ def _commit_trial_validation(
         issues=issues,
         metrics=metrics,
         raw_files_digest=raw_digest,
+        analysis_inputs=(
+            item.canonical_payload() for item in imported.analysis_inputs
+        ),
+        analysis_inputs_digest=imported.analysis_inputs_digest,
         index_counts=imported.indexes.counts(),
     )
     atomic_write_json(imported.entry.directory / "raw_files.json", imported.raw_payload)
-    atomic_write_json(imported.entry.directory / "validation.json", validation)
+    atomic_write_json(imported.entry.directory / "validity.json", validation)
     return {
         "trial_id": imported.manifest.trial_id,
         "trial_attempt_id": imported.manifest.trial_attempt_id,
@@ -615,6 +674,31 @@ def _commit_trial_validation(
         "raw_files_digest": raw_digest,
         "validation_digest": validation["validation_digest"],
     }
+
+
+def _arrival_lateness_exceeded(formal: ValidatedAnalysisInputs) -> bool:
+    measurement = tuple(
+        run for run in formal.run_manifest.runs if run.phase == "measurement"
+    )
+    lateness = [
+        float(run.arrival_lateness_ms)
+        for run in measurement
+        if run.arrival_lateness_ms is not None
+    ]
+    if not lateness:
+        return False
+    offsets = sorted(
+        run.scheduled_offset_ms
+        for run in measurement
+        if run.scheduled_offset_ms is not None
+    )
+    mean_interval = (
+        0.0
+        if len(offsets) < 2
+        else (offsets[-1] - offsets[0]) / (len(offsets) - 1)
+    )
+    limit_ms = max(10.0, mean_interval * 0.05)
+    return type7_quantile(lateness, 0.99) > limit_ms
 
 
 def _load_trial_manifest(path: Path) -> TrialManifest:

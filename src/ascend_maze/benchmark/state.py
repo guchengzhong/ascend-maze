@@ -187,6 +187,56 @@ class TrialCounters:
 
 
 @dataclass(frozen=True, slots=True)
+class RunManifestData:
+    trial_attempt_id: str
+    runs: tuple[TrialRunRecord, ...]
+    warmup_counters: TrialCounters
+    measurement_counters: TrialCounters
+
+
+def parse_run_manifest(payload: Mapping[str, object]) -> RunManifestData:
+    _require_fields(
+        payload,
+        {
+            "schema_version",
+            "schema",
+            "trial_attempt_id",
+            "runs",
+            "warmup_excluded_from_measurement",
+            "warmup_counters",
+            "measurement_counters",
+        },
+        "Run manifest",
+    )
+    if payload.get("schema_version") != 1 or payload.get("schema") != RUN_MANIFEST_SCHEMA:
+        raise ExperimentValidationError("Run manifest schema is invalid")
+    if payload.get("warmup_excluded_from_measurement") is not True:
+        raise ExperimentValidationError("Run manifest must exclude warmup")
+    runs = tuple(
+        _parse_run(_mapping(item, "Trial Run"))
+        for item in _list(payload.get("runs"), "Run manifest runs")
+    )
+    if len({(item.phase, item.arrival_index) for item in runs}) != len(runs):
+        raise ExperimentValidationError("Run manifest contains duplicate arrivals")
+    warmup = TrialCounters.from_runs(runs, phase="warmup")
+    measurement = TrialCounters.from_runs(runs, phase="measurement")
+    if _mapping(payload.get("warmup_counters"), "warmup counters") != (
+        warmup.canonical_payload()
+    ):
+        raise ExperimentValidationError("Run manifest warmup counters are invalid")
+    if _mapping(payload.get("measurement_counters"), "measurement counters") != (
+        measurement.canonical_payload()
+    ):
+        raise ExperimentValidationError("Run manifest measurement counters are invalid")
+    return RunManifestData(
+        trial_attempt_id=_string(payload, "trial_attempt_id"),
+        runs=runs,
+        warmup_counters=warmup,
+        measurement_counters=measurement,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class TrialExecutionState:
     schema_version: int
     trial_attempt_id: str

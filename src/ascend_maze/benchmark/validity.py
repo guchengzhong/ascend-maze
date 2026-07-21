@@ -8,7 +8,7 @@ from typing import Iterable
 from ascend_maze.benchmark.canonical import canonical_json_digest
 
 RAW_FILES_SCHEMA = "ascend-maze.raw-files.v1"
-TRIAL_VALIDATION_SCHEMA = "ascend-maze.trial-validation.v1"
+TRIAL_VALIDITY_SCHEMA = "ascend-maze.trial-validity.v1"
 STUDY_VALIDATION_SCHEMA = "ascend-maze.study-validation.v1"
 
 # These codes are persisted analysis inputs. Renaming one requires a schema revision.
@@ -23,6 +23,9 @@ REASON_CODES = frozenset(
         "context_identity_mismatch",
         "context_missing",
         "context_row_invalid",
+        "analysis_input_invalid",
+        "analysis_input_missing",
+        "arrival_lateness_exceeded",
         "dispatch_reference_dangling",
         "dropped_control_events",
         "dropped_telemetry_events",
@@ -206,11 +209,14 @@ def trial_validation_payload(
     issues: Iterable[ValidityIssue],
     metrics: Iterable[MetricValidity],
     raw_files_digest: str,
+    analysis_inputs: Iterable[dict[str, object]],
+    analysis_inputs_digest: str,
     index_counts: dict[str, int],
 ) -> dict[str, object]:
     ordered_issues = stable_issues(issues)
     ordered_metrics = tuple(sorted(metrics, key=lambda item: item.metric_name))
     reason_codes = tuple(sorted({item.reason_code for item in ordered_issues}))
+    ordered_inputs = sorted(analysis_inputs, key=lambda item: str(item["logical_name"]))
     body = {
         "trial_attempt_id": trial_attempt_id,
         "trial_id": trial_id,
@@ -219,11 +225,13 @@ def trial_validation_payload(
         "reasons": [item.canonical_payload() for item in ordered_issues],
         "metric_valid": [item.canonical_payload() for item in ordered_metrics],
         "raw_files_digest": raw_files_digest,
+        "analysis_inputs": ordered_inputs,
+        "analysis_inputs_digest": analysis_inputs_digest,
         "index_counts": dict(sorted(index_counts.items())),
     }
     return {
         "schema_version": 1,
-        "schema": TRIAL_VALIDATION_SCHEMA,
+        "schema": TRIAL_VALIDITY_SCHEMA,
         **body,
         "validation_digest": canonical_json_digest(body),
     }

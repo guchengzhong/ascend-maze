@@ -50,6 +50,8 @@ def test_maze_bench_reports_structured_local_errors(
     parser = build_parser()
     assert parser.parse_args(["run", "experiment.toml"]).command == "run"
     assert parser.parse_args(["resume", "study-dir"]).command == "resume"
+    assert parser.parse_args(["aggregate", "study-dir"]).command == "aggregate"
+    assert parser.parse_args(["report", "study-dir"]).command == "report"
 
 
 def test_plan_bytes_are_identical_across_process_hash_seeds(tmp_path: Path) -> None:

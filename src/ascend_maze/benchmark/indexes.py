@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping
 
 from ascend_maze.benchmark.validity import MetricValidity, ValidityIssue, stable_issues
+from ascend_maze.benchmark.metrics import metric_required_event_types
 from ascend_maze.contracts.recording import ExecutionEvent
 
 _RUN_TERMINAL_STATES = frozenset(
@@ -324,6 +325,7 @@ def metric_validity(
     run_ids: Iterable[str],
     events: Iterable[ExecutionEvent],
     trial_integrity_valid: bool,
+    formal_inputs_valid: bool = True,
 ) -> tuple[MetricValidity, ...]:
     event_tuple = tuple(events)
     by_run: dict[str, tuple[ExecutionEvent, ...]] = {
@@ -339,15 +341,18 @@ def metric_validity(
             if any(not _has_valid_dct(events) for events in by_run.values()):
                 reasons.add("metric_required_fact_missing")
         elif metric == "throughput_success_per_s":
-            if any(not _has_terminal_facts(events) for events in by_run.values()):
+            if not formal_inputs_valid or any(
+                not _has_terminal_facts(events) for events in by_run.values()
+            ):
                 reasons.add("metric_required_fact_missing")
         else:
-            required = _metric_event_types(metric)
+            required = metric_required_event_types(metric)
             if required is None:
                 reasons.add("metric_dependency_unknown")
-            elif not all(
-                any(event.event_type in required for event in events)
-                for events in by_run.values()
+            elif not required and not formal_inputs_valid:
+                reasons.add("metric_required_fact_missing")
+            elif required and not any(
+                event.event_type in required for event in event_tuple
             ):
                 reasons.add("metric_required_fact_missing")
         results.append(MetricValidity(metric, not reasons, tuple(reasons)))
@@ -552,22 +557,6 @@ def _has_terminal_facts(events: tuple[ExecutionEvent, ...]) -> bool:
     return len(terminal) == 1 and _payload_str(_payload(terminal[0]), "status") in (
         _RUN_TERMINAL_STATES
     )
-
-
-def _metric_event_types(metric: str) -> frozenset[str] | None:
-    if "queue" in metric:
-        return frozenset({"task_queued", "task_dispatched"})
-    if "schedul" in metric:
-        return frozenset({"scheduling_decision"})
-    if "worker" in metric or "cold_start" in metric or "standby" in metric:
-        return frozenset({"worker_started", "task_dispatched"})
-    if "model" in metric or "inference" in metric or metric in {"ttft_ms", "tpot_ms"}:
-        return frozenset({"inference_request", "attempt_inference_summary"})
-    if any(token in metric for token in ("hbm", "utilization", "power", "rss")):
-        return frozenset({"device_resource_sample", "node_resource_sample"})
-    if any(token in metric for token in ("fault", "recovery", "retry", "oom")):
-        return frozenset({"error_normalized", "recovery_decision"})
-    return None
 
 
 def _attempt_key(event: ExecutionEvent) -> AttemptKey | None:
