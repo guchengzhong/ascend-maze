@@ -35,6 +35,7 @@ from ascend_maze.benchmark.persistence import atomic_write_json
 from ascend_maze.benchmark.workloads.component import build as build_component
 from ascend_maze.benchmark.workloads.qwen3_4b import build as build_qwen
 from ascend_maze.config import load_config
+from ascend_maze.compiler.analyzer import analyse_callable
 from ascend_maze.contracts.recording import ExecutionEvent
 from ascend_maze.control.application import _worker_pool_config
 from ascend_maze.core.errors import ContractValidationError
@@ -104,7 +105,7 @@ def test_qwen_workload_dataset_and_candidate_profile_are_consistent(
             encoding="utf-8"
         )
     )
-    assert fingerprint == "723124e49e3d44cf507259cfff00972f08c5ddcfb02cc27945844455598cc851"
+    assert fingerprint == "ad0db2b49b0d4833dfa5cf794425f23f4f0991a368152bd4a768aad7691185a9"
     assert dataset["workflow_fingerprint"] == fingerprint
     assert len(dataset["records"]) == 32
     assert len({item["record_id"] for item in dataset["records"]}) == 32
@@ -120,6 +121,14 @@ def test_qwen_workload_dataset_and_candidate_profile_are_consistent(
     assert loaded.config.placement.task_slots_total == 2
     assert loaded.config.worker.standby_min_idle == 2
     assert loaded.config.worker.standby_max_idle == 2
+
+
+def test_task_code_hash_uses_version_neutral_ast_payload() -> None:
+    from ascend_maze.benchmark.workloads.qwen3_4b import normalize_prompt
+
+    analysis = analyse_callable(normalize_prompt)
+    assert "kwonlyargs" in analysis.normalized_ast
+    assert "type_params" not in analysis.normalized_ast
 
 
 def test_worker_pool_translation_preserves_standby_ablation(tmp_path: Path) -> None:

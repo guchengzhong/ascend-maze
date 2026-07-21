@@ -279,6 +279,32 @@ def _validate_signature(func: FunctionType) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _canonical_ast_payload(value: object) -> object:
+    if isinstance(value, ast.AST):
+        fields: list[tuple[str, object]] = []
+        for name in value._fields:
+            field_value = getattr(value, name, None)
+            if name == "type_params":
+                if field_value:
+                    raise TaskDefinitionError(
+                        "generic task function type parameters are not supported"
+                    )
+                continue
+            fields.append((name, _canonical_ast_payload(field_value)))
+        return ("ast", type(value).__name__, tuple(fields))
+    if isinstance(value, (list, tuple)):
+        return tuple(_canonical_ast_payload(item) for item in value)
+    if value is Ellipsis:
+        return ("singleton", "Ellipsis")
+    if isinstance(value, complex):
+        return ("complex", value.real.hex(), value.imag.hex())
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return value
+    raise TaskDefinitionError(
+        f"task AST contains an unsupported value: {type(value).__name__}"
+    )
+
+
 def analyse_callable(func: object) -> AnalyzedCallable:
     typed = _validate_function_kind(func)
     inputs = _validate_signature(typed)
@@ -306,11 +332,9 @@ def analyse_callable(func: object) -> AnalyzedCallable:
 
     normalized_node = copy.deepcopy(node)
     normalized_node.decorator_list = []
-    normalized_ast = ast.dump(
-        normalized_node,
-        annotate_fields=True,
-        include_attributes=False,
-    )
+    normalized_ast = canonical_bytes(
+        _canonical_ast_payload(normalized_node)
+    ).decode("utf-8")
     module = typed.__module__ or ""
     qualname = typed.__qualname__
     code_hash = hashlib.sha256(

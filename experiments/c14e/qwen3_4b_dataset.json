@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "workflow_fingerprint": "723124e49e3d44cf507259cfff00972f08c5ddcfb02cc27945844455598cc851",
+  "workflow_fingerprint": "ad0db2b49b0d4833dfa5cf794425f23f4f0991a368152bd4a768aad7691185a9",
   "records": [
     {"record_id": "prompt-00", "inputs": {"prompt": "Name one practical use of a distributed task scheduler.", "max_tokens": 32}},
     {"record_id": "prompt-01", "inputs": {"prompt": "Explain in one sentence why deterministic identifiers help reproducibility.", "max_tokens": 32}},
