@@ -127,6 +127,55 @@ def test_cpu_io_multinode_dag_reaches_both_resource_checkpoints() -> None:
     asyncio.run(scenario())
 
 
+def test_post_flush_destroy_request_does_not_gap_next_run_recording() -> None:
+    async def scenario() -> None:
+        controller = _controller(nodes=(_node("node_a"),))
+        await controller.start()
+        client = InMemoryRuntimeClient(controller)
+
+        async def execute(submission_id: str) -> str:
+            workflow = Workflow(submission_id)
+            result = workflow.add_task(
+                finish,
+                inputs={"summary": submission_id},
+                task_name="result",
+            )
+            outcome = await client.submit(
+                workflow,
+                inputs={},
+                submission_id=submission_id,
+            )
+            assert outcome.run_id is not None
+            terminal = await controller.wait_run(outcome.run_id, timeout_seconds=2)
+            assert terminal.status is RunStatus.SUCCEEDED
+            assert controller.result(outcome.run_id, result.task_id) == {
+                "result": submission_id
+            }
+            return outcome.run_id
+
+        try:
+            first_run_id = await execute("submission_before_flush")
+            first_flush = await controller.flush_run(first_run_id)
+            assert first_flush.recording_complete
+
+            controller.record_control_request(
+                first_run_id,
+                request_id="destroy_after_flush",
+                operation="destroy_run",
+            )
+            await controller.destroy_run(first_run_id)
+
+            second_run_id = await execute("submission_after_flush")
+            second_flush = await controller.flush_run(second_run_id)
+            assert second_flush.recording_complete
+            assert second_flush.sequence_gap_count == 0
+            await controller.destroy_run(second_run_id)
+        finally:
+            await controller.close()
+
+    asyncio.run(scenario())
+
+
 def test_submission_response_loss_replays_original_run_and_conflict_releases_upload() -> None:
     async def scenario() -> None:
         controller = _controller()

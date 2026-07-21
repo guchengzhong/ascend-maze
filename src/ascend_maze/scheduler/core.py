@@ -613,7 +613,7 @@ class SchedulerCore:
         model_instance_id: str | None = None,
         payload: dict[str, object] | None = None,
     ) -> None:
-        if run_id in self._runs:
+        if run_id in self._runs and run_id not in self._recording_flushes:
             self._record(
                 run_id,
                 event_type,
