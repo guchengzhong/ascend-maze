@@ -487,8 +487,11 @@ def _npu_topology(required_device_count: int) -> dict[str, object]:
         raise ExperimentValidationError("npu-smi is required for topology admission")
     output = _run_checked((executable, "info", "-t", "topo"))
     rows: list[dict[str, object]] = []
+    device_labels = tuple(f"NPU{index}" for index in range(required_device_count))
     for line in output.splitlines():
         fields = line.split()
+        if tuple(fields[:required_device_count]) == device_labels:
+            continue
         if not fields or not re.fullmatch(r"NPU\d+", fields[0]):
             continue
         if len(fields) < required_device_count + 2:

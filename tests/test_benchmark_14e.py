@@ -11,6 +11,7 @@ import pytest
 from ascend_maze.benchmark import calibration, orchestrator
 from ascend_maze.benchmark.admission import (
     HOST_AUDIT_SCHEMA,
+    _npu_topology,
     _verify_frozen_model_manifest,
     host_recovery_issues,
     model_artifact_manifest,
@@ -221,6 +222,27 @@ def test_host_recovery_reports_every_resource_dimension() -> None:
     assert host_recovery_issues(before, {}, hbm_tolerance_mb=64) == (
         "host_audit_invalid",
     )
+
+
+def test_topology_parser_ignores_npu_header_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ascend_maze.benchmark.admission as admission
+
+    output = "\n".join(
+        (
+            "NPU0 NPU1 CPU Affinity",
+            "NPU0 X HCCS 0-3",
+            "NPU1 HCCS X 4-7",
+            "",
+            "Legend:",
+        )
+    )
+    monkeypatch.setattr(admission.shutil, "which", lambda _: "/usr/bin/npu-smi")
+    monkeypatch.setattr(admission, "_run_checked", lambda _: output)
+    topology = _npu_topology(2)
+    assert topology["kind"] == "all_hccs"
+    assert [row["device_id"] for row in topology["rows"]] == ["0", "1"]
 
 
 def test_prepare_14e_is_deterministic_and_pilot_is_nonformal(
