@@ -31,6 +31,26 @@ def _node() -> NodeCapacity:
     )
 
 
+def test_controller_uses_configured_recorder_flush_timeout() -> None:
+    controller = InMemoryController(
+        config_fingerprint="c" * 64,
+        environment_fingerprint="e" * 64,
+        build_revision="test",
+        node_capacities=(_node(),),
+        recorder_flush_timeout_ms=60_000,
+    )
+    assert controller.core.recorder_flush_timeout_ms == 60_000
+
+    with pytest.raises(ValueError, match="recorder_flush_timeout_ms"):
+        InMemoryController(
+            config_fingerprint="c" * 64,
+            environment_fingerprint="e" * 64,
+            build_revision="test",
+            node_capacities=(_node(),),
+            recorder_flush_timeout_ms=0,
+        )
+
+
 def test_request_journal_replays_only_the_same_operation_and_payload() -> None:
     journal = RequestJournal(capacity=2)
     result = {"status": "cancelled"}

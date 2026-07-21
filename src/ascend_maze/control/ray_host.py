@@ -52,6 +52,7 @@ class ManagedRayHost:
         placement_lookahead: int = 8,
         max_bypass_count: int = 8,
         dispatch_timeout_ms: int = 5_000,
+        recorder_flush_timeout_ms: int = 1_000,
         worker_pool_config: WorkerPoolConfig | None = None,
         recorder: ExecutionRecorder | None = None,
         inference: InferenceCoordinator | None = None,
@@ -84,6 +85,7 @@ class ManagedRayHost:
         self.placement_lookahead = placement_lookahead
         self.max_bypass_count = max_bypass_count
         self.dispatch_timeout_ms = dispatch_timeout_ms
+        self.recorder_flush_timeout_ms = recorder_flush_timeout_ms
         self.worker_pool_config = worker_pool_config
         self.recorder = recorder
         self.inference = inference
@@ -139,6 +141,7 @@ class ManagedRayHost:
                 placement_lookahead=self.placement_lookahead,
                 max_bypass_count=self.max_bypass_count,
                 dispatch_timeout_ms=self.dispatch_timeout_ms,
+                recorder_flush_timeout_ms=self.recorder_flush_timeout_ms,
                 worker_pool_config=self.worker_pool_config,
                 recorder=self.recorder,
                 inference=self.inference,

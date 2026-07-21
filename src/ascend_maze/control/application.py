@@ -272,6 +272,7 @@ class ControllerApplication:
             placement_lookahead=config.scheduler.placement_lookahead,
             max_bypass_count=config.scheduler.max_bypass_count,
             dispatch_timeout_ms=config.scheduler.dispatch_timeout_ms,
+            recorder_flush_timeout_ms=config.recording.flush_timeout_ms,
             recorder=recorder,
             worker_pool_config=worker_pool_config,
             inference=inference,

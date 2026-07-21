@@ -13,7 +13,7 @@ import sys
 from typing import Mapping, Sequence, cast
 
 from ascend_maze.ascend import DcmiDeviceAdapter, discover_ascend_environment
-from ascend_maze.benchmark.canonical import canonical_json_digest
+from ascend_maze.benchmark.canonical import canonical_json_bytes, canonical_json_digest
 from ascend_maze.benchmark.contracts import ExperimentSpec
 from ascend_maze.benchmark.persistence import atomic_write_json
 from ascend_maze.config import load_config, load_model_catalog
@@ -356,7 +356,8 @@ def _write_environment_manifests(root: Path, evidence: AdmissionEvidence) -> Non
         if path.exists():
             from ascend_maze.benchmark.persistence import load_json_object
 
-            if dict(load_json_object(path, description=name)) != payload:
+            existing = load_json_object(path, description=name)
+            if canonical_json_bytes(existing) != canonical_json_bytes(payload):
                 raise ExperimentValidationError(
                     f"frozen C14E environment manifest changed: {name}"
                 )

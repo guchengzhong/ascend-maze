@@ -10,8 +10,10 @@ import pytest
 
 from ascend_maze.benchmark import calibration, orchestrator
 from ascend_maze.benchmark.admission import (
+    AdmissionEvidence,
     HOST_AUDIT_SCHEMA,
     _npu_topology,
+    _write_environment_manifests,
     _verify_frozen_model_manifest,
     host_recovery_issues,
     model_artifact_manifest,
@@ -229,6 +231,34 @@ def test_host_recovery_reports_every_resource_dimension() -> None:
     assert host_recovery_issues(before, {}, hbm_tolerance_mb=64) == (
         "host_audit_invalid",
     )
+
+
+def test_environment_manifests_accept_json_equivalent_frozen_payloads(
+    tmp_path: Path,
+) -> None:
+    evidence = AdmissionEvidence(
+        software={"schema_version": 1, "versions": {"python": "3.10"}},
+        hardware={
+            "schema_version": 1,
+            "chip_types": ("910B3",),
+            "topology": {
+                "rows": ({"device_id": "0", "links": ("X",)},),
+            },
+        },
+        model_artifacts={"schema_version": 1, "files": ()},
+        host_baseline={"schema_version": 1, "devices": ()},
+        evidence_digest="evidence",
+    )
+
+    _write_environment_manifests(tmp_path, evidence)
+    _write_environment_manifests(tmp_path, evidence)
+
+    atomic_write_json(
+        tmp_path / "environment" / "hardware.json",
+        {"schema_version": 1, "chip_types": ["different"]},
+    )
+    with pytest.raises(ContractValidationError, match="hardware.json"):
+        _write_environment_manifests(tmp_path, evidence)
 
 
 def test_topology_parser_ignores_npu_header_row(

@@ -148,6 +148,7 @@ class InMemoryController:
         placement_lookahead: int = 8,
         max_bypass_count: int = 8,
         dispatch_timeout_ms: int = 5_000,
+        recorder_flush_timeout_ms: int = 1_000,
         inference: InferenceCoordinator | None = None,
         shutdown_drain_timeout_ms: int = 5_000,
         shutdown_cleanup_timeout_ms: int = 30_000,
@@ -156,6 +157,7 @@ class InMemoryController:
         for name, value, minimum in (
             ("shutdown_drain_timeout_ms", shutdown_drain_timeout_ms, 0),
             ("shutdown_cleanup_timeout_ms", shutdown_cleanup_timeout_ms, 1),
+            ("recorder_flush_timeout_ms", recorder_flush_timeout_ms, 1),
         ):
             if (
                 isinstance(value, bool)
@@ -273,6 +275,7 @@ class InMemoryController:
             placement_lookahead=placement_lookahead,
             max_bypass_count=max_bypass_count,
             dispatch_timeout_ms=dispatch_timeout_ms,
+            recorder_flush_timeout_ms=recorder_flush_timeout_ms,
             inference=inference,
             checkpoint_sink=(
                 self._save_checkpoint if recovery_store is not None else None
