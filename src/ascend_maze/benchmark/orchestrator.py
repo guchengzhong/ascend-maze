@@ -32,6 +32,8 @@ from ascend_maze.benchmark.planning import file_sha256
 from ascend_maze.benchmark.runtime import (
     BenchmarkRuntimeClient,
     BenchmarkRuntimeFactory,
+    ResourceRecoveryResult,
+    ResourceSnapshot,
     RunFlushResult,
 )
 from ascend_maze.benchmark.schedule import (
@@ -331,46 +333,305 @@ class TrialOrchestrator:
             return journal.state
         if journal.state.state == "planned":
             await journal.transition("preparing", wall_ms=self.clock.wall_ms())
-        workflow = load_workflow(
-            plan.spec.workload,
-            config=cast(Mapping[str, object], thaw(cell.config_snapshot.resolved)),
-        )
-        runtime = await self.runtime_factory.open(
-            spec=plan.spec,
-            cell=cell,
-            trial_attempt_id=manifest.trial_attempt_id,
-            trial_directory=str(paths.root),
-            resume=journal.loaded,
-        )
-        records = {item.record_id: item for item in dataset.records}
-        while journal.state.state not in TERMINAL_TRIAL_STATES:
-            state = journal.state.state
-            if state == "preparing":
-                await self._prepare(runtime, journal)
-            elif state == "warming":
-                await self._warm(
-                    runtime,
-                    workflow,
-                    plan.spec,
-                    schedule,
-                    records,
-                    journal,
+        runtime: BenchmarkRuntimeClient | None = None
+        try:
+            workflow = load_workflow(
+                plan.spec.workload,
+                config=cast(Mapping[str, object], thaw(cell.config_snapshot.resolved)),
+            )
+            runtime = await self.runtime_factory.open(
+                spec=plan.spec,
+                cell=cell,
+                trial_attempt_id=manifest.trial_attempt_id,
+                trial_directory=str(paths.root),
+                resume=journal.loaded,
+            )
+            records = {item.record_id: item for item in dataset.records}
+            while journal.state.state not in TERMINAL_TRIAL_STATES:
+                state = journal.state.state
+                if state == "preparing":
+                    await self._prepare(runtime, journal)
+                elif state == "warming":
+                    await self._warm(
+                        runtime,
+                        workflow,
+                        plan.spec,
+                        schedule,
+                        records,
+                        journal,
+                    )
+                elif state == "measuring":
+                    await self._measure(
+                        runtime,
+                        workflow,
+                        plan.spec,
+                        schedule,
+                        records,
+                        journal,
+                    )
+                elif state == "draining":
+                    await self._drain(runtime, plan.spec, journal)
+                elif state == "flushing":
+                    await self._flush(runtime, plan.spec, journal)
+                else:
+                    raise ExperimentValidationError(f"unhandled Trial state: {state}")
+            return journal.state
+        except asyncio.CancelledError as exc:
+            await asyncio.shield(
+                self._abort_after_exception(runtime, plan.spec, journal, exc)
+            )
+            raise
+        except Exception as exc:
+            # Failpoints model an abrupt process death, so they must keep the
+            # durable resume behavior rather than becoming a handled failure.
+            if self.failpoint is not None:
+                raise
+            return await self._abort_after_exception(runtime, plan.spec, journal, exc)
+
+    async def _abort_after_exception(
+        self,
+        runtime: BenchmarkRuntimeClient | None,
+        spec: ExperimentSpec,
+        journal: TrialJournal,
+        primary_error: BaseException,
+    ) -> TrialExecutionState:
+        error_text = _exception_text(primary_error)
+        reasons = journal.state.invalid_reasons
+        if "trial_execution_failed" not in reasons:
+            reasons = (*reasons, "trial_execution_failed")
+        cleanup_errors: list[tuple[str, str]] = []
+        try:
+            await journal.revise(
+                wall_ms=self.clock.wall_ms(),
+                invalid_reasons=reasons,
+                last_error=error_text,
+            )
+        except Exception as exc:
+            cleanup_errors.append(("persist_primary_error", _exception_text(exc)))
+
+        if runtime is None:
+            await journal.add_invalid_reason(
+                "resource_recovery_unverified", wall_ms=self.clock.wall_ms()
+            )
+            await journal.transition("aborted", wall_ms=self.clock.wall_ms())
+            return journal.state
+
+        before = journal.state.resource_before
+        if before is None:
+            try:
+                before = await runtime.resource_snapshot()
+                await journal.revise(
+                    wall_ms=self.clock.wall_ms(), resource_before=before
                 )
-            elif state == "measuring":
-                await self._measure(
-                    runtime,
-                    workflow,
-                    plan.spec,
-                    schedule,
-                    records,
-                    journal,
+            except Exception as exc:
+                cleanup_errors.append(
+                    ("resource_snapshot_before", _exception_text(exc))
                 )
-            elif state == "draining":
-                await self._drain(runtime, plan.spec, journal)
-            elif state == "flushing":
-                await self._flush(runtime, plan.spec, journal)
-            else:
-                raise ExperimentValidationError(f"unhandled Trial state: {state}")
+
+        cleanup_deadline = self.clock.monotonic_ms() + min(
+            spec.windows.drain_deadline_ms, 10_000
+        )
+        for current in journal.state.runs:
+            if current.run_id is None or current.terminal:
+                continue
+            try:
+                await runtime.cancel_run(
+                    current.run_id,
+                    request_id=_request_id(
+                        journal.state.trial_attempt_id, "cancel", current.run_id
+                    ),
+                )
+            except Exception as exc:
+                cleanup_errors.append(
+                    (f"cancel:{current.run_id}", _exception_text(exc))
+                )
+
+        for current in journal.state.runs:
+            if current.run_id is None or current.terminal:
+                continue
+            run_id = current.run_id
+            try:
+                terminal_result = await runtime.wait_terminal(
+                    run_id,
+                    deadline_monotonic_ms=cleanup_deadline,
+                )
+                if terminal_result.run_id != run_id:
+                    raise ExperimentValidationError(
+                        "terminal result Run ID mismatch during cleanup"
+                    )
+                terminal_at = self.clock.monotonic_ms()
+                await journal.mutate_run(
+                    current.phase,
+                    current.arrival_index,
+                    lambda item: replace(
+                        item,
+                        terminal_status=terminal_result.status,
+                        terminal_at_monotonic_ms=terminal_at,
+                    ),
+                    wall_ms=self.clock.wall_ms(),
+                )
+            except Exception as exc:
+                cleanup_errors.append((f"wait_terminal:{run_id}", _exception_text(exc)))
+
+        for current in journal.state.runs:
+            if current.run_id is None or current.terminal_status is None:
+                continue
+            run_id = current.run_id
+            if not current.flushed:
+                try:
+                    flush_result = await runtime.flush_run(
+                        run_id,
+                        request_id=_request_id(
+                            journal.state.trial_attempt_id, "flush", run_id
+                        ),
+                    )
+                    await self._record_flush(journal, current, flush_result)
+                    current = journal.state.run(current.phase, current.arrival_index)
+                    if not flush_result.recording_complete:
+                        await journal.add_invalid_reason(
+                            "recording_incomplete", wall_ms=self.clock.wall_ms()
+                        )
+                except Exception as exc:
+                    cleanup_errors.append((f"flush:{run_id}", _exception_text(exc)))
+                    continue
+            if not current.destroyed:
+                try:
+                    await runtime.destroy_run(
+                        run_id,
+                        request_id=_request_id(
+                            journal.state.trial_attempt_id, "destroy", run_id
+                        ),
+                    )
+                    await journal.mutate_run(
+                        current.phase,
+                        current.arrival_index,
+                        lambda item: replace(item, destroyed=True),
+                        wall_ms=self.clock.wall_ms(),
+                    )
+                except Exception as exc:
+                    cleanup_errors.append((f"destroy:{run_id}", _exception_text(exc)))
+
+        run_ids = tuple(
+            item.run_id for item in journal.state.runs if item.run_id is not None
+        )
+        after: ResourceSnapshot | None = journal.state.resource_after
+        recovery: ResourceRecoveryResult | None = journal.state.recovery
+        if before is not None:
+            try:
+                after, recovery = await runtime.wait_for_recovery(
+                    before,
+                    run_ids=run_ids,
+                    deadline_monotonic_ms=cleanup_deadline,
+                )
+            except Exception as exc:
+                cleanup_errors.append(("wait_for_recovery", _exception_text(exc)))
+                try:
+                    after = await runtime.resource_snapshot()
+                except Exception as snapshot_exc:
+                    cleanup_errors.append(
+                        ("resource_snapshot_after", _exception_text(snapshot_exc))
+                    )
+                if after is not None:
+                    recovery = ResourceRecoveryResult.create(
+                        recovered=False,
+                        checked_at_wall_ms=self.clock.wall_ms(),
+                        reason_code="resource_recovery_failed",
+                        details={"wait_for_recovery_error": _exception_text(exc)},
+                    )
+            if after is not None and recovery is not None:
+                try:
+                    await journal.revise(
+                        wall_ms=self.clock.wall_ms(),
+                        resource_after=after,
+                        recovery=recovery,
+                    )
+                except Exception as exc:
+                    cleanup_errors.append(
+                        ("persist_pre_shutdown_recovery", _exception_text(exc))
+                    )
+
+        try:
+            shutdown = await runtime.shutdown(
+                request_id=_request_id(
+                    journal.state.trial_attempt_id,
+                    "shutdown",
+                    journal.state.trial_attempt_id,
+                )
+            )
+            if (
+                shutdown.get("timed_out") is True
+                or shutdown.get("cleanup_confirmed") is False
+            ):
+                cleanup_errors.append(
+                    ("shutdown", "Runtime shutdown did not confirm cleanup")
+                )
+        except Exception as exc:
+            cleanup_errors.append(("shutdown", _exception_text(exc)))
+
+        if before is not None and after is not None and recovery is not None:
+            try:
+                after, recovery = await runtime.finalize_recovery(
+                    before,
+                    after,
+                    recovery,
+                    deadline_monotonic_ms=(
+                        self.clock.monotonic_ms() + spec.windows.drain_deadline_ms
+                    ),
+                )
+            except Exception as exc:
+                cleanup_errors.append(("finalize_recovery", _exception_text(exc)))
+
+        if recovery is not None:
+            critical_cleanup_failure = any(
+                stage
+                in {
+                    "resource_snapshot_before",
+                    "resource_snapshot_after",
+                    "wait_for_recovery",
+                    "shutdown",
+                    "finalize_recovery",
+                }
+                for stage, _ in cleanup_errors
+            )
+            recovered = recovery.recovered and not critical_cleanup_failure
+            recovery = ResourceRecoveryResult.create(
+                recovered=recovered,
+                checked_at_wall_ms=self.clock.wall_ms(),
+                reason_code=(
+                    None
+                    if recovered
+                    else recovery.reason_code or "trial_cleanup_failed"
+                ),
+                details={
+                    "runtime_recovery": recovery.canonical_payload(),
+                    "cleanup_errors": [
+                        {"stage": stage, "error": error}
+                        for stage, error in cleanup_errors
+                    ],
+                    "primary_error": error_text,
+                },
+            )
+            assert after is not None
+            final_reasons = journal.state.invalid_reasons
+            if "trial_execution_failed" not in final_reasons:
+                final_reasons = (*final_reasons, "trial_execution_failed")
+            if not recovery.recovered:
+                recovery_reason = recovery.reason_code or "trial_cleanup_failed"
+                if recovery_reason not in final_reasons:
+                    final_reasons = (*final_reasons, recovery_reason)
+            await journal.revise(
+                wall_ms=self.clock.wall_ms(),
+                resource_after=after,
+                recovery=recovery,
+                invalid_reasons=final_reasons,
+                last_error=error_text,
+            )
+        else:
+            await journal.add_invalid_reason(
+                "resource_recovery_unverified", wall_ms=self.clock.wall_ms()
+            )
+
+        await journal.transition("aborted", wall_ms=self.clock.wall_ms())
         return journal.state
 
     def _load_trace(self, spec: ExperimentSpec) -> TraceSchedule | None:
@@ -628,54 +889,60 @@ class TrialOrchestrator:
         ]
         active: set[asyncio.Task[None]] = set()
         cursor = 0
-        while cursor < len(pending) or active:
-            while cursor < len(pending) and len(active) < concurrency:
-                entry = pending[cursor]
-                current = journal.state.run(entry.phase, entry.arrival_index)
-                if current.issued_at_monotonic_ms is None:
-                    issued = self.clock.monotonic_ms()
-                    await journal.mutate_run(
-                        entry.phase,
-                        entry.arrival_index,
-                        lambda item: replace(
-                            item,
-                            offered_at_monotonic_ms=issued,
-                            issued_at_monotonic_ms=issued,
-                        ),
-                        wall_ms=self.clock.wall_ms(),
+        try:
+            while cursor < len(pending) or active:
+                while cursor < len(pending) and len(active) < concurrency:
+                    entry = pending[cursor]
+                    current = journal.state.run(entry.phase, entry.arrival_index)
+                    if current.issued_at_monotonic_ms is None:
+                        issued = self.clock.monotonic_ms()
+                        await journal.mutate_run(
+                            entry.phase,
+                            entry.arrival_index,
+                            lambda item: replace(
+                                item,
+                                offered_at_monotonic_ms=issued,
+                                issued_at_monotonic_ms=issued,
+                            ),
+                            wall_ms=self.clock.wall_ms(),
+                        )
+                    await self._submit_existing(
+                        runtime,
+                        workflow,
+                        spec,
+                        entry,
+                        records,
+                        journal,
                     )
-                await self._submit_existing(
-                    runtime,
-                    workflow,
-                    spec,
-                    entry,
-                    records,
-                    journal,
-                )
-                current = journal.state.run(entry.phase, entry.arrival_index)
-                if current.run_id is not None and not current.terminal:
-                    active.add(
-                        asyncio.create_task(
-                            self._wait_one_terminal(
-                                runtime,
-                                spec,
-                                journal,
-                                current,
-                                deadline_monotonic_ms=(
-                                    self.clock.monotonic_ms()
-                                    + spec.windows.drain_deadline_ms
-                                ),
+                    current = journal.state.run(entry.phase, entry.arrival_index)
+                    if current.run_id is not None and not current.terminal:
+                        active.add(
+                            asyncio.create_task(
+                                self._wait_one_terminal(
+                                    runtime,
+                                    spec,
+                                    journal,
+                                    current,
+                                    deadline_monotonic_ms=(
+                                        self.clock.monotonic_ms()
+                                        + spec.windows.drain_deadline_ms
+                                    ),
+                                )
                             )
                         )
-                    )
-                cursor += 1
-            if not active:
-                continue
-            done, active = await asyncio.wait(
-                active, return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in done:
-                await task
+                    cursor += 1
+                if not active:
+                    continue
+                done, active = await asyncio.wait(
+                    active, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    await task
+        finally:
+            for task in active:
+                task.cancel()
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
 
     async def _issue_open(
         self,
@@ -734,7 +1001,7 @@ class TrialOrchestrator:
                 )
             )
         if tasks:
-            await asyncio.gather(*tasks)
+            await _gather_all(tasks)
 
     async def _run_to_terminal(
         self,
@@ -869,7 +1136,7 @@ class TrialOrchestrator:
                 )
             )
         if tasks:
-            await asyncio.gather(*tasks)
+            await _gather_all(tasks)
 
     async def _wait_one_terminal(
         self,
@@ -1066,6 +1333,8 @@ async def _continue_study(
             blocking_reason = recovery.reason_code or "resource_recovery_failed"
         elif "safe_shutdown_failed" in result.invalid_reasons:
             blocking_reason = "safe_shutdown_failed"
+        elif "resource_recovery_unverified" in result.invalid_reasons:
+            blocking_reason = "resource_recovery_unverified"
         if blocking_reason is not None:
             mutable["state"] = "blocked"
             mutable["blocked_reason"] = blocking_reason
@@ -1298,6 +1567,28 @@ def _request_id(trial_attempt_id: str, action: str, resource_id: str) -> str:
         },
         length=32,
     )
+
+
+async def _gather_all(tasks: list[asyncio.Task[None]]) -> None:
+    """Settle every issued operation before exposing the first failure."""
+
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+
+
+def _exception_text(exc: BaseException) -> str:
+    name = f"{type(exc).__module__}.{type(exc).__qualname__}"
+    message = str(exc).strip()
+    return name if not message else f"{name}: {message}"
 
 
 def _mark_issued(item: TrialRunRecord, scheduled: int, issued: int) -> TrialRunRecord:

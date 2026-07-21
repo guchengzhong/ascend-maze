@@ -13,7 +13,7 @@ import hmac
 import os
 from pathlib import Path
 import stat
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 import grpc
 import cloudpickle
@@ -1093,8 +1093,10 @@ class UdsRuntimeClient:
                     asyncio.TimeoutError,
                     ConnectionError,
                     OSError,
-                ):
+                ) as exc:
                     if transport_retries >= 1:
+                        if isinstance(exc, grpc.aio.AioRpcError):
+                            _raise_submit_transport(exc)
                         raise
                     transport_retries += 1
                     remaining = deadline - asyncio.get_running_loop().time()
@@ -1563,6 +1565,14 @@ def _json_value(value: object) -> object:
 
 def _grpc_uds_target(path: Path) -> str:
     return f"unix:{path}"
+
+
+def _raise_submit_transport(exc: grpc.aio.AioRpcError) -> NoReturn:
+    if exc.code() is grpc.StatusCode.DEADLINE_EXCEEDED:
+        raise TimeoutError("SubmitWorkflow RPC deadline exceeded") from exc
+    raise ConnectionError(
+        f"SubmitWorkflow RPC transport failed: {exc.code().name}"
+    ) from exc
 
 
 def _require_mapping(value: object, name: str) -> Mapping[str, object]:

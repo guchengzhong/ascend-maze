@@ -6,6 +6,7 @@ import importlib.metadata
 from pathlib import Path
 from types import SimpleNamespace
 
+import grpc
 import pytest
 
 from ascend_maze.cli import main as cli_main
@@ -16,7 +17,11 @@ from ascend_maze.cli.main import (
     _load_workflow_factory,
     main,
 )
-from ascend_maze.control.local_rpc import ControlRpcError, UdsRuntimeClient
+from ascend_maze.control.local_rpc import (
+    ControlRpcError,
+    UdsRuntimeClient,
+    _raise_submit_transport,
+)
 from ascend_maze.contracts.data import SharedFileRef
 from ascend_maze.core.errors import (
     ContractValidationError,
@@ -47,6 +52,22 @@ def _write_workflow_module(path: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def test_submit_transport_errors_map_to_retryable_builtin_types() -> None:
+    deadline = grpc.aio.AioRpcError(
+        grpc.StatusCode.DEADLINE_EXCEEDED,
+        details="deadline",
+    )
+    with pytest.raises(TimeoutError, match="SubmitWorkflow RPC deadline exceeded"):
+        _raise_submit_transport(deadline)
+
+    unavailable = grpc.aio.AioRpcError(
+        grpc.StatusCode.UNAVAILABLE,
+        details="unavailable",
+    )
+    with pytest.raises(ConnectionError, match="UNAVAILABLE"):
+        _raise_submit_transport(unavailable)
 
 
 def test_file_and_module_workflow_factories_compile_deterministically(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import json
 from pathlib import Path
 
@@ -20,6 +21,13 @@ from ascend_maze.benchmark.orchestrator import (
     run_study,
 )
 from ascend_maze.benchmark.persistence import atomic_write_json
+from ascend_maze.benchmark.runtime import (
+    ResourceRecoveryResult,
+    ResourceSnapshot,
+    RunFlushResult,
+    SubmissionReceipt,
+    TerminalRunResult,
+)
 from benchmark_fixtures import write_experiment_spec
 from benchmark_workload_fixtures import build
 
@@ -51,6 +59,90 @@ def _execution_spec(
         measurement_duration_ms=measurement_duration_ms,
         drain_deadline_ms=1_000,
     )
+
+
+class _InjectedFailureRuntime(FakeBenchmarkRuntime):
+    def __init__(self, clock: VirtualBenchmarkClock, stage: str) -> None:
+        super().__init__(clock)
+        self.stage = stage
+        self.fired = False
+        self.shutdown_attempts = 0
+        self.finalize_attempts = 0
+
+    def _inject(self, stage: str) -> None:
+        if self.stage == stage and not self.fired:
+            self.fired = True
+            raise RuntimeError(f"injected {stage} failure")
+
+    async def prepare_trial(self) -> Mapping[str, object]:
+        self._inject("prepare")
+        return await super().prepare_trial()
+
+    async def submit(
+        self,
+        workflow: object,
+        *,
+        inputs: dict[str, object],
+        submission_id: str,
+        run_deadline_ms: int | None,
+    ) -> SubmissionReceipt:
+        if self.submit_calls:
+            self._inject("submit")
+        return await super().submit(
+            workflow,
+            inputs=inputs,
+            submission_id=submission_id,
+            run_deadline_ms=run_deadline_ms,
+        )
+
+    async def wait_terminal(
+        self, run_id: str, *, deadline_monotonic_ms: int
+    ) -> TerminalRunResult:
+        self._inject("wait_terminal")
+        self._inject("drain_wait")
+        return await super().wait_terminal(
+            run_id, deadline_monotonic_ms=deadline_monotonic_ms
+        )
+
+    async def flush_run(self, run_id: str, *, request_id: str) -> RunFlushResult:
+        self._inject("flush")
+        return await super().flush_run(run_id, request_id=request_id)
+
+    async def wait_for_recovery(
+        self,
+        before: ResourceSnapshot,
+        *,
+        run_ids: tuple[str, ...],
+        deadline_monotonic_ms: int,
+    ) -> tuple[ResourceSnapshot, ResourceRecoveryResult]:
+        self._inject("recovery")
+        return await super().wait_for_recovery(
+            before,
+            run_ids=run_ids,
+            deadline_monotonic_ms=deadline_monotonic_ms,
+        )
+
+    async def shutdown(self, *, request_id: str) -> Mapping[str, object]:
+        self.shutdown_attempts += 1
+        self._inject("shutdown")
+        return await super().shutdown(request_id=request_id)
+
+    async def finalize_recovery(
+        self,
+        before: ResourceSnapshot,
+        after: ResourceSnapshot,
+        recovery: ResourceRecoveryResult,
+        *,
+        deadline_monotonic_ms: int,
+    ) -> tuple[ResourceSnapshot, ResourceRecoveryResult]:
+        self.finalize_attempts += 1
+        self._inject("finalize_recovery")
+        return await super().finalize_recovery(
+            before,
+            after,
+            recovery,
+            deadline_monotonic_ms=deadline_monotonic_ms,
+        )
 
 
 def test_trial_closed_loop_records_counts_and_excludes_warmup(tmp_path: Path) -> None:
@@ -215,6 +307,105 @@ def test_commit_response_loss_replays_same_submission_without_second_run(
         )
         assert resumed == state
         assert runtime.submit_calls == calls
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "stage",
+    (
+        "prepare",
+        "submit",
+        "wait_terminal",
+        "drain_wait",
+        "flush",
+        "recovery",
+        "shutdown",
+        "finalize_recovery",
+    ),
+)
+def test_runtime_exception_aborts_trial_and_recovers_resources(
+    tmp_path: Path, stage: str
+) -> None:
+    async def scenario() -> None:
+        plan = load_study_plan(
+            _execution_spec(
+                tmp_path / stage / "spec",
+                arrival_mode=("fixed_rate" if stage == "drain_wait" else "closed_loop"),
+                warmup_runs=0,
+                measurement_run_count=0 if stage == "drain_wait" else 3,
+                measurement_duration_ms=30 if stage == "drain_wait" else 0,
+            )
+        )
+        trial = plan.trials[0]
+        cell = next(item for item in plan.cells if item.cell_id == trial.cell_id)
+        clock = VirtualBenchmarkClock()
+        runtime = _InjectedFailureRuntime(clock, stage)
+        paths = TrialPaths(tmp_path / stage / "trial")
+
+        state = await TrialOrchestrator(
+            runtime_factory=FakeBenchmarkRuntimeFactory(runtime),
+            clock=clock,
+        ).execute(plan=plan, cell=cell, trial=trial, paths=paths)
+
+        assert runtime.fired
+        assert state.state == "aborted"
+        assert state.last_error is not None
+        assert f"injected {stage} failure" in state.last_error
+        assert "trial_execution_failed" in state.invalid_reasons
+        assert state.recovery is not None and state.recovery.recovered
+        assert runtime.shutdown_attempts >= 1
+        assert runtime.finalize_attempts >= 1
+        assert all(item.destroyed for item in runtime.runs_by_id.values())
+        persisted = json.loads(paths.state.read_text(encoding="utf-8"))
+        assert persisted["state"] == "aborted"
+        assert persisted["last_error"] == state.last_error
+        assert persisted["recovery"]["recovered"] is True
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_failure_preserves_primary_error_and_blocks_study(
+    tmp_path: Path,
+) -> None:
+    class CleanupFailureRuntime(_InjectedFailureRuntime):
+        async def shutdown(self, *, request_id: str) -> Mapping[str, object]:
+            del request_id
+            self.shutdown_attempts += 1
+            raise RuntimeError("injected permanent shutdown failure")
+
+    async def scenario() -> None:
+        spec = _execution_spec(
+            tmp_path / "spec", warmup_runs=0, measurement_run_count=3
+        )
+        clock = VirtualBenchmarkClock()
+        runtime = CleanupFailureRuntime(clock, "submit")
+        result = await run_study(
+            spec,
+            runtime_factory=FakeBenchmarkRuntimeFactory(runtime),
+            output_root=tmp_path / "output",
+            clock_factory=lambda: clock,
+        )
+
+        assert result.state == "blocked"
+        assert result.completed_trials == 1
+        assert result.blocked_reason == "trial_cleanup_failed"
+        plan = load_study_plan(spec)
+        attempt = TrialManifest.planned(plan.trials[0])
+        state_path = next(
+            (Path(result.study_directory) / "trials").glob(
+                f"*/*/{attempt.trial_attempt_id}/state.json"
+            )
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert "injected submit failure" in state["last_error"]
+        assert state["recovery"]["reason_code"] == "trial_cleanup_failed"
+        assert state["recovery"]["details"]["cleanup_errors"] == [
+            {
+                "stage": "shutdown",
+                "error": ("builtins.RuntimeError: injected permanent shutdown failure"),
+            }
+        ]
 
     asyncio.run(scenario())
 

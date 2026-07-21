@@ -20,6 +20,7 @@ from ascend_maze.inference.contracts import (
 )
 from ascend_maze.inference.instance_manager import ModelInstanceManager
 from ascend_maze.inference.router import InferenceRouter
+from ascend_maze.placement import NodeStatus
 
 
 @dataclass(slots=True)
@@ -303,7 +304,11 @@ class ReplicaController:
                     ready.append(self.instances.snapshot(instance.instance_id))
 
         scale = self._scale[model_id]
-        needs_scale_up = desired > len(live) and (
+        nodes = self.instances.placement.snapshot().nodes
+        scale_up_allowed = not nodes or any(
+            node.status is NodeStatus.HEALTHY for node in nodes
+        )
+        needs_scale_up = scale_up_allowed and desired > len(live) and (
             pending >= spec.scale_up_pending_threshold or not ready
         )
         if needs_scale_up:

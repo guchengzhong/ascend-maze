@@ -458,19 +458,36 @@ class C13BenchmarkRuntime(BenchmarkRuntimeClient):
             )
 
     async def shutdown(self, *, request_id: str) -> Mapping[str, object]:
+        if self._shutdown_result is not None:
+            return self._shutdown_result
+        normalized: dict[str, object]
         try:
-            result = await self.client.shutdown_controller(
-                request_id=request_id,
-                drain_timeout_ms=self.shutdown_drain_timeout_ms,
-                timeout_seconds=max(5.0, self.shutdown_drain_timeout_ms / 1_000 + 5),
-            )
-            normalized = dict(result)
+            try:
+                result = await self.client.shutdown_controller(
+                    request_id=request_id,
+                    drain_timeout_ms=self.shutdown_drain_timeout_ms,
+                    timeout_seconds=max(
+                        5.0, self.shutdown_drain_timeout_ms / 1_000 + 5
+                    ),
+                )
+                normalized = dict(result)
+            except Exception as exc:
+                normalized = {
+                    "cleanup_confirmed": False,
+                    "timed_out": isinstance(exc, (TimeoutError, asyncio.TimeoutError)),
+                    "exit_code": 1,
+                    "rpc_error": _exception_text(exc),
+                }
             if self.process is not None:
                 try:
                     await asyncio.wait_for(self.process.wait(), timeout=10.0)
                 except TimeoutError:
                     self.process.terminate()
-                    await self.process.wait()
+                    try:
+                        await asyncio.wait_for(self.process.wait(), timeout=10.0)
+                    except TimeoutError:
+                        self.process.kill()
+                        await self.process.wait()
                     normalized["cleanup_confirmed"] = False
                     normalized["timed_out"] = True
                 if self.process.returncode not in {None, 0}:
@@ -735,3 +752,9 @@ def _contains_value(value: object, expected: str) -> bool:
     if isinstance(value, (list, tuple)):
         return any(_contains_value(item, expected) for item in value)
     return False
+
+
+def _exception_text(exc: BaseException) -> str:
+    name = f"{type(exc).__module__}.{type(exc).__qualname__}"
+    message = str(exc).strip()
+    return name if not message else f"{name}: {message}"

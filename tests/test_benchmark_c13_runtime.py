@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -235,6 +236,59 @@ def test_formal_adapter_maps_only_public_c13_runtime_operations() -> None:
     assert "ascend_maze.control.controller" not in imports
     assert "create_subprocess_exec" in source
     assert "shell=" not in source
+
+
+def test_shutdown_rpc_failure_still_reaps_managed_controller_process() -> None:
+    class Client:
+        calls = 0
+
+        async def shutdown_controller(self, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            self.calls += 1
+            raise ConnectionError("injected shutdown transport failure")
+
+    class Process:
+        returncode: int | None = None
+        terminated = False
+        killed = False
+
+        async def wait(self) -> int:
+            if not self.terminated and not self.killed:
+                raise TimeoutError("process still running")
+            self.returncode = -15 if self.terminated else -9
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+    async def scenario() -> None:
+        client = Client()
+        process = Process()
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+        runtime = C13BenchmarkRuntime(
+            client,  # type: ignore[arg-type]
+            process=process,  # type: ignore[arg-type]
+            stdout=stdout,
+            stderr=stderr,
+            shutdown_drain_timeout_ms=100,
+        )
+
+        result = await runtime.shutdown(request_id="shutdown-failure")
+        repeated = await runtime.shutdown(request_id="shutdown-failure")
+
+        assert repeated is result
+        assert client.calls == 1
+        assert process.terminated and not process.killed
+        assert result["cleanup_confirmed"] is False
+        assert result["exit_code"] == -15
+        assert "injected shutdown transport failure" in str(result["rpc_error"])
+        assert stdout.closed and stderr.closed
+
+    asyncio.run(scenario())
 
 
 def test_formal_factory_starts_controller_with_argv_and_frozen_overrides(
