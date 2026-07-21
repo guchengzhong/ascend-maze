@@ -65,6 +65,9 @@ class FakeBenchmarkRuntime(BenchmarkRuntimeClient):
         self.max_active_runs = 0
         self._lost_responses: set[str] = set()
 
+    async def prepare_trial(self) -> Mapping[str, object]:
+        return {"model_ready": True, "standby_ready": True}
+
     async def resource_snapshot(self) -> ResourceSnapshot:
         return ResourceSnapshot.create(
             captured_at_wall_ms=self.clock.wall_ms(),
@@ -205,6 +208,17 @@ class FakeBenchmarkRuntime(BenchmarkRuntimeClient):
         self.shutdown_calls.append(request_id)
         return {"cleanup_confirmed": True, "timed_out": False, "exit_code": 0}
 
+    async def finalize_recovery(
+        self,
+        before: ResourceSnapshot,
+        after: ResourceSnapshot,
+        recovery: ResourceRecoveryResult,
+        *,
+        deadline_monotonic_ms: int,
+    ) -> tuple[ResourceSnapshot, ResourceRecoveryResult]:
+        del before, deadline_monotonic_ms
+        return after, recovery
+
     def _run(self, run_id: str) -> _FakeRun:
         try:
             return self.runs_by_id[run_id]
@@ -213,6 +227,8 @@ class FakeBenchmarkRuntime(BenchmarkRuntimeClient):
 
 
 class FakeBenchmarkRuntimeFactory(BenchmarkRuntimeFactory):
+    analysis_after_each_trial = False
+
     def __init__(self, runtime: FakeBenchmarkRuntime) -> None:
         self.runtime = runtime
         self.open_calls: list[tuple[str, bool]] = []

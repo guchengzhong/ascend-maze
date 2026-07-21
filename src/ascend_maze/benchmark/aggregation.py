@@ -927,7 +927,10 @@ def _apply_guard_decisions(rows: list[dict[str, object]]) -> None:
         grouped.setdefault(key, {})[cast(str, row["metric_name"])] = row
     for metrics in grouped.values():
         reasons: list[str] = []
-        for guard_name in sorted(CORRECTNESS_GUARD_METRICS):
+        guard_names = set(CORRECTNESS_GUARD_METRICS)
+        if "scheduling_order_match" in metrics:
+            guard_names.add("scheduling_order_match")
+        for guard_name in sorted(guard_names):
             guard = metrics.get(guard_name)
             if guard is None or cast(int, guard["paired_blocks"]) == 0:
                 reasons.append(f"guard_missing:{guard_name}")
@@ -935,7 +938,7 @@ def _apply_guard_decisions(rows: list[dict[str, object]]) -> None:
             effect = guard["relative_effect_pct"]
             absolute = guard["absolute_effect"]
             lower = guard["ci95_lower"]
-            if guard_name == "success_rate":
+            if guard_name in {"scheduling_order_match", "success_rate"}:
                 if (
                     not isinstance(effect, (int, float))
                     or not isinstance(lower, (int, float))

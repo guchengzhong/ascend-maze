@@ -20,7 +20,15 @@ from ascend_maze.ascend import (
     discover_atb_runtime_library_preloads,
 )
 from ascend_maze.config import LoadedConfig, load_model_catalog
+from ascend_maze.config.schema import MainConfig
 from ascend_maze.contracts.recording import ParquetRecorderConfig
+from ascend_maze.contracts.resources import ReservationVector
+from ascend_maze.contracts.worker import (
+    WarmupManifest,
+    WorkerPoolConfig,
+    WorkerPoolProfileConfig,
+    WorkerProfile,
+)
 from ascend_maze.control.node_rpc import NodeAgent, NodeAgentIdentity
 from ascend_maze.control.contracts import NodeRuntimePolicy
 from ascend_maze.control.ray_host import ManagedRayHost
@@ -214,6 +222,7 @@ class ControllerApplication:
                 environment_fingerprint=environment.environment_fingerprint
             )
         )
+        worker_pool_config = _worker_pool_config(config)
         ray_config = RayClusterConfig(
             namespace=config.ray.namespace,
             temp_directory=config.ray.temp_directory,
@@ -264,6 +273,7 @@ class ControllerApplication:
             max_bypass_count=config.scheduler.max_bypass_count,
             dispatch_timeout_ms=config.scheduler.dispatch_timeout_ms,
             recorder=recorder,
+            worker_pool_config=worker_pool_config,
             inference=inference,
             node_registry=node_registry,
             recovery_path=Path(config.control.recovery_path),
@@ -304,6 +314,45 @@ class ControllerApplication:
                 except NotImplementedError:  # pragma: no cover
                     pass
             await host.close()
+
+
+def _worker_pool_config(config: MainConfig) -> WorkerPoolConfig:
+    """Translate the frozen C13 worker watermarks into the C10 pool contract."""
+
+    worker = config.worker
+    min_idle = worker.standby_min_idle
+    max_idle = worker.standby_max_idle
+    mode = "zero_hbm_standby" if max_idle > 0 else "cold_start"
+    profiles = tuple(
+        WorkerPoolProfileConfig(
+            profile=profile,
+            min_idle=min_idle,
+            max_idle=max_idle,
+            max_total=worker.max_total,
+            replenish_concurrency=1,
+            idle_ttl_ms=60_000,
+            acquire_timeout_ms=worker.binding_deadline_ms,
+            max_tasks_per_worker=worker.max_tasks_per_worker,
+            max_worker_lifetime_ms=120_000,
+            max_rss_growth_mb=256,
+            standby_resources=ReservationVector(
+                cpu_num=1,
+                host_mem_mb=256,
+                io_slots=1 if profile is WorkerProfile.IO else 0,
+                npu_hbm_mb=0,
+                npu_slots=0,
+            ),
+            termination_timeout_ms=worker.binding_deadline_ms,
+            warmup_manifest=WarmupManifest(("json",)),
+        )
+        for profile in (WorkerProfile.CPU, WorkerProfile.IO, WorkerProfile.NPU_HOST)
+    )
+    return WorkerPoolConfig(
+        mode=mode,
+        profiles=profiles,
+        reconcile_interval_ms=250,
+        config_generation=1,
+    )
 
 
 def _recorder(config: object, cursor_key: bytes) -> ParquetRecorder | NoopRecorder:

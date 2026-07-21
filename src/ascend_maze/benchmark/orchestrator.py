@@ -382,6 +382,7 @@ class TrialOrchestrator:
         self, runtime: BenchmarkRuntimeClient, journal: TrialJournal
     ) -> None:
         if journal.state.resource_before is None:
+            await runtime.prepare_trial()
             before = await runtime.resource_snapshot()
             await journal.revise(
                 wall_ms=self.clock.wall_ms(),
@@ -546,11 +547,8 @@ class TrialOrchestrator:
                 resource_after=after,
                 recovery=recovery,
             )
-            if not recovery.recovered:
-                await journal.add_invalid_reason(
-                    recovery.reason_code or "resource_recovery_failed",
-                    wall_ms=self.clock.wall_ms(),
-                )
+        assert journal.state.resource_after is not None
+        assert journal.state.recovery is not None
         shutdown = await runtime.shutdown(
             request_id=_request_id(
                 journal.state.trial_attempt_id,
@@ -564,6 +562,24 @@ class TrialOrchestrator:
         ):
             await journal.add_invalid_reason(
                 "safe_shutdown_failed", wall_ms=self.clock.wall_ms()
+            )
+        final_after, final_recovery = await runtime.finalize_recovery(
+            before,
+            journal.state.resource_after,
+            journal.state.recovery,
+            deadline_monotonic_ms=(
+                self.clock.monotonic_ms() + spec.windows.drain_deadline_ms
+            ),
+        )
+        await journal.revise(
+            wall_ms=self.clock.wall_ms(),
+            resource_after=final_after,
+            recovery=final_recovery,
+        )
+        if not final_recovery.recovered:
+            await journal.add_invalid_reason(
+                final_recovery.reason_code or "resource_recovery_failed",
+                wall_ms=self.clock.wall_ms(),
             )
         terminal = "invalid" if journal.state.invalid_reasons else "valid"
         await journal.transition(terminal, wall_ms=self.clock.wall_ms())
@@ -999,6 +1015,8 @@ async def _continue_study(
     failpoint: AtomicWriteFailpoint | None,
 ) -> StudyExecutionResult:
     completed = _audit_study_trials(plan, root, manifest)
+    if runtime_factory.analysis_after_each_trial:
+        _ensure_analysis_history(root, completed)
     if manifest.get("state") == "completed":
         if len(completed) != len(plan.trials):
             raise ExperimentValidationError(
@@ -1054,12 +1072,71 @@ async def _continue_study(
             atomic_write_json(
                 root / "study_manifest.json", mutable, failpoint=failpoint
             )
+            if runtime_factory.analysis_after_each_trial:
+                _run_analysis_pipeline(root, result.trial_attempt_id)
             return _study_result(root, mutable)
         atomic_write_json(root / "study_manifest.json", mutable, failpoint=failpoint)
+        if runtime_factory.analysis_after_each_trial:
+            _run_analysis_pipeline(root, result.trial_attempt_id)
     mutable["state"] = "completed"
     mutable["blocked_reason"] = None
     atomic_write_json(root / "study_manifest.json", mutable, failpoint=failpoint)
     return _study_result(root, mutable)
+
+
+def _run_analysis_pipeline(root: Path, trial_attempt_id: str) -> None:
+    """Commit the only formal analysis path after every completed Trial."""
+
+    from ascend_maze.benchmark.aggregation import aggregate_study
+    from ascend_maze.benchmark.importer import validate_study
+    from ascend_maze.benchmark.reporting import report_study
+
+    validation = validate_study(root)
+    aggregate_study(root)
+    report = report_study(root)
+    aggregate_manifest = load_json_object(
+        root / "aggregates" / "manifest.json",
+        description="aggregate manifest",
+    )
+    atomic_write_json(
+        root / "analysis_history" / f"{trial_attempt_id}.json",
+        {
+            "schema_version": 1,
+            "trial_attempt_id": trial_attempt_id,
+            "pipeline": ("validate", "aggregate", "report"),
+            "validation_digest": validation["validation_digest"],
+            "aggregate_manifest_digest": canonical_json_digest(aggregate_manifest),
+            "report_digest": report["content_digest"],
+        },
+    )
+
+
+def _ensure_analysis_history(
+    root: Path, completed: Mapping[str, Mapping[str, object]]
+) -> None:
+    for entry in completed.values():
+        trial_attempt_id = cast(str, entry["trial_attempt_id"])
+        path = root / "analysis_history" / f"{trial_attempt_id}.json"
+        if not path.exists():
+            _run_analysis_pipeline(root, trial_attempt_id)
+            continue
+        payload = load_json_object(path, description="Trial analysis history")
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("trial_attempt_id") != trial_attempt_id
+            or payload.get("pipeline") != ["validate", "aggregate", "report"]
+            or any(
+                not isinstance(payload.get(name), str) or not payload.get(name)
+                for name in (
+                    "validation_digest",
+                    "aggregate_manifest_digest",
+                    "report_digest",
+                )
+            )
+        ):
+            raise ExperimentValidationError(
+                f"Trial analysis history is invalid: {trial_attempt_id}"
+            )
 
 
 def _new_study_manifest(plan: StudyPlan, source: Path) -> dict[str, object]:

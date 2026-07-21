@@ -99,6 +99,13 @@ _DEFINITIONS = (
     _definition("scheduler_policy_select_ms", "ms", "Scheduler policy selection duration"),
     _definition("scheduler_placement_ms", "ms", "Scheduler placement duration"),
     _definition("scheduler_total_ms", "ms", "Scheduler score, policy and placement duration"),
+    _definition(
+        "scheduling_order_match",
+        "ratio",
+        "Whether read clients preserved the reference scheduling order",
+        higher_is_better=True,
+        scope="trial",
+    ),
     _definition("data_binding_ms", "ms", "Input binding duration"),
     _definition("object_store_get_ms", "ms", "Object Store read duration"),
     _definition("object_store_put_ms", "ms", "Object Store write duration"),
@@ -310,6 +317,9 @@ def extract_metric(
     measured_runs = tuple(run for run in runs if run.phase == "measurement")
     run_ids = {run.run_id for run in measured_runs if run.run_id is not None}
     selected_events = tuple(event for event in events if event.run_id in run_ids)
+    direct = _direct_microbenchmark_samples(name, selected_events)
+    if direct:
+        return MetricExtraction(definition, direct)
 
     if name == "dct_ms":
         samples = _dct_samples(selected_events)
@@ -399,6 +409,32 @@ def extract_metric(
         samples = ()
     reasons = () if samples else ("metric_required_fact_missing",)
     return MetricExtraction(definition, samples, reasons)
+
+
+def _direct_microbenchmark_samples(
+    metric_name: str, events: Sequence[ExecutionEvent]
+) -> tuple[MetricSample, ...]:
+    samples: list[MetricSample] = []
+    for event in events:
+        if (
+            event.event_type != "microbenchmark_sample"
+            or event.payload.get("metric_name") != metric_name
+        ):
+            continue
+        value = event.payload.get("value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        samples.append(
+            MetricSample(
+                metric_name=metric_name,
+                value=float(value),
+                run_id=event.run_id,
+                node_id=event.node_id,
+                device_id=event.device_id,
+                producer_id=event.producer_id,
+            )
+        )
+    return tuple(samples)
 
 
 def _dct_samples(events: Sequence[ExecutionEvent]) -> tuple[MetricSample, ...]:

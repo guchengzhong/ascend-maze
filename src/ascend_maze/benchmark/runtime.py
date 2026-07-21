@@ -220,6 +220,8 @@ class ResourceRecoveryResult:
 class BenchmarkRuntimeClient(Protocol):
     """The complete runtime surface visible to the benchmark orchestrator."""
 
+    async def prepare_trial(self) -> Mapping[str, object]: ...
+
     async def resource_snapshot(self) -> ResourceSnapshot: ...
 
     async def submit(
@@ -251,8 +253,19 @@ class BenchmarkRuntimeClient(Protocol):
 
     async def shutdown(self, *, request_id: str) -> Mapping[str, object]: ...
 
+    async def finalize_recovery(
+        self,
+        before: ResourceSnapshot,
+        after: ResourceSnapshot,
+        recovery: ResourceRecoveryResult,
+        *,
+        deadline_monotonic_ms: int,
+    ) -> tuple[ResourceSnapshot, ResourceRecoveryResult]: ...
+
 
 class BenchmarkRuntimeFactory(Protocol):
+    analysis_after_each_trial: bool
+
     async def open(
         self,
         *,

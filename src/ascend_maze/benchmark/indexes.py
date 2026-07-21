@@ -328,6 +328,17 @@ def metric_validity(
     formal_inputs_valid: bool = True,
 ) -> tuple[MetricValidity, ...]:
     event_tuple = tuple(events)
+    direct_metrics = {
+        metric_name
+        for event in event_tuple
+        if event.event_type == "microbenchmark_sample"
+        for payload in (_payload(event),)
+        for metric_name in (payload.get("metric_name"),)
+        if isinstance(metric_name, str)
+        and metric_name
+        and isinstance(payload.get("value"), (int, float))
+        and not isinstance(payload.get("value"), bool)
+    }
     by_run: dict[str, tuple[ExecutionEvent, ...]] = {
         run_id: tuple(event for event in event_tuple if event.run_id == run_id)
         for run_id in run_ids
@@ -337,7 +348,9 @@ def metric_validity(
         reasons: set[str] = set()
         if not trial_integrity_valid:
             reasons.add("metric_required_fact_missing")
-        if metric == "dct_ms":
+        if metric in direct_metrics:
+            pass
+        elif metric == "dct_ms":
             if any(not _has_valid_dct(events) for events in by_run.values()):
                 reasons.add("metric_required_fact_missing")
         elif metric == "throughput_success_per_s":

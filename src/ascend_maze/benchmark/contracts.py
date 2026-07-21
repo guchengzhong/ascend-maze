@@ -26,6 +26,12 @@ TRIAL_MANIFEST_SCHEMA = "ascend-maze.trial-manifest.v1"
 ANALYSIS_POLICY_VERSION = "c14_v1"
 INTERNAL_ABLATION_MATRIX = "internal_ablation_v1"
 CUSTOM_MATRIX = "custom_v1"
+BENCHMARK_OVERRIDE_PATHS = frozenset(
+    {
+        "benchmark.c12_bookkeeping",
+        "benchmark.c13_read_clients",
+    }
+)
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -66,7 +72,7 @@ OVERRIDABLE_CONFIG_PATHS = frozenset(
         "worker.standby_max_idle",
         "worker.standby_min_idle",
     }
-)
+) | BENCHMARK_OVERRIDE_PATHS
 
 
 def _required_string(name: str, value: object) -> str:

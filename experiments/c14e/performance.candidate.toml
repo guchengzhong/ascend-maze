@@ -1,0 +1,76 @@
+schema_version = 1
+profile = "performance"
+
+[control]
+runtime_directory = "../../benchmark_output/c14e/runtime"
+shutdown_drain_timeout_ms = 30000
+shutdown_cleanup_timeout_ms = 60000
+watch_retention_count = 20000
+max_inline_control_bytes = 1048576
+max_inline_result_bytes = 1048576
+
+[workflow]
+max_literal_value_bytes = 65536
+max_compiled_literal_bytes = 1048576
+
+[data]
+shared_filesystem_roots = ["../../../model_weight/model_from_hf"]
+
+[cluster]
+cluster_id = "ascend-maze-c14e"
+environment_fingerprint = "d178ab70c6b8902a47f602a91e7c622a667fc43cbc6baec8fd0eb7a1d6baecb4"
+expected_node_count = 1
+head_node_id = "train01"
+head_node_ip = "127.0.0.1"
+
+[runtime.ray]
+namespace = "ascend-maze-c14e"
+temp_directory = "../../benchmark_output/c14e/ray_tmp"
+object_store_memory_bytes = 2147483648
+include_dashboard = false
+local_num_cpus = 64
+disable_ray_npu_resource = true
+
+[scheduler]
+policy = "hacs_no_tp"
+partitioner = "heterogeneous"
+placement_lookahead = 16
+max_bypass_count = 16
+dispatch_timeout_ms = 30000
+
+[placement]
+anchor_strategy = "static"
+task_slots_total = 2
+allow_colocation = true
+npu_system_reserved_hbm_mb = 4096
+npu_hbm_headroom_mb = 2048
+host_mem_headroom_mb = 4096
+io_slots_total = 32
+
+[worker]
+max_tasks_per_worker = 1
+standby_min_idle = 2
+standby_max_idle = 2
+max_total = 64
+binding_deadline_ms = 30000
+hbm_recovery_deadline_ms = 60000
+hbm_recovery_tolerance_mb = 64
+
+[inference]
+model_catalog_path = "model_catalog.toml"
+reconcile_interval_ms = 100
+
+[recording]
+backend = "parquet"
+root_directory = "../../benchmark_output/c14e/records"
+control_queue_capacity = 32768
+telemetry_queue_capacity = 8192
+batch_size = 512
+flush_interval_ms = 1000
+compression = "zstd"
+max_page_size = 1000
+flush_timeout_ms = 60000
+
+[fault]
+retry_backoff_ms = 100
+max_retries_default = 0

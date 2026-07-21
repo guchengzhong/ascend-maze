@@ -1,0 +1,45 @@
+schema_version = 1
+catalog_revision = "qwen3-4b-hf-6dc0981b8829"
+
+[[models]]
+model_id = "qwen3-4b"
+artifact_path = "../../../model_weight/model_from_hf/Qwen3-4B"
+tokenizer_path = "../../../model_weight/model_from_hf/Qwen3-4B"
+artifact_revision = "6dc0981b8829fead746441f68f38f24c5ca4a3a66351f652c26c6df0efc43ab2"
+backend = "vllm_ascend"
+dtype = "bfloat16"
+tensor_parallel_size = 1
+max_model_len = 2048
+instance_cpu_num = 4
+instance_host_mem_mb = 16384
+weight_hbm_mb = 7500
+runtime_hbm_mb = 4000
+kv_cache_hbm_mb = 22000
+instance_hbm_mb = 36000
+npu_slots = 1
+allow_colocation = false
+request_capacity = 4
+required_capabilities = ["vllm_ascend"]
+min_replicas = 1
+max_replicas = 8
+target_route_utilization = 0.75
+scale_up_pending_threshold = 1
+scale_up_sustain_ms = 500
+scale_down_idle_ms = 600000
+scale_cooldown_ms = 5000
+max_parallel_starts = 2
+startup_timeout_ms = 180000
+drain_timeout_ms = 30000
+
+[models.launch_options]
+block_size = 128
+enable_prefix_caching = true
+enforce_eager = true
+gpu_memory_utilization = 0.5
+log_level = "INFO"
+max_num_seqs = 8
+
+[models.warmup_request]
+messages = [{ role = "user", content = "Reply briefly: ready." }]
+max_tokens = 8
+temperature = 0.0

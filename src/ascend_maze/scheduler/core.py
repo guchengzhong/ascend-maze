@@ -984,7 +984,14 @@ class SchedulerCore:
             for partition in ordered:
                 policy_started_ns = perf_counter_ns()
                 proposals = self.policy.propose(partition, self.placement_lookahead)
-                policy_select_ms = (perf_counter_ns() - policy_started_ns) / 1_000_000
+                policy_elapsed_ms = (
+                    perf_counter_ns() - policy_started_ns
+                ) / 1_000_000
+                policy_select_ms = max(
+                    0.0,
+                    policy_elapsed_ms
+                    - sum(proposal.score_compute_ms for proposal in proposals),
+                )
                 blocked_before: list[TaskKey] = []
                 for proposal_rank, proposal in enumerate(proposals, start=1):
                     key = proposal.task_key

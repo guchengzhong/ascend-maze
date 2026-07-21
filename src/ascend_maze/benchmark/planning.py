@@ -8,6 +8,7 @@ import hashlib
 
 from ascend_maze.benchmark.canonical import derive_seed, stable_payload_id, thaw
 from ascend_maze.benchmark.contracts import (
+    BENCHMARK_OVERRIDE_PATHS,
     INTERNAL_ABLATION_MATRIX,
     SCHEMA_VERSION,
     CellDefinition,
@@ -93,7 +94,9 @@ def _build_cell(
     base_resolved: Mapping[str, object],
 ) -> CellSpec:
     override_pairs = tuple(
-        (item.path, thaw(item.value)) for item in definition.overrides
+        (item.path, thaw(item.value))
+        for item in definition.overrides
+        if item.path not in BENCHMARK_OVERRIDE_PATHS
     )
     loaded = load_config(
         spec.base_config_path,
@@ -102,7 +105,16 @@ def _build_cell(
         config_overrides=override_pairs,
     )
     resolved = _plain_mapping(loaded.snapshot.resolved, f"cell {definition.name}")
-    differences = _config_differences(base_resolved, resolved)
+    differences = _config_differences(base_resolved, resolved) + tuple(
+        ConfigDifference(
+            path=item.path,
+            before=None,
+            after=item.value,
+        )
+        for item in definition.overrides
+        if item.path in BENCHMARK_OVERRIDE_PATHS
+    )
+    differences = tuple(sorted(differences, key=lambda item: item.path))
     expected_paths = {item.path for item in definition.overrides}
     actual_paths = {item.path for item in differences}
     if expected_paths != actual_paths:
