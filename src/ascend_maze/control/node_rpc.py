@@ -132,7 +132,7 @@ def _execution_event_from_runtime(
     event: RuntimeEvent,
     wall_time_ms: int,
 ) -> ExecutionEvent:
-    payload_items: list[tuple[str, object]] = []
+    payload_items: list[tuple[str, object]] = [("dispatch_id", event.dispatch_id)]
     if event.worker_pid is not None:
         payload_items.append(("worker_pid", event.worker_pid))
     if event.device_id is not None:

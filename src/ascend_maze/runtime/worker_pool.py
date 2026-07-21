@@ -380,6 +380,13 @@ class StandbyWorkerBroker:
                 with self._lock:
                     record.releasing = False
                     record.released = True
+                self._emit_lease(
+                    "worker_released",
+                    worker.descriptor,
+                    record.lease,
+                    record.placement_lease,
+                    reason=disposition,
+                )
                 return True
         try:
             await self._retire_worker(descriptor.worker_id, f"worker_{disposition}")
@@ -390,6 +397,13 @@ class StandbyWorkerBroker:
         with self._lock:
             record.releasing = False
             record.released = True
+        self._emit_lease(
+            "worker_released",
+            descriptor,
+            record.lease,
+            record.placement_lease,
+            reason=disposition,
+        )
         self.notify_changed()
         return True
 

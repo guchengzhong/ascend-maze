@@ -142,6 +142,29 @@ class RayHostController(InMemoryController):
         node_registry = node_registry or RayNodeRegistry()
         effective_placement = placement or PlacementManager()
         pool_events: list[WorkerPoolEvent] = []
+
+        def capture_pool_event(event: WorkerPoolEvent) -> None:
+            pool_events.append(event)
+            if event.run_id is None or not hasattr(self, "core"):
+                return
+            self.core.record_control_event(
+                event.run_id,
+                event.event_type,
+                task_id=event.task_id,
+                attempt=event.attempt,
+                lease_id=event.placement_lease_id,
+                payload={
+                    "boot_id": event.boot_id,
+                    "worker_id": event.worker_id,
+                    "worker_lease_id": event.worker_lease_id,
+                    "worker_profile": event.profile.value,
+                    "reason": event.reason,
+                    "worker_acquire_ms": event.worker_acquire_ms,
+                    "cold_start_ms": event.cold_start_ms,
+                    "host_warmup_ms": event.host_warmup_ms,
+                },
+            )
+
         worker_broker: ColdWorkerBroker | StandbyWorkerBroker
         if worker_pool_config is None:
             worker_broker = ColdWorkerBroker(
@@ -155,7 +178,7 @@ class RayHostController(InMemoryController):
                 environment_fingerprint=environment_fingerprint,
                 config=worker_pool_config,
                 endpoint_factory=RayWorkerEndpointFactory(),
-                event_sink=pool_events.append,
+                event_sink=capture_pool_event,
             )
         runtime = RayRuntimeBackend(
             data_store=data_store,

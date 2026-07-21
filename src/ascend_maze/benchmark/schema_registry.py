@@ -18,13 +18,16 @@ SCHEMA_FILES = (
     "baseline_trial_result.v1.schema.json",
     "controller_config_overrides.v1.schema.json",
     "experiment_spec.v1.schema.json",
+    "raw_files.v1.schema.json",
     "report.v1.schema.json",
     "run_manifest.v1.schema.json",
     "study_manifest.v1.schema.json",
     "study_plan.v1.schema.json",
+    "study_validation.v1.schema.json",
     "trace_schedule.v1.schema.json",
     "trial_manifest.v1.schema.json",
     "trial_state.v1.schema.json",
+    "trial_validation.v1.schema.json",
     "workload_dataset.v1.schema.json",
 )
 

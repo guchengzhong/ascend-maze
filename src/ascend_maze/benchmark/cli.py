@@ -26,6 +26,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output-root", default="experiment_output")
     resume = commands.add_parser("resume", help="resume an interrupted Study")
     resume.add_argument("study_directory")
+    validate = commands.add_parser(
+        "validate", help="import and validate a completed Study"
+    )
+    validate.add_argument("study_directory")
     return parser
 
 
@@ -51,6 +55,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             sys.stdout.write("\n")
             return 0 if result.get("state") == "completed" else 1
+        if args.command == "validate":
+            from ascend_maze.benchmark.importer import validate_study
+
+            result = validate_study(args.study_directory)
+            json.dump(
+                result,
+                sys.stdout,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            sys.stdout.write("\n")
+            return 0 if result.get("study_valid") is True else 1
         parser.print_help(sys.stderr)
         return 2
     except ContractValidationError as exc:

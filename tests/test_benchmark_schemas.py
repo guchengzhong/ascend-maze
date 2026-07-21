@@ -13,7 +13,7 @@ from ascend_maze.core.errors import ExperimentValidationError
 
 
 def test_all_versioned_benchmark_schemas_are_packaged_and_fingerprinted() -> None:
-    assert len(SCHEMA_FILES) == 16
+    assert len(SCHEMA_FILES) == 19
     digests = dict(schema_digests())
     assert tuple(sorted(digests)) == SCHEMA_FILES
     assert all(len(value) == 64 for value in digests.values())

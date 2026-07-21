@@ -48,7 +48,7 @@ def test_internal_ablation_plan_expands_paired_blocks(tmp_path: Path) -> None:
         assert len({trial.trial_seed for trial in trials}) == 5
     decoded = json.loads(plan.canonical_bytes)
     assert decoded["study_id"] == plan.spec.study_id
-    assert len(decoded["schema_digests"]) == 16
+    assert len(decoded["schema_digests"]) == 19
     assert str(tmp_path) not in plan.spec.canonical_bytes.decode("utf-8")
 
 

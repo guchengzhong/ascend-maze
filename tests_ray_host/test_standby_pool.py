@@ -21,6 +21,7 @@ from ascend_maze.contracts.worker import (
 )
 from ascend_maze.lifecycle import RunStatus
 from ascend_maze.placement import NodeCapacity
+from ascend_maze.recording import InMemoryRecorder
 from ascend_maze.runtime.ray_node_registry import RuntimeNodeStatus
 from tests_ray_host.standby_task_fixtures import (
     drain_slow_cpu_task,
@@ -210,6 +211,24 @@ def test_ray_standby_actor_reuses_pid_and_common_execution_path(
             assert controller.placement.active_lease_count(outcome.run_id) == 0
             assert controller.placement.active_lease_count() == 1
             assert any(event.event_type == "standby_hit" for event in controller.pool_events)
+            assert isinstance(controller.ray_recorder, InMemoryRecorder)
+            recorded_worker_events = tuple(
+                event
+                for event in controller.ray_recorder.events(outcome.run_id)
+                if event.event_type in {"standby_hit", "worker_released"}
+            )
+            assert len(recorded_worker_events) == 4
+            assert {event.event_type for event in recorded_worker_events} == {
+                "standby_hit",
+                "worker_released",
+            }
+            assert all(
+                isinstance(event.payload["worker_lease_id"], str)
+                and event.lease_id is not None
+                and event.task_id is not None
+                and event.attempt == 1
+                for event in recorded_worker_events
+            )
 
             await controller.destroy_run(outcome.run_id)
         finally:

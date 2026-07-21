@@ -606,10 +606,24 @@ class SchedulerCore:
         run_id: str,
         event_type: str,
         *,
+        task_id: str | None = None,
+        attempt: int | None = None,
+        lease_id: str | None = None,
+        route_lease_id: str | None = None,
+        model_instance_id: str | None = None,
         payload: dict[str, object] | None = None,
     ) -> None:
         if run_id in self._runs:
-            self._record(run_id, event_type, payload=payload)
+            self._record(
+                run_id,
+                event_type,
+                task_id=task_id,
+                attempt=attempt,
+                lease_id=lease_id,
+                route_lease_id=route_lease_id,
+                model_instance_id=model_instance_id,
+                payload=payload,
+            )
 
     async def flush_run_recording(self, run_id: str) -> FlushResult:
         cached = self._recording_flushes.get(run_id)
@@ -1229,6 +1243,19 @@ class SchedulerCore:
                                 if route_lease is None
                                 else route_lease.instance_id
                             ),
+                            payload={
+                                "dispatch_id": dispatch_id,
+                                "model_id": (
+                                    None
+                                    if route_lease is None
+                                    else route_lease.model_id
+                                ),
+                                "instance_generation": (
+                                    None
+                                    if route_lease is None
+                                    else route_lease.instance_generation
+                                ),
+                            },
                         )
                         for blocked_key in blocked_before:
                             blocked = self._blocked.get(blocked_key)
