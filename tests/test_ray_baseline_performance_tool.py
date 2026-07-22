@@ -83,6 +83,26 @@ def test_ray_performance_family_defaults_to_text_but_can_select_vision() -> None
     assert vision_args.family == ["vision"]
 
 
+def test_ray_performance_plan_records_vision_launch_workarounds() -> None:
+    tool = _load_tool()
+    args = tool.parse_args(["--plan-only", "--family", "vision"])
+    args.data_root = REPO_ROOT / "data"
+    args.text_model_path = Path("/models/text")
+    args.vision_model_path = Path("/models/vision")
+
+    plan = tool._build_plan(  # noqa: SLF001
+        args=args,
+        output_dir=REPO_ROOT / "experiments" / "ray_baseline_performance" / "unit",
+        samples=[],
+        discovery_failures=[],
+    )
+
+    assert plan["models"]["vision"]["launch_options"] == {
+        "generation_config": "vllm",
+        "qwen2_5_vl_cpu_unique_consecutive_workaround": True,
+    }
+
+
 def test_ray_performance_batch_mode_uses_batch_size_not_iterations() -> None:
     tool = _load_tool()
     args = tool.parse_args(

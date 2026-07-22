@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from base64 import b64encode
 from collections.abc import Mapping, Sequence
 from hashlib import sha256
 from io import BytesIO
@@ -133,6 +134,75 @@ def chat_prompt_batch(
             "reason": 0,
         },
     )
+
+
+def chat_image_prompt_batch(
+    prompts: list[str],
+    images: list[dict[str, object]],
+    metadata: dict[str, object],
+    override_key: str,
+    *,
+    max_tokens: int = 1024,
+) -> tuple[list[str], dict[str, object]]:
+    from ascend_maze.inference import chat
+
+    if len(prompts) != len(images):
+        raise ValueError("prompts and images must have the same length")
+    answers: list[str] = []
+    total_input_tokens = 0
+    total_output_tokens = 0
+    true_multimodal_count = 0
+    for index, (prompt, image) in enumerate(zip(prompts, images)):
+        content = image_content_parts(prompt, image)
+        if isinstance(content, list):
+            true_multimodal_count += 1
+        response = chat(
+            [{"role": "user", "content": content}],
+            max_tokens=max_tokens,
+            temperature=0.0,
+        )
+        override = list_override(metadata, override_key, index)
+        answers.append(response.text if override is None else override)
+        total_input_tokens += response.input_tokens
+        total_output_tokens += response.output_tokens
+    return (
+        answers,
+        {
+            "text_length": sum(len(prompt) for prompt in prompts),
+            "token_count": sum(estimate_tokens(prompt) for prompt in prompts),
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "batch_size": len(prompts),
+            "reason": 0,
+            "vision_input_mode": (
+                "true_multimodal"
+                if true_multimodal_count == len(images)
+                else "mixed_or_text_only"
+            ),
+            "true_multimodal_count": true_multimodal_count,
+        },
+    )
+
+
+def image_content_parts(
+    prompt: str,
+    image_info: dict[str, object],
+) -> list[dict[str, object]] | str:
+    content = image_info.get("content")
+    if not isinstance(content, bytes) or not content:
+        return prompt
+    return [
+        {"type": "text", "text": prompt},
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": _image_data_url(
+                    content,
+                    str(image_info.get("file_name", "")),
+                )
+            },
+        },
+    ]
 
 
 def list_override(
@@ -305,26 +375,27 @@ def image_caption_prompt(
 
 def multimodal_vqa_prompt(question: str, image_info: dict[str, object]) -> str:
     return (
-        "Carefully observe this explicitly supplied image and answer the "
+        "Carefully observe the attached image and answer the "
         f"following question: {question}\n\n"
-        "The current Ascend-Maze task-side chat contract accepts text content, "
-        "so this prompt carries the image identity and lightweight features "
-        "instead of embedding image bytes directly.\n"
+        "Use the image itself as primary evidence. The metadata below is only "
+        "diagnostic context.\n"
         f"Image metadata: {json.dumps(image_info.get('features', {}), sort_keys=True)}"
     )
 
 
 def blip_prompt(image_info: dict[str, object]) -> str:
     return (
-        "Generate a concise visual caption for this explicitly supplied image. "
+        "Generate a concise visual caption for the attached image. "
+        "Use the image itself as primary evidence. "
         f"Image metadata: {json.dumps(image_info.get('features', {}), sort_keys=True)}"
     )
 
 
 def ocr_prompt(image_info: dict[str, object], target_language: str) -> str:
     return (
-        "Extract any readable OCR text from this explicitly supplied image. "
+        "Extract any readable OCR text from the attached image. "
         f"Preferred language: {target_language}. "
+        "Use the image itself as primary evidence. "
         f"Image metadata: {json.dumps(image_info.get('features', {}), sort_keys=True)}"
     )
 
@@ -506,6 +577,24 @@ def _source_kind(payload: object) -> str:
 
 def _is_image_name(name: str) -> bool:
     return name.lower().endswith((".png", ".jpg", ".jpeg"))
+
+
+def _image_data_url(content: bytes, file_name: str) -> str:
+    mime_type = _image_mime_type(file_name)
+    return f"data:{mime_type};base64,{b64encode(content).decode('ascii')}"
+
+
+def _image_mime_type(file_name: str) -> str:
+    suffix = Path(file_name).suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".webp":
+        return "image/webp"
+    if suffix == ".gif":
+        return "image/gif"
+    if suffix == ".bmp":
+        return "image/bmp"
+    return "image/png"
 
 
 def _image_record(name: str, content: bytes, source_kind: str) -> dict[str, object]:

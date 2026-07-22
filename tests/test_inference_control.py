@@ -8,7 +8,7 @@ import time
 import pytest
 
 from ascend_maze.core.clock import ManualClock
-from ascend_maze.core.errors import StateTransitionError
+from ascend_maze.core.errors import ContractValidationError, StateTransitionError
 from ascend_maze.inference import (
     AttemptInferenceSummary,
     ChatRequest,
@@ -34,6 +34,58 @@ def test_public_chat_requires_attempt_context() -> None:
     with pytest.raises(InferenceCallError) as missing_context:
         get_route_context()
     assert missing_context.value.error_code == "model_route_context_missing"
+
+
+def test_chat_request_accepts_openai_text_image_content_parts() -> None:
+    request = ChatRequest.create(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this image?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,aGVsbG8=",
+                            "detail": "low",
+                        },
+                    },
+                ],
+            }
+        ],
+        max_tokens=32,
+    )
+
+    content = request.messages[0]["content"]
+    assert isinstance(content, tuple)
+    assert content[0]["type"] == "text"
+    assert content[1]["type"] == "image_url"
+
+
+def test_chat_request_rejects_unknown_or_unsafe_content_parts() -> None:
+    with pytest.raises(ContractValidationError, match="content part type"):
+        ChatRequest.create(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "video_url", "video_url": {"url": "x"}}],
+                }
+            ]
+        )
+    with pytest.raises(ContractValidationError, match="data:image"):
+        ChatRequest.create(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "file:///tmp/private.png"},
+                        }
+                    ],
+                }
+            ]
+        )
 
 
 def test_instance_route_and_sequential_request_lifecycle(tmp_path) -> None:

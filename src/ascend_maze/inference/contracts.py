@@ -377,10 +377,11 @@ class ChatRequest:
                 raise ContractValidationError("chat messages must be mappings")
             role = frozen.get("role")
             content = frozen.get("content")
-            if not isinstance(role, str) or not role or not isinstance(content, str):
+            if not isinstance(role, str) or not role:
                 raise ContractValidationError(
-                    "chat messages require string role and content"
+                    "chat messages require a non-empty string role"
                 )
+            _validate_chat_content(content)
             frozen_messages.append(frozen)
         if not frozen_messages:
             raise ContractValidationError("chat requires at least one message")
@@ -395,6 +396,71 @@ class ChatRequest:
         temperature: float = 0.0,
     ) -> "ChatRequest":
         return cls(tuple(messages), max_tokens=max_tokens, temperature=temperature)  # type: ignore[arg-type]
+
+
+def _validate_chat_content(content: CanonicalValue | None) -> None:
+    if isinstance(content, str):
+        return
+    if not isinstance(content, tuple) or not content:
+        raise ContractValidationError(
+            "chat message content must be a string or non-empty content parts"
+        )
+    for part in content:
+        if not isinstance(part, FrozenMap):
+            raise ContractValidationError("chat content parts must be mappings")
+        part_type = part.get("type")
+        if part_type == "text":
+            _validate_text_content_part(part)
+        elif part_type == "image_url":
+            _validate_image_url_content_part(part)
+        else:
+            raise ContractValidationError(
+                "chat content part type must be 'text' or 'image_url'"
+            )
+
+
+def _validate_text_content_part(
+    part: FrozenMap[CanonicalValue, CanonicalValue],
+) -> None:
+    if set(part) != {"type", "text"}:
+        raise ContractValidationError("text chat content parts require only type/text")
+    if not isinstance(part.get("text"), str):
+        raise ContractValidationError("text chat content part requires string text")
+
+
+def _validate_image_url_content_part(
+    part: FrozenMap[CanonicalValue, CanonicalValue],
+) -> None:
+    if set(part) != {"type", "image_url"}:
+        raise ContractValidationError(
+            "image_url chat content parts require only type/image_url"
+        )
+    image_url = part.get("image_url")
+    if not isinstance(image_url, FrozenMap):
+        raise ContractValidationError("image_url chat content part requires a mapping")
+    allowed_keys = {"url", "detail"}
+    unknown = set(image_url) - allowed_keys
+    if unknown:
+        raise ContractValidationError(
+            "image_url mapping contains unsupported keys: "
+            + ", ".join(str(key) for key in sorted(unknown, key=str))
+        )
+    url = image_url.get("url")
+    if not isinstance(url, str) or not url:
+        raise ContractValidationError("image_url mapping requires a non-empty url")
+    detail = image_url.get("detail")
+    if detail is not None and detail not in {"auto", "low", "high"}:
+        raise ContractValidationError(
+            "image_url detail must be one of auto/low/high"
+        )
+    if not (
+        url.startswith("data:image/")
+        or url.startswith("http://")
+        or url.startswith("https://")
+    ):
+        raise ContractValidationError(
+            "image_url url must be a data:image URI or an HTTP(S) URL"
+        )
 
 
 @dataclass(frozen=True, slots=True)

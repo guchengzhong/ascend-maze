@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from base64 import b64encode
 from collections.abc import Mapping
 from csv import reader as csv_reader
 from hashlib import sha256
@@ -283,12 +284,52 @@ def vision_prompt(question: str, image_features: dict[str, object]) -> str:
     return (
         "#Background#\n"
         f"{GAIA_FINAL_ANSWER_RULES}\n"
-        "The user supplied an explicit supplementary image. The current "
-        "Ascend-Maze task-side inference API carries text messages, so this "
-        "prompt includes the image identity and lightweight image features.\n"
+        "The user supplied an explicit supplementary image. Inspect the "
+        "attached image directly; the metadata below is only diagnostic "
+        "context and must not replace visual reasoning.\n"
         f"#Question#\n{question}\n"
         f"#Image metadata#\n{json.dumps(image_features, sort_keys=True)}"
     )
+
+
+def vision_content_parts(
+    question: str,
+    image_bytes: bytes,
+    image_features: dict[str, object],
+) -> list[dict[str, object]] | str:
+    prompt = vision_prompt(question, image_features)
+    if not image_bytes:
+        return prompt
+    return [
+        {"type": "text", "text": prompt},
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": _image_data_url(
+                    image_bytes,
+                    str(image_features.get("file_extension", "")),
+                )
+            },
+        },
+    ]
+
+
+def _image_data_url(image_bytes: bytes, extension: str) -> str:
+    mime_type = _image_mime_type(extension)
+    return f"data:{mime_type};base64,{b64encode(image_bytes).decode('ascii')}"
+
+
+def _image_mime_type(extension: str) -> str:
+    normalized = extension.lower()
+    if normalized in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if normalized == ".webp":
+        return "image/webp"
+    if normalized == ".gif":
+        return "image/gif"
+    if normalized == ".bmp":
+        return "image/bmp"
+    return "image/png"
 
 
 def response_or_override(

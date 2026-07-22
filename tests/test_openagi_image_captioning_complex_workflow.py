@@ -46,6 +46,11 @@ def test_openagi_image_captioning_complex_workflow_runs_with_fake_inference(
 
     merged = results["task5_merge_results"]
     assert len(merged["final_descriptions"]) == 5
+    assert results["task3a_extract_blip_captions"]["curr_task_feat"]["vision_input_mode"] == "true_multimodal"  # type: ignore[index]
+    assert results["task3a_extract_blip_captions"]["curr_task_feat"]["true_multimodal_count"] == 5  # type: ignore[index]
+    assert results["task3b_extract_ocr_text"]["curr_task_feat"]["vision_input_mode"] == "true_multimodal"  # type: ignore[index]
+    assert results["task5a_vlm_process"]["curr_task_feat"]["true_multimodal_count"] == 1  # type: ignore[index]
+    assert results["task5d_vlm_process"]["curr_task_feat"]["true_multimodal_count"] == 2  # type: ignore[index]
     final = results["task6_output_final_answer"]
     assert "Image image_1.png: description one" in final["final_answer"]
     assert "Image image_5.png: description five" in final["final_answer"]

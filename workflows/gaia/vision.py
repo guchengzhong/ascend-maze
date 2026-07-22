@@ -11,6 +11,7 @@ from workflows.gaia._common import (
     response_or_override,
     summarize_image_file,
     text_features,
+    vision_content_parts,
     vision_prompt,
 )
 
@@ -72,10 +73,18 @@ def task2_vlm_process(
 ) -> dict[str, object]:
     from ascend_maze.inference import chat
 
-    del image_bytes
     prompt = vision_prompt(question, image_features)
     response = chat(
-        [{"role": "user", "content": prompt}],
+        [
+            {
+                "role": "user",
+                "content": vision_content_parts(
+                    question,
+                    image_bytes,
+                    image_features,
+                ),
+            }
+        ],
         max_tokens=1024,
         temperature=0.0,
     )
@@ -84,7 +93,10 @@ def task2_vlm_process(
         "dag_id": dag_id,
         "vlm_answer": vlm_answer,
         "raw_model_output": response.text,
-        "curr_task_feat": inference_features(prompt, response),
+        "curr_task_feat": {
+            **inference_features(prompt, response),
+            "vision_input_mode": "true_multimodal" if image_bytes else "text_only",
+        },
     }
 
 

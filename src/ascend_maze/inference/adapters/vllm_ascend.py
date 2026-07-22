@@ -169,10 +169,12 @@ class VllmAscendInferenceEngineAdapter:
             "block_size",
             "enable_prefix_caching",
             "enforce_eager",
+            "generation_config",
             "gpu_memory_utilization",
             "log_level",
             "max_num_batched_tokens",
             "max_num_seqs",
+            "qwen2_5_vl_cpu_unique_consecutive_workaround",
             "trust_remote_code",
         }
     )
@@ -291,6 +293,14 @@ class VllmAscendInferenceEngineAdapter:
             value = options.get(name, name != "trust_remote_code")
             if not isinstance(value, bool):
                 raise ContractValidationError(f"{name} must be a boolean")
+        workaround = options.get("qwen2_5_vl_cpu_unique_consecutive_workaround", False)
+        if not isinstance(workaround, bool):
+            raise ContractValidationError(
+                "qwen2_5_vl_cpu_unique_consecutive_workaround must be a boolean"
+            )
+        generation_config = options.get("generation_config")
+        if generation_config is not None and generation_config not in {"auto", "vllm"}:
+            raise ContractValidationError("generation_config must be auto or vllm")
         log_level = options.get("log_level", "INFO")
         if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
             raise ContractValidationError("log_level is invalid")
@@ -370,6 +380,9 @@ class VllmAscendInferenceEngineAdapter:
         max_num_batched_tokens = options.get("max_num_batched_tokens")
         if max_num_batched_tokens is not None:
             argv.extend(("--max-num-batched-tokens", str(max_num_batched_tokens)))
+        generation_config = options.get("generation_config")
+        if generation_config is not None:
+            argv.extend(("--generation-config", str(generation_config)))
         environment_values = [
             ("ASCEND_MAZE_ARTIFACT_REVISION", spec.artifact_revision),
             ("ASCEND_MAZE_ENVIRONMENT_FINGERPRINT", spec.environment_fingerprint),
@@ -399,6 +412,16 @@ class VllmAscendInferenceEngineAdapter:
                 (
                     "LD_LIBRARY_PATH",
                     os.pathsep.join((*self.runtime_library_paths, *inherited)),
+                )
+            )
+        if bool(options.get("qwen2_5_vl_cpu_unique_consecutive_workaround", False)):
+            current = os.environ.get("PYTHONPATH", "")
+            inherited = tuple(item for item in current.split(os.pathsep) if item)
+            patch_dir = str(Path(__file__).resolve().with_name("vllm_runtime_patches"))
+            environment_values.extend(
+                (
+                    ("ASCEND_MAZE_QWEN25VL_CPU_UNIQUE_CONSECUTIVE", "1"),
+                    ("PYTHONPATH", os.pathsep.join((patch_dir, *inherited))),
                 )
             )
         environment = FrozenMap(environment_values)

@@ -9,7 +9,7 @@ from workflows.openagi._common import (
     aggregate_feature_dicts,
     batch_feature_summary,
     blip_prompt,
-    chat_prompt_batch,
+    chat_image_prompt_batch,
     format_named_answers,
     image_caption_prompt,
     image_records_with_features,
@@ -119,8 +119,9 @@ def task3a_extract_blip_captions(
     target_language: str,
 ) -> dict[str, object]:
     prompts = [blip_prompt(image) for image in enhanced_images]
-    captions, features = chat_prompt_batch(
+    captions, features = chat_image_prompt_batch(
         prompts,
+        enhanced_images,
         metadata,
         "blip_caption_overrides",
         max_tokens=128,
@@ -148,8 +149,9 @@ def task3b_extract_ocr_text(
     target_language: str,
 ) -> dict[str, object]:
     prompts = [ocr_prompt(image, target_language) for image in enhanced_images]
-    ocr_texts, features = chat_prompt_batch(
+    ocr_texts, features = chat_image_prompt_batch(
         prompts,
+        enhanced_images,
         metadata,
         "ocr_text_overrides",
         max_tokens=128,
@@ -355,7 +357,12 @@ def _describe_image_batch(
         )
         for image in batch
     ]
-    answers, features = chat_prompt_batch(prompts, metadata, override_key)
+    answers, features = chat_image_prompt_batch(
+        prompts,
+        batch,
+        metadata,
+        override_key,
+    )
     descriptions = [
         {"file_name": image["file_name"], "description": answers[index]}
         for index, image in enumerate(batch)

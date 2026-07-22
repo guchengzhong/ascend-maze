@@ -38,6 +38,10 @@ def test_openagi_multimodal_vqa_complex_workflow_runs_with_fake_inference(
 
     merged = results["task4_merge_results"]
     assert len(merged["final_answers"]) == 5
+    assert results["task4a_vlm_process"]["curr_task_feat"]["vision_input_mode"] == "true_multimodal"  # type: ignore[index]
+    assert results["task4a_vlm_process"]["curr_task_feat"]["true_multimodal_count"] == 1  # type: ignore[index]
+    assert results["task4d_vlm_process"]["curr_task_feat"]["vision_input_mode"] == "true_multimodal"  # type: ignore[index]
+    assert results["task4d_vlm_process"]["curr_task_feat"]["true_multimodal_count"] == 2  # type: ignore[index]
     final = results["task5_output_final_answer"]
     assert "Answer for vqa_1.png:\nanswer one" in final["final_answer"]
     assert "Answer for vqa_5.png:\nanswer five" in final["final_answer"]

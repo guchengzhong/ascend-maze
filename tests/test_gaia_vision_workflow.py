@@ -29,6 +29,9 @@ def test_gaia_vision_workflow_runs_with_fake_inference(tmp_path) -> None:
 
     prepared = results["task1_obtain_content"]
     assert prepared["image_features"]["size_bytes"] == len(one_pixel_png)  # type: ignore[index]
+    vlm = results["task2_vlm_process"]
+    assert "[1 image(s)]" in str(vlm["raw_model_output"])
+    assert vlm["curr_task_feat"]["vision_input_mode"] == "true_multimodal"  # type: ignore[index]
     final = results["task3_output_final_answer"]
     assert final["final_answer"] == "FINAL ANSWER: pixel"
     assert invoke_count == 1

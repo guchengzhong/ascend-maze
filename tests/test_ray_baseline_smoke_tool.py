@@ -77,6 +77,7 @@ def test_ray_baseline_vllm_argv_uses_model_alias_and_vision_options() -> None:
         max_num_seqs=1,
         max_num_batched_tokens=4096,
         trust_remote_code=True,
+        generation_config="vllm",
     )
 
     assert argv[:3] == ["/opt/python", "-m", "vllm.entrypoints.openai.api_server"]
@@ -86,6 +87,59 @@ def test_ray_baseline_vllm_argv_uses_model_alias_and_vision_options() -> None:
     assert argv[argv.index("--max-num-batched-tokens") + 1] == "4096"
     assert "--trust-remote-code" in argv
     assert "--no-enable-prefix-caching" in argv
+    assert argv[argv.index("--generation-config") + 1] == "vllm"
+
+
+def test_ray_baseline_vision_service_uses_runtime_workarounds() -> None:
+    tool = _load_tool()
+    env = tool._service_environment(  # noqa: SLF001
+        base_env={"PYTHONPATH": "/existing/path"},
+        device_id="3",
+        log_level="INFO",
+        runtime_preloads={},
+        runtime_library_paths=(),
+        qwen2_5_vl_cpu_unique_consecutive_workaround=True,
+    )
+
+    assert env["ASCEND_RT_VISIBLE_DEVICES"] == "3"
+    assert env["ASCEND_MAZE_QWEN25VL_CPU_UNIQUE_CONSECUTIVE"] == "1"
+    assert env["PYTHONPATH"].split(os.pathsep)[0].endswith(
+        "ascend_maze/inference/adapters/vllm_runtime_patches"
+    )
+
+
+def test_ray_baseline_plan_records_vision_launch_workarounds() -> None:
+    tool = _load_tool()
+    args = tool.parse_args(
+        [
+            "--family",
+            "vision",
+            "--dataset",
+            "gaia",
+            "--workflow",
+            "vision",
+            "--samples-per-workflow",
+            "1",
+            "--plan-only",
+        ]
+    )
+    args.data_root = REPO_ROOT / "data"
+    args.text_model_path = Path("/models/text")
+    args.vision_model_path = Path("/models/vision")
+    samples, failures = tool._discover(args)  # noqa: SLF001
+
+    plan = tool._build_plan(  # noqa: SLF001
+        args=args,
+        output_dir=REPO_ROOT / "experiments" / "ray_baseline_smoke" / "unit",
+        samples=samples,
+        discovery_failures=failures,
+    )
+
+    assert not failures
+    assert plan["vision_model"]["launch_options"] == {
+        "generation_config": "vllm",
+        "qwen2_5_vl_cpu_unique_consecutive_workaround": True,
+    }
 
 
 def test_ray_baseline_resolves_compiled_workflow_bindings() -> None:

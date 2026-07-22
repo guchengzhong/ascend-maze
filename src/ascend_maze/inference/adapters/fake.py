@@ -254,7 +254,7 @@ class FakeInferenceEngineAdapter:
             await self._delay(plan.invoke_delay_ms)
             if plan.fail_invoke is not None:
                 raise RuntimeError(plan.fail_invoke)
-            content = str(request.messages[-1]["content"])
+            content = _content_text_preview(request.messages[-1]["content"])
             prefix = spec.launch_options.get("response_prefix", spec.model_id)
             assert isinstance(prefix, str)
             text = f"{prefix}:{content}"
@@ -370,3 +370,22 @@ class FakeInferenceEngineAdapter:
     async def _delay(milliseconds: int) -> None:
         if milliseconds:
             await asyncio.sleep(milliseconds / 1_000)
+
+
+def _content_text_preview(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, tuple):
+        fragments: list[str] = []
+        image_count = 0
+        for part in value:
+            if not isinstance(part, FrozenMap):
+                continue
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
+                fragments.append(str(part["text"]))
+            elif part.get("type") == "image_url":
+                image_count += 1
+        if image_count:
+            fragments.append(f"[{image_count} image(s)]")
+        return " ".join(fragment for fragment in fragments if fragment)
+    return str(value)

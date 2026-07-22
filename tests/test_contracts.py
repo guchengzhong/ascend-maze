@@ -184,6 +184,30 @@ def test_error_and_event_payloads_are_deeply_frozen() -> None:
     assert event.payload["nested"] == (1, 2)
 
 
+def test_inference_error_codes_used_by_adapters_are_stable() -> None:
+    for code in (
+        "model_service_unavailable",
+        "model_inference_timeout",
+        "model_process_exited",
+        "model_warmup_failed",
+        "model_client_cleanup_failed",
+    ):
+        error = ErrorInfo(
+            schema_version=1,
+            error_code=code,
+            category="model_service",
+            origin="runtime",
+            message=code,
+            retryable_hint=False,
+            classification_confidence="exact",
+            execution_phase="attempt",
+            run_id="run",
+            task_id="task",
+            attempt=1,
+        )
+        assert error.error_code == code
+
+
 def test_protocols_are_runtime_checkable() -> None:
     class Store:
         def put_staged(self, value, owner_generation):

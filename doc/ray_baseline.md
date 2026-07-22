@@ -49,8 +49,12 @@ ModelRouter 的性能结论。
 
    这里的含义是：已迁移 workflow 在 Ray task/actor 路径下，每个 workflow 至少
    1 个样本可以端到端跑通。它不代表全量样本已覆盖，也不代表正式性能结论。
-   vision workflow 当前 smoke 使用 `metadata_text_only` 口径；真实视觉性能需要
-   使用视觉模型单独验证。
+   vision workflow 已切到 `true_multimodal` 请求口径。当前
+   Ascend/CANN/torch_npu 环境中的 Qwen2.5-VL 视觉 encoder
+   `aclnnUniqueConsecutive` AICPU 失败已通过 repo runtime workaround
+   绕开；小规模视觉 Ray smoke 已在
+   `experiments/ray_baseline_smoke/vision_smoke_repo_runtime_patch_20260722_1/`
+   验证 3/3 成功。
 
 2. Ray performance runner 已验证 batch 和 arrival 两类 Maze 风格负载入口。
 
@@ -313,3 +317,84 @@ measurement_window_seconds = 90 或 180
 
 因此当前更合理的状态是：代码和入口已准备好，先保存本文档和推荐矩阵；等要产出正式
 Ray baseline 时，再按矩阵执行。
+
+## 7. 下一阶段小规模性能实验计划
+
+下一阶段先跑小规模 Ray performance admission，不直接进入完整矩阵。
+
+### 7.1 Text admission
+
+目标是继续使用已经跑通过的轻量文本 workload，确认脚本改动后 batch/arrival
+入口仍稳定：
+
+```bash
+PY=/home/user2/workplace/miniconda3/envs/ascend-maze/bin/python
+
+PYTHONPATH=$PWD/src:$PWD:$PWD/tools:${PYTHONPATH:-} \
+$PY tools/ray_baseline_performance.py \
+  --family text \
+  --dataset tbench \
+  --workflow retail_cancel \
+  --samples-per-workflow 1 \
+  --arrival-mode batch \
+  --batch-size 2 \
+  --warmup-iterations 1 \
+  --concurrency 2 \
+  --model-actor-concurrency 2 \
+  --max-num-seqs 2 \
+  --output-dir experiments/ray_baseline_performance/text_retail_cancel_batch2_<tag>
+```
+
+然后再跑一个短窗口 arrival：
+
+```bash
+PYTHONPATH=$PWD/src:$PWD:$PWD/tools:${PYTHONPATH:-} \
+$PY tools/ray_baseline_performance.py \
+  --family text \
+  --dataset tbench \
+  --workflow retail_cancel \
+  --samples-per-workflow 1 \
+  --arrival-mode poisson \
+  --arrival-ratio 0.5 \
+  --avg-workflow-time-seconds 45 \
+  --measurement-window-seconds 90 \
+  --warmup-iterations 1 \
+  --concurrency 2 \
+  --model-actor-concurrency 2 \
+  --max-num-seqs 2 \
+  --output-dir experiments/ray_baseline_performance/text_retail_cancel_arrival_0_5_<tag>
+```
+
+### 7.2 Vision admission
+
+目标是只验证 `true_multimodal` Ray performance 入口，不追求性能结论：
+
+```bash
+PYTHONPATH=$PWD/src:$PWD:$PWD/tools:${PYTHONPATH:-} \
+$PY tools/ray_baseline_performance.py \
+  --family vision \
+  --samples-per-workflow 1 \
+  --arrival-mode batch \
+  --batch-size 1 \
+  --warmup-iterations 0 \
+  --concurrency 1 \
+  --model-actor-concurrency 1 \
+  --max-num-seqs 1 \
+  --vision-max-num-batched-tokens 4096 \
+  --request-timeout-ms 180000 \
+  --output-dir experiments/ray_baseline_performance/vision_true_multimodal_batch1_<tag>
+```
+
+该 vision admission 必须记录：
+
+- `generation_config=vllm`；
+- `qwen2_5_vl_cpu_unique_consecutive_workaround=true`；
+- `vision_mode=true_multimodal`；
+- 3 个 vision workflow 的 sample records；
+- vLLM service log；
+- `cleanup_errors=[]`；
+- `residual_vllm_processes=[]`；
+- 跑后 `npu-smi info` 无残留用户进程。
+
+只有 admission 都通过后，再冻结正式矩阵的样本数、窗口、seed、batch size 和
+arrival ratio。

@@ -113,7 +113,7 @@ class FakeWorkerInferenceClient:
             await asyncio.sleep(self.delay_ms / 1_000)
         if self.failure is not None:
             raise RuntimeError(self.failure)
-        content = str(request.messages[-1]["content"])
+        content = _content_text_preview(request.messages[-1]["content"])
         text = f"{self.prefix}:{content}"
         return ChatResponse(
             text=text,
@@ -190,3 +190,22 @@ def _plain(value: CanonicalValue) -> object:
     if isinstance(value, tuple):
         return [_plain(item) for item in value]
     return value
+
+
+def _content_text_preview(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, tuple):
+        fragments: list[str] = []
+        image_count = 0
+        for part in value:
+            if not isinstance(part, FrozenMap):
+                continue
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
+                fragments.append(str(part["text"]))
+            elif part.get("type") == "image_url":
+                image_count += 1
+        if image_count:
+            fragments.append(f"[{image_count} image(s)]")
+        return " ".join(fragment for fragment in fragments if fragment)
+    return str(value)

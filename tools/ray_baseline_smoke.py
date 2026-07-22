@@ -179,6 +179,20 @@ def _conservative_sampling_options() -> dict[str, object]:
     }
 
 
+def _launch_options_for_family(family: str) -> dict[str, object]:
+    """Return fixed vLLM launch options that are part of the baseline contract."""
+    if family != "vision":
+        return {}
+    return {
+        "generation_config": "vllm",
+        "qwen2_5_vl_cpu_unique_consecutive_workaround": True,
+    }
+
+
+def _runtime_patch_dir() -> Path:
+    return SRC_ROOT / "ascend_maze" / "inference" / "adapters" / "vllm_runtime_patches"
+
+
 def _build_vllm_argv(
     *,
     python_executable: Path,
@@ -192,6 +206,7 @@ def _build_vllm_argv(
     max_num_seqs: int,
     max_num_batched_tokens: int | None,
     trust_remote_code: bool,
+    generation_config: str | None = None,
 ) -> list[str]:
     argv = [
         str(python_executable),
@@ -224,6 +239,8 @@ def _build_vllm_argv(
         argv.extend(("--max-num-batched-tokens", str(max_num_batched_tokens)))
     if trust_remote_code:
         argv.append("--trust-remote-code")
+    if generation_config is not None:
+        argv.extend(("--generation-config", generation_config))
     return argv
 
 
@@ -234,6 +251,7 @@ def _service_environment(
     log_level: str,
     runtime_preloads: Mapping[str, str],
     runtime_library_paths: tuple[str, ...],
+    qwen2_5_vl_cpu_unique_consecutive_workaround: bool = False,
 ) -> dict[str, str]:
     env = dict(base_env)
     env["ASCEND_RT_VISIBLE_DEVICES"] = str(device_id)
@@ -248,6 +266,12 @@ def _service_environment(
         env["LD_LIBRARY_PATH"] = os.pathsep.join(
             (*runtime_library_paths, *inherited)
         )
+    if qwen2_5_vl_cpu_unique_consecutive_workaround:
+        inherited = tuple(
+            item for item in env.get("PYTHONPATH", "").split(os.pathsep) if item
+        )
+        env["ASCEND_MAZE_QWEN25VL_CPU_UNIQUE_CONSECUTIVE"] = "1"
+        env["PYTHONPATH"] = os.pathsep.join((str(_runtime_patch_dir()), *inherited))
     return env
 
 
@@ -280,6 +304,7 @@ class _VllmServiceActor:
             max_num_seqs=int(self.config["max_num_seqs"]),
             max_num_batched_tokens=self.config["max_num_batched_tokens"],  # type: ignore[arg-type]
             trust_remote_code=bool(self.config["trust_remote_code"]),
+            generation_config=self.config.get("generation_config"),  # type: ignore[arg-type]
         )
         env = _service_environment(
             base_env=os.environ,
@@ -287,8 +312,25 @@ class _VllmServiceActor:
             log_level=str(self.config["log_level"]),
             runtime_preloads=dict(self.config.get("runtime_preloads", {})),  # type: ignore[arg-type]
             runtime_library_paths=tuple(self.config.get("runtime_library_paths", ())),  # type: ignore[arg-type]
+            qwen2_5_vl_cpu_unique_consecutive_workaround=bool(
+                self.config.get("qwen2_5_vl_cpu_unique_consecutive_workaround", False)
+            ),
         )
         self.log_handle.write("RAY_BASELINE_VLLM_ARGV " + json.dumps(argv) + "\n")
+        self.log_handle.write(
+            "RAY_BASELINE_VLLM_ENV "
+            + json.dumps(
+                {
+                    "ASCEND_MAZE_QWEN25VL_CPU_UNIQUE_CONSECUTIVE": env.get(
+                        "ASCEND_MAZE_QWEN25VL_CPU_UNIQUE_CONSECUTIVE"
+                    ),
+                    "ASCEND_RT_VISIBLE_DEVICES": env.get("ASCEND_RT_VISIBLE_DEVICES"),
+                    "PYTHONPATH_PREFIX": env.get("PYTHONPATH", "").split(os.pathsep)[:3],
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
         self.process = subprocess.Popen(
             argv,
             cwd=str(Path(str(self.config["model_path"])).parent),
@@ -371,6 +413,7 @@ class _VllmServiceActor:
                 max_num_seqs=int(self.config["max_num_seqs"]),
                 max_num_batched_tokens=self.config["max_num_batched_tokens"],  # type: ignore[arg-type]
                 trust_remote_code=bool(self.config["trust_remote_code"]),
+                generation_config=self.config.get("generation_config"),  # type: ignore[arg-type]
             ),
         }
 
@@ -994,6 +1037,7 @@ def _build_plan(
             "dtype": str(args.text_dtype),
             "max_model_len": int(args.text_max_model_len),
             "max_num_batched_tokens": args.text_max_num_batched_tokens,
+            "launch_options": _launch_options_for_family("text"),
         },
         "vision_model": {
             "model_id": qwen_smoke.VISION_MODEL_ID,
@@ -1001,7 +1045,8 @@ def _build_plan(
             "dtype": str(args.vision_dtype),
             "max_model_len": int(args.vision_max_model_len),
             "max_num_batched_tokens": args.vision_max_num_batched_tokens,
-            "vision_mode": "metadata_text_only",
+            "vision_mode": "true_multimodal",
+            "launch_options": _launch_options_for_family("vision"),
         },
         "ray": {
             "address": args.ray_address,
@@ -1106,6 +1151,7 @@ def _family_service_config(
     is_vision = family == "vision"
     model_path = args.vision_model_path if is_vision else args.text_model_path
     model_id = qwen_smoke.VISION_MODEL_ID if is_vision else qwen_smoke.TEXT_MODEL_ID
+    launch_options = _launch_options_for_family(family)
     return {
         "family": family,
         "model_id": model_id,
@@ -1137,6 +1183,7 @@ def _family_service_config(
         "runtime_preloads": dict(preflight["runtime_preloads"]),  # type: ignore[arg-type]
         "runtime_library_paths": tuple(preflight["runtime_library_paths"]),  # type: ignore[arg-type]
         "log_path": str(output_dir / "logs" / f"{family}_vllm" / "service.log"),
+        **launch_options,
     }
 
 

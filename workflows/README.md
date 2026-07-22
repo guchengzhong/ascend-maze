@@ -26,13 +26,16 @@ GAIA workflows now have Ascend-Maze-native runnable logic ported from Maze:
   transcription, then runs the same Qwen/DeepSeek/fusion answer path.
 - `workflows.gaia.vision`: accepts explicit image bytes or `SharedFileRef`,
   extracts lightweight image metadata when Pillow is available, calls the
-  service inference path with a text prompt containing the image identity and
-  feature summary, then emits the final answer.
+  service inference path with OpenAI-style text+image content parts, then emits
+  the final answer.
 
-The current task-side chat contract accepts string chat content. The GAIA vision
-port therefore keeps image bytes and identity explicit in workflow data, but
-passes only text prompts to `ascend_maze.inference.chat()` until a first-class
-multimodal request contract is added.
+The task-side chat contract supports the existing string content path and the
+OpenAI-style text+`image_url` content-parts path. The current implementation
+uses base64 `data:image/...` URLs for explicit inline images. On the current
+2026-07-22 Ascend environment, Qwen2.5-VL requires the repo runtime workaround
+for a lower-level `torch_npu` `aclnnUniqueConsecutive`/AICPU failure; with that
+workaround and `--generation-config vllm`, the three migrated vision workflows
+have passed true multimodal smoke.
 
 OpenAGI workflows now also have Ascend-Maze-native runnable logic ported from
 Maze:
@@ -47,17 +50,16 @@ Maze:
   path, fans out four VLM-style captioning branches, then merges sorted image
   descriptions.
 - `workflows.openagi.multimodal_vqa_complex`: reads explicit images, preserves
-  the old four-way VQA fanout, calls the service inference path with image
-  identity and feature summaries in text prompts, and emits per-image answers.
+  the old four-way VQA fanout, calls the service inference path with
+  OpenAI-style text+image content parts, and emits per-image answers.
 - `workflows.openagi.text_processing_multilingual`: reads an explicit
   `text.txt` payload, splits user questions, detects source/target language,
   performs translation, summary, sentiment, three-way answer generation, and
   final merge through explicit task outputs.
 
-For OpenAGI image and multimodal workflows, the current task-side chat contract
-has the same limitation as GAIA vision: image bytes remain explicit workflow
-data, while model prompts include image identity and lightweight feature
-summaries until a first-class multimodal request contract is added.
+For OpenAGI image and multimodal workflows, image bytes remain explicit workflow
+data and are encoded into per-request `data:image/...` content parts at the
+service-call boundary.
 
 All tau-bench workflows now have Ascend-Maze-native business logic ported from
 Maze:

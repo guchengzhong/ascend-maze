@@ -42,6 +42,19 @@
       "measurement_window_seconds": 90,
       "succeeded": 2,
       "failed": 0
+    },
+    "vision_true_multimodal_smoke": {
+      "path": "experiments/ray_baseline_smoke/vision_smoke_repo_runtime_patch_20260722_1/summary.json",
+      "model": "Qwen2.5-VL-3B-Instruct",
+      "vision_mode": "true_multimodal",
+      "launch_options": {
+        "generation_config": "vllm",
+        "qwen2_5_vl_cpu_unique_consecutive_workaround": true
+      },
+      "sample_count": 3,
+      "succeeded": 3,
+      "failed": 0,
+      "scope_note": "One sample each for gaia.vision, openagi.image_captioning_complex, and openagi.multimodal_vqa_complex."
     }
   },
   "models": {
@@ -58,7 +71,12 @@
       "model_path": "/home/user2/workplace/model_weight/model_from_hf/Qwen2.5-VL-3B-Instruct",
       "dtype": "bfloat16",
       "default_max_model_len": 4096,
-      "scope_note": "Run separately from Qwen3-4B text baseline; current smoke evidence used metadata_text_only vision mode."
+      "vision_mode": "true_multimodal",
+      "launch_options": {
+        "generation_config": "vllm",
+        "qwen2_5_vl_cpu_unique_consecutive_workaround": true
+      },
+      "scope_note": "Run separately from Qwen3-4B text baseline; current smoke evidence uses true multimodal image_url content parts."
     }
   },
   "workload_tiers": [

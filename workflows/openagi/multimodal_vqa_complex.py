@@ -8,7 +8,7 @@ from workflows._common import WorkflowSpec, edges, nodes, spec_inputs
 from workflows.openagi._common import (
     aggregate_feature_dicts,
     batch_feature_summary,
-    chat_prompt_batch,
+    chat_image_prompt_batch,
     image_records_with_features,
     list_inline_images,
     metadata_dict,
@@ -259,7 +259,12 @@ def _answer_vqa_batch(
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     batch = vlm_batches[batch_index] if batch_index < len(vlm_batches) else []
     prompts = [multimodal_vqa_prompt(question, image) for image in batch]
-    answers, features = chat_prompt_batch(prompts, metadata, override_key)
+    answers, features = chat_image_prompt_batch(
+        prompts,
+        batch,
+        metadata,
+        override_key,
+    )
     return (
         [
             {"file_name": image["file_name"], "answer": answers[index]}

@@ -16,9 +16,8 @@ models from the original Maze workflows, such as ``qwen3-32b`` and
 ``deepseek-r1-32b``, route to one local smoke model.  Text workflows use local
 Qwen3-4B; visual workflows default to local Qwen2.5-VL-3B-Instruct because
 this is the Qwen VL family implemented by the current vLLM-Ascend stack.
-Current visual
-workflow ports still pass image identity and lightweight metadata as text
-prompts, so visual runs are marked as ``metadata_text_only`` system-path checks.
+Current visual workflow ports pass OpenAI-style text+image content parts to
+``ascend_maze.inference.chat()`` and are marked as ``true_multimodal``.
 
 Typical plan-only usage from the repository root:
 
@@ -651,7 +650,7 @@ def _discover_gaia_samples(
                     source_files=tuple(source_files),
                     expected_answer=answer,
                     vision_mode=(
-                        "metadata_text_only" if family == "vision" else None
+                        "true_multimodal" if family == "vision" else None
                     ),
                 )
             )
@@ -755,7 +754,7 @@ def _discover_openagi_samples(
                     source_files=tuple(source_files),
                     expected_answer=answer,
                     vision_mode=(
-                        "metadata_text_only" if family == "vision" else None
+                        "true_multimodal" if family == "vision" else None
                     ),
                 )
             )
@@ -1641,6 +1640,8 @@ async def _run_family(
         launch_options["trust_remote_code"] = True
 
     if is_vision:
+        launch_options["generation_config"] = "vllm"
+        launch_options["qwen2_5_vl_cpu_unique_consecutive_workaround"] = True
         weight_hbm_mb = 18_000
         runtime_hbm_mb = 8_000
         kv_cache_hbm_mb = 20_000
@@ -2097,7 +2098,7 @@ async def run_smoke(args: argparse.Namespace) -> int:
             "dtype": str(args.vision_dtype),
             "max_model_len": int(args.vision_max_model_len),
             "max_num_batched_tokens": args.vision_max_num_batched_tokens,
-            "vision_mode": "metadata_text_only",
+            "vision_mode": "true_multimodal",
         },
     }
     _write_json(output_dir / "plan.json", plan)

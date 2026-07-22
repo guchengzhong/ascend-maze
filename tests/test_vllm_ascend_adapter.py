@@ -309,6 +309,39 @@ def test_vllm_launch_request_injects_aicpu_runtime_paths(
     assert paths[:2] == [str(aicpu.resolve()), str(inherited)]
 
 
+def test_vllm_launch_request_supports_qwen25vl_workarounds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model = tmp_path / "model"
+    inherited = tmp_path / "pythonpath"
+    inherited.mkdir()
+    monkeypatch.setenv("PYTHONPATH", str(inherited))
+    adapter, _, _ = _adapter(model)
+    spec = _spec(
+        model,
+        launch_options={
+            "block_size": 128,
+            "enable_prefix_caching": False,
+            "enforce_eager": True,
+            "generation_config": "vllm",
+            "gpu_memory_utilization": 0.5,
+            "log_level": "INFO",
+            "max_num_batched_tokens": 1024,
+            "max_num_seqs": 1,
+            "qwen2_5_vl_cpu_unique_consecutive_workaround": True,
+            "trust_remote_code": True,
+        },
+    )
+
+    request = adapter.build_launch_request(spec, _lease(), _port())
+
+    assert request.argv[request.argv.index("--generation-config") + 1] == "vllm"
+    assert request.environment["ASCEND_MAZE_QWEN25VL_CPU_UNIQUE_CONSECUTIVE"] == "1"
+    paths = request.environment["PYTHONPATH"].split(":")
+    assert paths[0].endswith("vllm_runtime_patches")
+    assert paths[1] == str(inherited)
+
+
 def test_vllm_adapter_rejects_unpinned_runtime_library_preloads(
     tmp_path: Path,
 ) -> None:
@@ -355,6 +388,26 @@ def test_vllm_model_spec_rejects_unverified_or_unbounded_options(
                 launch_options={
                     "gpu_memory_utilization": 0.5,
                     "max_num_batched_tokens": 0,
+                },
+            )
+        )
+    with pytest.raises(ContractValidationError, match="generation_config"):
+        adapter.validate_model_spec(
+            _spec(
+                tmp_path / "bad_generation_config",
+                launch_options={
+                    "gpu_memory_utilization": 0.5,
+                    "generation_config": "model-defaults",
+                },
+            )
+        )
+    with pytest.raises(ContractValidationError, match="unique_consecutive"):
+        adapter.validate_model_spec(
+            _spec(
+                tmp_path / "bad_workaround",
+                launch_options={
+                    "gpu_memory_utilization": 0.5,
+                    "qwen2_5_vl_cpu_unique_consecutive_workaround": "yes",
                 },
             )
         )
@@ -422,6 +475,73 @@ def test_vllm_probe_warmup_chat_metrics_and_close(tmp_path: Path) -> None:
         assert metrics.actual_request_inflight == 1
         await adapter.close()
         assert transport.closed
+
+    asyncio.run(scenario())
+
+
+def test_vllm_adapter_forwards_openai_multimodal_content_parts(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        spec = _spec(tmp_path / "model")
+        adapter, _, transport = _adapter(Path(spec.artifact_path))
+        handle = ServiceHandle(
+            service_handle_id="service_1",
+            instance_id="instance_1",
+            generation=1,
+            endpoint_id="http://127.0.0.1:25000",
+            node_id="node_a",
+            boot_id="boot_1",
+            npu_device_id="7",
+            process_id=123,
+            port_lease_id="port_1",
+            port=25000,
+        )
+
+        await adapter.invoke_chat(
+            ModelRouteContext(
+                route_lease_id="route_1",
+                model_id=spec.model_id,
+                adapter_name=adapter.name,
+                endpoint_id=handle.endpoint_id,
+                instance_id=handle.instance_id,
+                instance_generation=handle.generation,
+            ),
+            ChatRequest.create(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this image."},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,aGVsbG8=",
+                                },
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=16,
+            ),
+        )
+
+        payload = transport.calls[-1][2]
+        assert isinstance(payload, dict)
+        assert payload["messages"] == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,aGVsbG8=",
+                        },
+                    },
+                ],
+            }
+        ]
 
     asyncio.run(scenario())
 

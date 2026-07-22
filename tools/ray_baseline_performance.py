@@ -696,13 +696,15 @@ def _build_plan(
                 "path": str(args.text_model_path),
                 "dtype": str(args.text_dtype),
                 "max_model_len": int(args.text_max_model_len),
+                "launch_options": smoke._launch_options_for_family("text"),  # noqa: SLF001
             },
             "vision": {
                 "model_id": qwen_smoke.VISION_MODEL_ID,
                 "path": str(args.vision_model_path),
                 "dtype": str(args.vision_dtype),
                 "max_model_len": int(args.vision_max_model_len),
-                "vision_mode": "metadata_text_only",
+                "vision_mode": "true_multimodal",
+                "launch_options": smoke._launch_options_for_family("vision"),  # noqa: SLF001
             },
         },
         "data_root": str(args.data_root),
