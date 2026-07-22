@@ -11,7 +11,10 @@ from ascend_maze.ascend.contracts import (
     AscendEnvironmentSnapshot,
     create_ascend_correctness_config_snapshot,
 )
-from ascend_maze.ascend.discovery import discover_atb_runtime_library_preloads
+from ascend_maze.ascend.discovery import (
+    discover_aicpu_runtime_library_paths,
+    discover_atb_runtime_library_preloads,
+)
 from ascend_maze.compiler import compile_workflow
 from ascend_maze.control.client import InMemoryRuntimeClient
 from ascend_maze.control.controller import InMemoryController
@@ -117,6 +120,32 @@ def test_atb_runtime_preload_discovery_pins_resolved_library_digest(
     assert dict(discovered) == {
         str(libmki.resolve()): hashlib.sha256(b"test-mki").hexdigest(),
     }
+
+
+def test_aicpu_runtime_library_path_discovery_prefers_ascend_home(
+    tmp_path, monkeypatch
+) -> None:
+    ascend_home = tmp_path / "cann"
+    host_aicpu = ascend_home / "opp" / "built-in" / "op_impl" / "host_aicpu"
+    kernel_lib = (
+        ascend_home
+        / "opp"
+        / "built-in"
+        / "op_impl"
+        / "aicpu"
+        / "aicpu_kernel"
+        / "lib"
+        / "Ascend"
+    )
+    host_aicpu.mkdir(parents=True)
+    kernel_lib.mkdir(parents=True)
+    (host_aicpu / "libcpu_kernels.so").write_bytes(b"test-host-aicpu")
+    (kernel_lib / "libcpu_kernels_v1.0.1.so").write_bytes(b"test-kernel-aicpu")
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(ascend_home))
+
+    discovered = discover_aicpu_runtime_library_paths()
+
+    assert discovered[:2] == (str(host_aicpu.resolve()), str(kernel_lib.resolve()))
 
 
 def test_correctness_config_snapshot_covers_every_stage_four_setting() -> None:

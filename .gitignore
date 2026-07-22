@@ -1,5 +1,7 @@
-/doc/
+/doc/paper/
+/doc/todo/
 /refs/
+/data/
 
 __pycache__/
 *.py[cod]
@@ -35,6 +37,11 @@ build/
 /logs/
 /benchmark_output/
 /experiment_output/
+/experiments/qwen_benchmark_smoke/
+/experiments/ray_baseline_smoke/
+/experiments/ray_baseline_performance/*
+!/experiments/ray_baseline_performance/
+!/experiments/ray_baseline_performance/ray_baseline_matrix.recommended.json
 /artifacts/
 /kernel_meta/
 /outputs/

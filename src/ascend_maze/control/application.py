@@ -16,6 +16,7 @@ from ascend_maze.ascend import (
     DcmiDeviceAdapter,
     build_ascend_node_capacity,
     build_ascend_node_observation,
+    discover_aicpu_runtime_library_paths,
     discover_ascend_environment,
     discover_atb_runtime_library_preloads,
 )
@@ -408,6 +409,7 @@ def _inference(
         python_executable=sys.executable,
         endpoint_host_resolver=service_backend.endpoint_host,
         runtime_library_preloads=discover_atb_runtime_library_preloads(),
+        runtime_library_paths=discover_aicpu_runtime_library_paths(),
     )
     catalog = ModelCatalog(
         document.specs,

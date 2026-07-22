@@ -542,6 +542,8 @@ python -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist
 ## 15. 文档与许可证
 
 - [../pyproject.toml](../pyproject.toml)：包、依赖、入口和工具配置。
+- [ray_baseline.md](ray_baseline.md)：Ray correctness/performance baseline 使用口径、
+  已验证范围和推荐实验矩阵。
 
 C0-C14 规范性产品契约、实施顺序、硬门槛、验收证据和故障补充记录目前作为
 内部资料维护，不包含在临时公开仓库中。

@@ -13,6 +13,7 @@ from ascend_maze.ascend.dcmi import DcmiDeviceAdapter, DcmiError
 from ascend_maze.ascend.discovery import (
     build_ascend_node_capacity,
     build_ascend_node_observation,
+    discover_aicpu_runtime_library_paths,
     discover_atb_runtime_library_preloads,
     discover_ascend_environment,
 )
@@ -29,6 +30,7 @@ __all__ = [
     "DcmiError",
     "build_ascend_node_capacity",
     "build_ascend_node_observation",
+    "discover_aicpu_runtime_library_paths",
     "discover_atb_runtime_library_preloads",
     "discover_ascend_environment",
 ]

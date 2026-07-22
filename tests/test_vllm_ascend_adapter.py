@@ -59,6 +59,7 @@ def _spec(model_dir: Path, **changes: object) -> ModelSpec:
             "enforce_eager": True,
             "gpu_memory_utilization": 0.5,
             "log_level": "INFO",
+            "max_num_batched_tokens": 1024,
         },
         "warmup_request": {
             "messages": [{"role": "user", "content": "Say ready."}],
@@ -191,6 +192,7 @@ def _adapter(
     model_dir: Path,
     *,
     runtime_library_preloads: dict[str, str] | None = None,
+    runtime_library_paths: tuple[str, ...] | None = None,
 ) -> tuple[
     VllmAscendInferenceEngineAdapter,
     _ProcessBackend,
@@ -204,6 +206,7 @@ def _adapter(
         endpoint_host_resolver=lambda lease: "127.0.0.1",
         transport=transport,
         runtime_library_preloads=runtime_library_preloads,
+        runtime_library_paths=runtime_library_paths,
         request_timeout_ms=1_000,
         probe_timeout_ms=2_000,
         probe_interval_ms=1,
@@ -281,8 +284,29 @@ def test_vllm_launch_request_is_deterministic_and_lease_bound(tmp_path: Path) ->
     assert request.argv[request.argv.index("--model") + 1] == spec.artifact_path
     assert request.argv[request.argv.index("--gpu-memory-utilization") + 1] == "0.5"
     assert request.argv[request.argv.index("--block-size") + 1] == "128"
+    assert request.argv[request.argv.index("--max-num-batched-tokens") + 1] == "1024"
     assert "--enforce-eager" in request.argv
     assert "--enable-prefix-caching" in request.argv
+
+
+def test_vllm_launch_request_injects_aicpu_runtime_paths(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model = tmp_path / "model"
+    aicpu = tmp_path / "aicpu"
+    inherited = tmp_path / "inherited"
+    aicpu.mkdir()
+    inherited.mkdir()
+    monkeypatch.setenv("LD_LIBRARY_PATH", str(inherited))
+    adapter, _, _ = _adapter(
+        model,
+        runtime_library_paths=(str(aicpu), str(aicpu)),
+    )
+
+    request = adapter.build_launch_request(_spec(model), _lease(), _port())
+
+    paths = request.environment["LD_LIBRARY_PATH"].split(":")
+    assert paths[:2] == [str(aicpu.resolve()), str(inherited)]
 
 
 def test_vllm_adapter_rejects_unpinned_runtime_library_preloads(
@@ -324,6 +348,16 @@ def test_vllm_model_spec_rejects_unverified_or_unbounded_options(
                 },
             )
         )
+    with pytest.raises(ContractValidationError, match="max_num_batched_tokens"):
+        adapter.validate_model_spec(
+            _spec(
+                tmp_path / "bad_batched_tokens",
+                launch_options={
+                    "gpu_memory_utilization": 0.5,
+                    "max_num_batched_tokens": 0,
+                },
+            )
+        )
     with pytest.raises(ContractValidationError, match="quantized"):
         adapter.validate_model_spec(_spec(tmp_path / "quantized", quantization="awq"))
 
@@ -355,6 +389,11 @@ def test_vllm_probe_warmup_chat_metrics_and_close(tmp_path: Path) -> None:
         assert warmup.succeeded
         assert warmup.response_digest is not None
         assert len(warmup.response_digest) == 64
+        warmup_payload = transport.calls[-1][2]
+        assert isinstance(warmup_payload, dict)
+        assert warmup_payload["frequency_penalty"] == 0.0
+        assert warmup_payload["presence_penalty"] == 0.0
+        assert warmup_payload["repetition_penalty"] == 1.0
 
         response = await adapter.invoke_chat(
             ModelRouteContext(
@@ -372,6 +411,11 @@ def test_vllm_probe_warmup_chat_metrics_and_close(tmp_path: Path) -> None:
         assert response.input_tokens == 4
         assert response.output_tokens == 1
         assert response.engine_queue_depth is None
+        chat_payload = transport.calls[-1][2]
+        assert isinstance(chat_payload, dict)
+        assert chat_payload["frequency_penalty"] == 0.0
+        assert chat_payload["presence_penalty"] == 0.0
+        assert chat_payload["repetition_penalty"] == 1.0
 
         metrics = await adapter.read_metrics(handle)
         assert metrics.queue_depth == 2

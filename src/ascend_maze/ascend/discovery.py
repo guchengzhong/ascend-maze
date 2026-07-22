@@ -125,12 +125,62 @@ def discover_atb_runtime_library_preloads() -> FrozenMap[str, str]:
     return FrozenMap(((str(library), _file_sha256(library)),))
 
 
+def discover_aicpu_runtime_library_paths() -> tuple[str, ...]:
+    """Return CANN AICPU kernel directories needed by torch_npu CPU kernels."""
+
+    candidates: list[Path] = []
+    ascend_home = os.environ.get("ASCEND_HOME_PATH")
+    if ascend_home:
+        home = Path(ascend_home).expanduser().resolve(strict=False)
+        candidates.extend(
+            (
+                home / "opp" / "built-in" / "op_impl" / "host_aicpu",
+                home
+                / "opp"
+                / "built-in"
+                / "op_impl"
+                / "aicpu"
+                / "aicpu_kernel"
+                / "lib"
+                / "Ascend",
+            )
+        )
+    for cann_home in sorted(Path("/usr/local/Ascend").glob("cann-*"), reverse=True):
+        candidates.extend(
+            (
+                cann_home / "opp" / "built-in" / "op_impl" / "host_aicpu",
+                cann_home
+                / "opp"
+                / "built-in"
+                / "op_impl"
+                / "aicpu"
+                / "aicpu_kernel"
+                / "lib"
+                / "Ascend",
+            )
+        )
+
+    paths: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        identity = str(resolved)
+        if identity in seen or not resolved.is_dir():
+            continue
+        if not any(resolved.glob("libcpu_kernels*.so")):
+            continue
+        seen.add(identity)
+        paths.append(identity)
+    return tuple(paths)
+
+
 def discover_ascend_environment(
     adapter: DcmiDeviceAdapter,
     devices: tuple[AscendDeviceSnapshot, ...] | None = None,
 ) -> AscendEnvironmentSnapshot:
     inventory = adapter.devices() if devices is None else devices
     atb_directory = _atb_library_directory()
+    aicpu_paths = discover_aicpu_runtime_library_paths()
     versions = {
         "python": platform.python_version(),
         "torch": _distribution_version("torch"),
@@ -154,6 +204,9 @@ def discover_ascend_environment(
             if atb_directory is None
             else _file_sha256(atb_directory / "libtbe_adapter.so")
         ),
+        "aicpu_runtime_library_paths": os.pathsep.join(aicpu_paths)
+        if aicpu_paths
+        else "absent",
         "executable_abi": f"{sys.version_info.major}.{sys.version_info.minor}",
     }
     return AscendEnvironmentSnapshot.create(

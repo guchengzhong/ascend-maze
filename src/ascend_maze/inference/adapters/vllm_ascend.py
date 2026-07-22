@@ -171,6 +171,7 @@ class VllmAscendInferenceEngineAdapter:
             "enforce_eager",
             "gpu_memory_utilization",
             "log_level",
+            "max_num_batched_tokens",
             "max_num_seqs",
             "trust_remote_code",
         }
@@ -189,6 +190,7 @@ class VllmAscendInferenceEngineAdapter:
             "vllm.entrypoints.openai.api_server",
         ),
         runtime_library_preloads: Mapping[str, str] | None = None,
+        runtime_library_paths: tuple[str, ...] | None = None,
         request_timeout_ms: int = 30_000,
         probe_timeout_ms: int = 300_000,
         probe_interval_ms: int = 250,
@@ -221,6 +223,9 @@ class VllmAscendInferenceEngineAdapter:
         self.api_server_entrypoint = api_server_entrypoint
         self.runtime_library_preloads = self._validate_runtime_library_preloads(
             runtime_library_preloads
+        )
+        self.runtime_library_paths = self._validate_runtime_library_paths(
+            runtime_library_paths
         )
         self.request_timeout_ms = request_timeout_ms
         self.probe_timeout_ms = probe_timeout_ms
@@ -266,6 +271,15 @@ class VllmAscendInferenceEngineAdapter:
         block_size = options.get("block_size", 128)
         if block_size not in {1, 8, 16, 32, 64, 128}:
             raise ContractValidationError("unsupported vLLM block_size")
+        max_num_batched_tokens = options.get("max_num_batched_tokens")
+        if max_num_batched_tokens is not None and (
+            isinstance(max_num_batched_tokens, bool)
+            or not isinstance(max_num_batched_tokens, int)
+            or max_num_batched_tokens < 1
+        ):
+            raise ContractValidationError(
+                "max_num_batched_tokens must be positive"
+            )
         max_num_seqs = options.get("max_num_seqs")
         if max_num_seqs is not None and (
             isinstance(max_num_seqs, bool)
@@ -353,6 +367,9 @@ class VllmAscendInferenceEngineAdapter:
         max_num_seqs = options.get("max_num_seqs")
         if max_num_seqs is not None:
             argv.extend(("--max-num-seqs", str(max_num_seqs)))
+        max_num_batched_tokens = options.get("max_num_batched_tokens")
+        if max_num_batched_tokens is not None:
+            argv.extend(("--max-num-batched-tokens", str(max_num_batched_tokens)))
         environment_values = [
             ("ASCEND_MAZE_ARTIFACT_REVISION", spec.artifact_revision),
             ("ASCEND_MAZE_ENVIRONMENT_FINGERPRINT", spec.environment_fingerprint),
@@ -373,6 +390,15 @@ class VllmAscendInferenceEngineAdapter:
                         "LD_PRELOAD",
                         " ".join(path for path, _ in self.runtime_library_preloads),
                     ),
+                )
+            )
+        if self.runtime_library_paths:
+            current = os.environ.get("LD_LIBRARY_PATH", "")
+            inherited = tuple(item for item in current.split(os.pathsep) if item)
+            environment_values.append(
+                (
+                    "LD_LIBRARY_PATH",
+                    os.pathsep.join((*self.runtime_library_paths, *inherited)),
                 )
             )
         environment = FrozenMap(environment_values)
@@ -449,6 +475,33 @@ class VllmAscendInferenceEngineAdapter:
                 )
             resolved[normalized] = expected_digest
         return tuple(sorted(resolved.items()))
+
+    @staticmethod
+    def _validate_runtime_library_paths(
+        configured: tuple[str, ...] | None,
+    ) -> tuple[str, ...]:
+        if configured is None:
+            return ()
+        if not isinstance(configured, tuple):
+            raise ContractValidationError("runtime_library_paths must be a tuple")
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for configured_path in configured:
+            if not isinstance(configured_path, str) or not configured_path:
+                raise ContractValidationError(
+                    "runtime library paths must be non-empty strings"
+                )
+            path = Path(configured_path).expanduser().resolve(strict=False)
+            if not path.is_absolute() or not path.is_dir():
+                raise ContractValidationError(
+                    f"runtime library path does not exist: {configured_path}"
+                )
+            identity = str(path)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            resolved.append(identity)
+        return tuple(resolved)
 
     async def probe(self, handle: ServiceHandle, spec: ModelSpec) -> EngineProbe:
         deadline = monotonic() + self.probe_timeout_ms / 1_000
@@ -530,6 +583,7 @@ class VllmAscendInferenceEngineAdapter:
             "messages": [_plain(message) for message in request.messages],
             "max_tokens": request.max_tokens,
             "temperature": float(request.temperature),
+            **self._conservative_sampling_options(),
         }
         return await self._invoke(context.endpoint_id, payload)
 
@@ -753,4 +807,13 @@ class VllmAscendInferenceEngineAdapter:
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": float(temperature),
+            **VllmAscendInferenceEngineAdapter._conservative_sampling_options(),
+        }
+
+    @staticmethod
+    def _conservative_sampling_options() -> dict[str, object]:
+        return {
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.0,
         }

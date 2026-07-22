@@ -169,6 +169,7 @@ def _validate_backend(spec: ModelSpec, prefix: str) -> None:
             "enforce_eager",
             "gpu_memory_utilization",
             "log_level",
+            "max_num_batched_tokens",
             "max_num_seqs",
             "trust_remote_code",
         }

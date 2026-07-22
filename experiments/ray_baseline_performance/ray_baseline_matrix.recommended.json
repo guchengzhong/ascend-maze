@@ -1,0 +1,189 @@
+{
+  "schema_version": 1,
+  "name": "ray_baseline_recommended_matrix",
+  "status": "recommended_not_fully_executed",
+  "purpose": "Freeze the recommended Ray baseline workload and load-shape matrix before running formal performance experiments.",
+  "baseline_kind": "plain_ray_task_actor",
+  "does_not_use": [
+    "Ascend-Maze Controller",
+    "Ascend-Maze Scheduler",
+    "Ascend-Maze Placement",
+    "Ascend-Maze RuntimeClient",
+    "Ascend-Maze C11 ModelRouter"
+  ],
+  "existing_evidence": {
+    "correctness_smoke_all_workflows": {
+      "path": "experiments/ray_baseline_smoke/all_workflows_1sample_20260722_1/summary.json",
+      "result": "succeeded",
+      "sample_count": 14,
+      "succeeded": 14,
+      "failed": 0,
+      "text_succeeded": 11,
+      "vision_succeeded": 3,
+      "scope_note": "One sample per migrated workflow; not full-dataset coverage and not a performance result."
+    },
+    "performance_batch_admission": {
+      "path": "experiments/ray_baseline_performance/batch4_retail_cancel_ray_20260722_1/summary.json",
+      "workflow": "tbench.retail_cancel",
+      "model": "Qwen3-4B",
+      "arrival_mode": "batch",
+      "batch_size": 4,
+      "succeeded": 4,
+      "failed": 0
+    },
+    "performance_arrival_admission": {
+      "path": "experiments/ray_baseline_performance/arrival_ratio_0_5_retail_cancel_ray_20260722_1/summary.json",
+      "workflow": "tbench.retail_cancel",
+      "model": "Qwen3-4B",
+      "arrival_mode": "poisson",
+      "arrival_ratio": 0.5,
+      "avg_workflow_time_seconds": 45,
+      "effective_arrival_rate": 0.011111111111111112,
+      "measurement_window_seconds": 90,
+      "succeeded": 2,
+      "failed": 0
+    }
+  },
+  "models": {
+    "text_primary": {
+      "family": "text",
+      "model_id": "qwen3-4b-smoke",
+      "model_path": "/home/user2/workplace/model_weight/model_from_hf/Qwen3-4B",
+      "dtype": "bfloat16",
+      "default_max_model_len": 4096
+    },
+    "vision_separate": {
+      "family": "vision",
+      "model_id": "qwen2.5-vl-3b-smoke",
+      "model_path": "/home/user2/workplace/model_weight/model_from_hf/Qwen2.5-VL-3B-Instruct",
+      "dtype": "bfloat16",
+      "default_max_model_len": 4096,
+      "scope_note": "Run separately from Qwen3-4B text baseline; current smoke evidence used metadata_text_only vision mode."
+    }
+  },
+  "workload_tiers": [
+    {
+      "tier": "admission",
+      "purpose": "Fast post-change validation that the Ray performance runner and vLLM service still work.",
+      "family": "text",
+      "selectors": [
+        {
+          "dataset": "tbench",
+          "workflow": "retail_cancel"
+        }
+      ],
+      "samples_per_workflow": 1
+    },
+    {
+      "tier": "text_primary",
+      "purpose": "Formal text Ray baseline with Qwen3-4B.",
+      "family": "text",
+      "selectors": [
+        {
+          "dataset": "gaia",
+          "workflows": [
+            "file",
+            "reason",
+            "speech"
+          ]
+        },
+        {
+          "dataset": "openagi",
+          "workflows": [
+            "document_qa",
+            "text_processing_multilingual"
+          ]
+        },
+        {
+          "dataset": "tbench",
+          "workflows": [
+            "airline_book",
+            "airline_cancel",
+            "retail_cancel",
+            "retail_cancel_modify",
+            "retail_modify",
+            "retail_return"
+          ]
+        }
+      ],
+      "samples_per_workflow": "freeze_before_formal_run"
+    },
+    {
+      "tier": "vision_separate",
+      "purpose": "Separate vision Ray baseline; do not mix with Qwen3-4B text results.",
+      "family": "vision",
+      "selectors": [
+        {
+          "dataset": "gaia",
+          "workflows": [
+            "vision"
+          ]
+        },
+        {
+          "dataset": "openagi",
+          "workflows": [
+            "image_captioning_complex",
+            "multimodal_vqa_complex"
+          ]
+        }
+      ],
+      "samples_per_workflow": "freeze_after_vision_model_admission"
+    }
+  ],
+  "batch_matrix": {
+    "arrival_mode": "batch",
+    "batch_sizes": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "warmup_iterations": 1,
+    "recommended_concurrency_rule": "Set --concurrency and --model-actor-concurrency to the batch size for admission and small formal runs.",
+    "recommended_max_num_seqs_rule": "Set --max-num-seqs equal to batch size up to the validated vLLM-Ascend capacity; if lower, interpret the result as one-shot submission with internal queueing."
+  },
+  "arrival_matrix": {
+    "arrival_mode": "poisson",
+    "arrival_ratios": [
+      0.5,
+      0.75,
+      1.0,
+      1.25,
+      0.5
+    ],
+    "avg_workflow_time_seconds": 45,
+    "formal_measurement_window_seconds": 600,
+    "debug_measurement_window_seconds": [
+      90,
+      180
+    ],
+    "seed_policy": "Freeze one primary seed before formal runs; use additional seeds only for sensitivity checks.",
+    "rate_formula": "effective_arrival_rate = arrival_ratio / avg_workflow_time_seconds"
+  },
+  "output_requirements": [
+    "performance_plan.json",
+    "summary.json",
+    "{family}_performance_summary.json",
+    "{family}_performance_records.jsonl",
+    "{family}_performance_failures.jsonl",
+    "vLLM service logs"
+  ],
+  "metrics_required": [
+    "planned",
+    "launched",
+    "completed",
+    "success_rate",
+    "workflow_latency_ms",
+    "task_latency_ms",
+    "chat_latency_ms",
+    "input_tokens",
+    "output_tokens",
+    "output_tokens_per_wall_second",
+    "output_tokens_per_chat_second",
+    "failure_reasons",
+    "cleanup_errors",
+    "residual_vllm_processes"
+  ],
+  "current_recommendation": "Do not rerun the full workflow performance matrix immediately. Correctness coverage and the batch/arrival admission path are already established; run the formal matrix only after workload size, model settings, seeds, windows, and output naming are frozen."
+}
