@@ -18,7 +18,7 @@ from ascend_maze.contracts.recording import (
     FlushResult,
     RunRecordingContext,
 )
-from ascend_maze.contracts.runtime import RuntimeNodeBinding
+from ascend_maze.contracts.runtime import RuntimeDeviceMapping, RuntimeNodeBinding
 from ascend_maze.core.canonical import (
     FrozenMap,
     canonical_bytes,
@@ -232,6 +232,7 @@ class NodeAgentIdentity:
     agent_generation: str
     environment_fingerprint: str
     producer_id: str
+    device_mappings: tuple[RuntimeDeviceMapping, ...] = ()
 
     def __post_init__(self) -> None:
         for name in (
@@ -245,6 +246,19 @@ class NodeAgentIdentity:
         ):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ContractValidationError(f"{name} is required")
+        if not isinstance(self.device_mappings, tuple) or any(
+            not isinstance(item, RuntimeDeviceMapping)
+            for item in self.device_mappings
+        ):
+            raise ContractValidationError(
+                "device_mappings must contain RuntimeDeviceMapping values"
+            )
+        ordered = tuple(sorted(self.device_mappings))
+        if len({item.physical_device_id for item in ordered}) != len(ordered):
+            raise ContractValidationError(
+                "NodeAgent physical device mappings must be unique"
+            )
+        object.__setattr__(self, "device_mappings", ordered)
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,6 +489,14 @@ class NodeControlServer:
             bytes(registration.authorization_token), self.authorization_token
         ):
             raise ContractValidationError("NodeAgent authorization failed")
+        device_mappings = tuple(
+            RuntimeDeviceMapping(
+                physical_device_id=str(item.physical_device_id),
+                runtime_visible_device_id=str(item.runtime_visible_device_id),
+                visible_device_index=int(item.visible_device_index),
+            )
+            for item in registration.device_mappings
+        )
         RuntimeNodeBinding(
             node_id=str(meta.node_id),
             boot_id=str(meta.boot_id),
@@ -484,6 +506,7 @@ class NodeControlServer:
             agent_endpoint=str(registration.agent_endpoint),
             producer_id=str(registration.producer_id),
             records_locally=bool(registration.records_locally),
+            device_mappings=device_mappings,
         )
         capacity: NodeCapacity | None = None
         if registration.has_capacity:
@@ -493,6 +516,14 @@ class NodeControlServer:
             ):
                 raise ContractValidationError(
                     "NodeAgent capacity identity does not match registration"
+                )
+            capacity_device_ids = {item.device_id for item in capacity.npus}
+            mapping_device_ids = {
+                item.physical_device_id for item in device_mappings
+            }
+            if device_mappings and mapping_device_ids != capacity_device_ids:
+                raise ContractValidationError(
+                    "NodeAgent device mappings do not match reported capacity"
                 )
         if self.registration_validator is not None:
             self.registration_validator(str(meta.node_id), capacity)
@@ -511,6 +542,7 @@ class NodeControlServer:
             agent_endpoint=str(registration.agent_endpoint),
             producer_id=str(registration.producer_id),
             records_locally=bool(registration.records_locally),
+            device_mappings=device_mappings,
             status=status,
         )
         if previous is not None and self.on_binding_replaced is not None:
@@ -1041,6 +1073,12 @@ class NodeAgent:
             ),
             service_handle_ids=tuple(sorted(service_handle_ids)),
         )
+        for mapping in self.identity.device_mappings:
+            registration.device_mappings.add(
+                physical_device_id=mapping.physical_device_id,
+                runtime_visible_device_id=mapping.runtime_visible_device_id,
+                visible_device_index=mapping.visible_device_index,
+            )
         if self.node_capacity is not None:
             registration.capacity.CopyFrom(_encode_node_capacity(self.node_capacity))
             registration.has_capacity = True

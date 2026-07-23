@@ -25,6 +25,7 @@ from ascend_maze.contracts.worker import (
     WorkerProfile,
 )
 from ascend_maze.lifecycle import AttemptStatus, RunStatus, TaskStatus
+from ascend_maze.core.errors import RunDataIndexError, StateTransitionError
 from ascend_maze.placement import LeaseStatus, NodeCapacity, NodeStatus
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 
@@ -250,12 +251,10 @@ def test_ray_controller_restart_recovers_owner_fences_events_and_avoids_redispat
             assert second.result(run_id, loaded.task_id) == {"text": "payload"}
 
             replay_client = InMemoryRuntimeClient(second)
-            replay = await replay_client.submit(
-                workflow,
-                inputs={"value": "payload"},
-                submission_id="submission_ray_controller_recovery",
+            replay = replay_client.get_submission_status(
+                "submission_ray_controller_recovery"
             )
-            assert replay.replayed
+            assert replay is not None
             assert replay.run_id == run_id
             assert second.ray_runtime.active_dispatch_count() == 0
 
@@ -266,6 +265,169 @@ def test_ray_controller_restart_recovers_owner_fences_events_and_avoids_redispat
             await agent.close(grace_seconds=0)
             await second.close()
             second.ray_data_store.close(kill_owner=True)
+
+    asyncio.run(scenario())
+
+
+def test_destroyed_checkpoint_rotates_missing_data_owner_and_accepts_new_run(
+    ray_namespace: str,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        @task
+        def echo(value: str):
+            return {"result": value}
+
+        recovery_path = tmp_path / "destroyed-owner-rotation.sqlite3"
+        first = _controller(
+            ray_namespace=ray_namespace,
+            recovery_path=recovery_path,
+            generation="controller_rotation_1",
+        )
+        await first.start()
+        agent = NodeAgent(
+            identity=NodeAgentIdentity(
+                cluster_id="cluster_controller_recovery",
+                node_id="node_a",
+                boot_id="boot_1",
+                ray_node_id=ray.get_runtime_context().get_node_id(),
+                agent_generation="agent_rotation_1",
+                environment_fingerprint=ENVIRONMENT,
+                producer_id="node_agent:node_a:agent_rotation_1",
+            ),
+            authorization_token=b"recovery-token",
+            heartbeat_interval_ms=25,
+        )
+        await agent.start(controller_endpoint=first.node_rpc_endpoint)
+
+        workflow = Workflow("destroyed-owner-rotation")
+        value = workflow.input("value")
+        echoed = workflow.add_task(echo, inputs={"value": value})
+        first_outcome = await InMemoryRuntimeClient(first).submit(
+            workflow,
+            inputs={"value": "before-rotation"},
+            submission_id="submission_before_owner_rotation",
+        )
+        assert first_outcome.run_id is not None
+        old_run_id = first_outcome.run_id
+        completed = await first.wait_run(old_run_id, timeout_seconds=10)
+        assert completed.status is RunStatus.SUCCEEDED
+        destroyed = await first.destroy_run(old_run_id)
+        assert destroyed.tombstone.destroy_succeeded
+        old_descriptor = first.ray_data_store.descriptor
+        await first.close()
+        first.ray_data_store.close(kill_owner=True)
+
+        second = _controller(
+            ray_namespace=ray_namespace,
+            recovery_path=recovery_path,
+            generation="controller_rotation_2",
+        )
+        try:
+            await second.start()
+            await agent.reconnect(second.node_rpc_endpoint)
+            await _wait_reconciled(second)
+            assert second.ray_data_store.descriptor != old_descriptor
+            assert (
+                second.data_owner_generation
+                == second.ray_data_store.descriptor.owner_generation
+            )
+            assert second.ray_data_store.active_count == 0
+            assert second.snapshot(old_run_id).status is RunStatus.SUCCEEDED
+            with pytest.raises(RunDataIndexError, match="destroyed"):
+                second.result(old_run_id, echoed.task_id)
+            assert await second.destroy_run(old_run_id) == destroyed
+            replay = InMemoryRuntimeClient(second).get_submission_status(
+                "submission_before_owner_rotation"
+            )
+            assert replay is not None
+            assert replay.run_id == old_run_id
+
+            checkpoint = second.recovery_store.load()
+            assert checkpoint is not None
+            assert checkpoint.data_owner_generation == second.data_owner_generation
+            assert checkpoint.data_store_descriptor == second.ray_data_store.descriptor
+            assert all(not item.workflow_inputs for item in checkpoint.submissions)
+
+            new_outcome = await InMemoryRuntimeClient(second).submit(
+                workflow,
+                inputs={"value": "after-rotation"},
+                submission_id="submission_after_owner_rotation",
+            )
+            assert new_outcome.run_id is not None
+            new_run_id = new_outcome.run_id
+            new_completed = await second.wait_run(new_run_id, timeout_seconds=10)
+            assert new_completed.status is RunStatus.SUCCEEDED
+            assert second.result(new_run_id, echoed.task_id) == {
+                "result": "after-rotation"
+            }
+            new_destroyed = await second.destroy_run(new_run_id)
+            assert new_destroyed.tombstone.destroy_succeeded
+            assert second.ray_data_store.active_count == 0
+        finally:
+            await agent.close(grace_seconds=0)
+            await second.close()
+            second.ray_data_store.close(kill_owner=True)
+
+    asyncio.run(scenario())
+
+
+def test_missing_data_owner_does_not_rotate_live_checkpoint(
+    ray_namespace: str,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        @task
+        def slow(value: str):
+            import time
+
+            time.sleep(30)
+            return {"result": value}
+
+        recovery_path = tmp_path / "live-owner-rotation.sqlite3"
+        first = _controller(
+            ray_namespace=ray_namespace,
+            recovery_path=recovery_path,
+            generation="controller_live_rotation_1",
+        )
+        await first.start()
+        agent = NodeAgent(
+            identity=NodeAgentIdentity(
+                cluster_id="cluster_controller_recovery",
+                node_id="node_a",
+                boot_id="boot_1",
+                ray_node_id=ray.get_runtime_context().get_node_id(),
+                agent_generation="agent_live_rotation_1",
+                environment_fingerprint=ENVIRONMENT,
+                producer_id="node_agent:node_a:agent_live_rotation_1",
+            ),
+            authorization_token=b"recovery-token",
+            heartbeat_interval_ms=25,
+        )
+        await agent.start(controller_endpoint=first.node_rpc_endpoint)
+        workflow = Workflow("live-owner-rotation")
+        value = workflow.input("value")
+        pending = workflow.add_task(slow, inputs={"value": value})
+        outcome = await InMemoryRuntimeClient(first).submit(
+            workflow,
+            inputs={"value": "live"},
+            submission_id="submission_live_owner_rotation",
+        )
+        assert outcome.run_id is not None
+        await _wait_task_running(first, outcome.run_id, pending.task_id)
+        await first.crash()
+        first.ray_data_store.close(kill_owner=True)
+
+        with pytest.raises(
+            StateTransitionError,
+            match="checkpoint Run is not successfully destroyed",
+        ):
+            _controller(
+                ray_namespace=ray_namespace,
+                recovery_path=recovery_path,
+                generation="controller_live_rotation_2",
+            )
+        await agent.close(grace_seconds=0)
 
     asyncio.run(scenario())
 

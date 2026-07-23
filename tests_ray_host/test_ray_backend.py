@@ -118,7 +118,13 @@ def test_ray_backend_executes_one_shot_worker_on_hard_bound_node(
                 compiled.tasks[node.task_id].definition_id: host_echo,
             },
         )
+        code_package_puts_before = int(store.stats()["code_package_put_count"])
+        canonicalize_before_prepare = int(store.stats()["canonicalize_count"])
         code_handles = await backend.prepare(packages)
+        assert int(store.stats()["code_package_put_count"]) == (
+            code_package_puts_before + 1
+        )
+        assert int(store.stats()["canonicalize_count"]) == canonicalize_before_prepare
         definition_id = compiled.tasks[node.task_id].definition_id
         code_handle = next(
             item for item in code_handles if item.definition_id == definition_id
@@ -137,6 +143,9 @@ def test_ray_backend_executes_one_shot_worker_on_hard_bound_node(
             created_at_ms=1,
             dispatch_deadline_ms=100_000,
         )
+        input_handle = store.put_staged("hello", generation)
+        resolve_batches_before = int(store.stats()["resolve_batch_count"])
+        runtime_outputs_before = int(store.stats()["runtime_output_put_count"])
         request = ExecutionRequest(
             dispatch_id="dispatch_1",
             run_id="run_1",
@@ -146,13 +155,17 @@ def test_ray_backend_executes_one_shot_worker_on_hard_bound_node(
             execution_target=ExecutionTarget.LOCAL_WORKER,
             model_route=None,
             code_handle=code_handle,
-            arguments=(RuntimeArgument("value", "literal", literal="hello"),),
+            arguments=(
+                RuntimeArgument("value", "data_handle", data_handle=input_handle),
+            ),
             expected_outputs=("result",),
             timeout_ms=None,
             environment_fingerprint=ENVIRONMENT,
         )
         dispatch = await backend.dispatch(request, lease)
         assert await backend.dispatch(request, lease) == dispatch
+        assert store.local_get_count == 0
+        assert int(store.stats()["resolve_batch_count"]) == resolve_batches_before + 1
         await asyncio.wait_for(backend.wait_idle(), timeout=15)
         for _ in range(1_000):
             if len(events) >= 2:
@@ -172,6 +185,15 @@ def test_ray_backend_executes_one_shot_worker_on_hard_bound_node(
         outcome = backend.worker_outcome("dispatch_1")
         assert outcome is not None
         assert outcome.ray_node_id == identity.ray_node_id
+        timings = backend.task_timing_records("run_1")
+        assert len(timings) == 1
+        assert timings[0]["dispatch_id"] == "dispatch_1"
+        assert timings[0]["status"] == "succeeded"
+        assert timings[0]["input_fetch_scope"] == (
+            "ray_materialized_argument_binding"
+        )
+        assert timings[0]["output_put_scope"] == "ray_data_store_put_staged"
+        assert timings[0]["dispatch_wait_ms"] >= timings[0]["worker_startup_ms"]
         started = backend.worker_started_event("dispatch_1")
         assert started is not None
         assert started.worker_pid == outcome.worker_pid
@@ -184,12 +206,18 @@ def test_ray_backend_executes_one_shot_worker_on_hard_bound_node(
         with pytest.raises(ProcessLookupError):
             os.kill(outcome.worker_pid, 0)
         result_handle = events[-1].output_handles[0][1]
+        assert result_handle.stable_digest is None
+        assert result_handle.size_bytes is None
         assert store.get(result_handle) == "hello"
         assert store.state_of(result_handle) == "staged"
+        assert int(store.stats()["runtime_output_put_count"]) == (
+            runtime_outputs_before + 1
+        )
         assert broker.active_count() == 0
         assert recorder.events("run_1")[0].producer_id == identity.producer_id
 
         store.release(result_handle)
+        store.release(input_handle)
         await backend.release_code(code_handles)
         assert backend.code_reference_count() == 0
         await backend.close()

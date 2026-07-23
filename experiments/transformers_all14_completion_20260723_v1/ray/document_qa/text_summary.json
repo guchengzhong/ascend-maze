@@ -1,0 +1,32 @@
+{
+  "cleanup_errors": [],
+  "failed": 0,
+  "failures_path": "/home/user2/workplace/Ascend-Maze/experiments/transformers_all14_completion_20260723_v1/ray/document_qa/text_failures.jsonl",
+  "family": "text",
+  "inference_backend": "transformers",
+  "records_path": "/home/user2/workplace/Ascend-Maze/experiments/transformers_all14_completion_20260723_v1/ray/document_qa/text_records.jsonl",
+  "sample_count": 1,
+  "service_config": null,
+  "service_log_tails": {},
+  "status": "completed",
+  "succeeded": 1,
+  "target_model_id": "qwen3-4b-smoke",
+  "transformers_config": {
+    "device_id": "0",
+    "dtype": "bfloat16",
+    "enable_thinking": false,
+    "family": "text",
+    "generation_method": "manual_greedy",
+    "max_model_len": 10240,
+    "model_id": "qwen3-4b-smoke",
+    "model_kind": "text",
+    "model_path": "/home/user2/workplace/model_weight/model_from_hf/Qwen3-4B",
+    "request_timeout_ms": 900000,
+    "runtime_library_paths": [
+      "/usr/local/Ascend/cann-9.0.0-beta.2/opp/built-in/op_impl/host_aicpu",
+      "/usr/local/Ascend/cann-9.0.0-beta.2/opp/built-in/op_impl/aicpu/aicpu_kernel/lib/Ascend"
+    ],
+    "tokenizer_path": "/home/user2/workplace/model_weight/model_from_hf/Qwen3-4B",
+    "trust_remote_code": false
+  }
+}

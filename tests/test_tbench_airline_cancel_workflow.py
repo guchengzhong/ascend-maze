@@ -141,14 +141,17 @@ def test_airline_cancel_workflow_runs_with_fake_inference(tmp_path) -> None:
                 task_id_by_name["task6_book_new_reservation"],
             )
             assert final["status"] == "success"
-            reservations = final["backend_data"]["reservations"]  # type: ignore[index]
-            assert reservations["OLDRES"]["status"] == "cancelled"
-            assert reservations["OLDRES"]["payment_history"][1] == {
+            cancelled_reservation = final["cancel_result"]["result"]  # type: ignore[index]
+            assert cancelled_reservation["reservation_id"] == "OLDRES"
+            assert cancelled_reservation["status"] == "cancelled"
+            assert cancelled_reservation["payment_history"][1] == {
                 "payment_id": "credit_card_air",
                 "amount": -50,
             }
-            assert set(reservations) == {"OLDRES", "HATHAT"}
-            new_reservation = reservations["HATHAT"]
+            booking_result = final["booking_result"]
+            assert booking_result["status"] == "success"
+            new_reservation = booking_result["result"]
+            assert new_reservation["reservation_id"] == "HATHAT"
             assert new_reservation["user_id"] == "airline_user"
             assert new_reservation["origin"] == "SFO"
             assert new_reservation["destination"] == "LAX"
@@ -167,8 +170,7 @@ def test_airline_cancel_workflow_runs_with_fake_inference(tmp_path) -> None:
                     "amount": 120.0,
                 }
             ]
-            users = final["backend_data"]["users"]  # type: ignore[index]
-            assert users["airline_user"]["reservations"] == ["OLDRES", "HATHAT"]
+            assert final["affected_user_reservations"] == ["OLDRES", "HATHAT"]
 
             await controller.destroy_run(outcome.run_id)
         finally:

@@ -107,6 +107,17 @@ def test_fake_runtime_returns_staged_handles_and_releases_code() -> None:
         output_handle = result_event.output_handles[0][1]
         assert store.get(output_handle) == "hello"
         assert store.state_of(output_handle) == "staged"
+        timings = backend.task_timing_records("run_1")
+        assert len(timings) == 1
+        timing = timings[0]
+        assert timing["run_id"] == "run_1"
+        assert timing["task_id"] == node.task_id
+        assert timing["status"] == "succeeded"
+        assert timing["input_handle_count"] == 0
+        assert timing["output_count"] == 1
+        assert timing["task_total_ms"] >= timing["callable_execute_ms"]
+        assert timing["output_put_ms"] >= 0
+        assert timing["chat_request_ms"] == 0
         await backend.release_code(handles)
         assert backend.code_reference_count() == 0
         await backend.close()

@@ -76,7 +76,7 @@ def task1_llm_process(
 
     response = chat(
         [{"role": "user", "content": prompt}],
-        max_tokens=512,
+        max_tokens=4096,
         temperature=0.0,
     )
     override = metadata.get("llm_output_override")
@@ -97,7 +97,6 @@ def task1_llm_process(
         "llm_output": llm_output,
         "raw_model_output": response.text,
         "cancellation_requests": cancellation_requests,
-        "backend_data": backend_data,
         "curr_task_feat": features,
     }
 
@@ -112,11 +111,34 @@ def task2_execute_cancel(
         backend_data,
         cancellation_requests,
     )
+    affected_orders = []
+    affected_user_payment_methods: dict[str, object] = {}
+    users = backend_data.get("users", {})
+    if not isinstance(users, dict):
+        users = {}
+    for cancel_result in cancel_results:
+        order_result = cancel_result.get("result")
+        if not isinstance(order_result, dict):
+            continue
+        affected_orders.append(order_result)
+        user_id = order_result.get("user_id")
+        if not isinstance(user_id, str) or not user_id:
+            continue
+        user = users.get(user_id)
+        if not isinstance(user, dict):
+            continue
+        payment_methods = user.get("payment_methods", {})
+        if isinstance(payment_methods, dict):
+            affected_user_payment_methods[user_id] = {
+                str(payment_id): payment_method
+                for payment_id, payment_method in payment_methods.items()
+            }
     return {
         "dag_id": dag_id,
         "status": "done",
-        "backend_data": backend_data,
         "cancel_results": cancel_results,
+        "affected_orders": affected_orders,
+        "affected_user_payment_methods": affected_user_payment_methods,
     }
 
 
@@ -170,7 +192,7 @@ def build() -> Workflow:
         task_name="task2_execute_cancel",
         inputs={
             "dag_id": extracted.outputs["dag_id"],
-            "backend_data": extracted.outputs["backend_data"],
+            "backend_data": initialized.outputs["backend_data"],
             "cancellation_requests": extracted.outputs["cancellation_requests"],
         },
     )

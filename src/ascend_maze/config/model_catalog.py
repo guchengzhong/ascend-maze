@@ -181,6 +181,33 @@ def _validate_backend(spec: ModelSpec, prefix: str) -> None:
             raise ContractValidationError(
                 f"{prefix}.npu_slots: vllm_ascend requires one NPU slot"
             )
+    elif spec.backend == "transformers_local":
+        allowed = {
+            "device_id",
+            "enable_thinking",
+            "generation_method",
+            "model_kind",
+            "qwen2_5_vl_cpu_unique_consecutive_workaround",
+            "request_timeout_ms",
+            "runtime_library_paths",
+            "trust_remote_code",
+        }
+        if spec.dtype not in {"bfloat16", "float16"}:
+            raise ContractValidationError(
+                f"{prefix}.dtype: transformers_local requires bfloat16 or float16"
+            )
+        if spec.tensor_parallel_size != 1:
+            raise ContractValidationError(
+                f"{prefix}.tensor_parallel_size: transformers_local requires one NPU"
+            )
+        if spec.npu_slots != 1:
+            raise ContractValidationError(
+                f"{prefix}.npu_slots: transformers_local requires one NPU slot"
+            )
+        if spec.request_capacity != 1:
+            raise ContractValidationError(
+                f"{prefix}.request_capacity: transformers_local requires capacity one"
+            )
     else:
         raise ContractValidationError(f"{prefix}.backend: unsupported value {spec.backend!r}")
     unknown = sorted(str(key) for key in spec.launch_options if str(key) not in allowed)

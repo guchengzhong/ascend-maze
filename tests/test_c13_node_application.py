@@ -13,6 +13,7 @@ from ascend_maze.control import node_application
 from ascend_maze.control.contracts import NodeRuntimePolicy
 from ascend_maze.control.node_application import NodeApplication, NodeBootstrapResponse
 from ascend_maze.control.process_lock import NodeProcessLock
+from ascend_maze.contracts.runtime import RuntimeDeviceMapping
 from ascend_maze.core.errors import ContractValidationError
 from ascend_maze.placement import NodeCapacity
 
@@ -75,6 +76,16 @@ def test_node_bootstrap_config_is_strict_and_normalizes_paths(tmp_path: Path) ->
     assert config.runtime_directory == str((tmp_path / "runtime").resolve())
     assert config.ray_temp_directory == str((tmp_path / "ray-tmp").resolve())
     assert config.recording_root_directory == str((tmp_path / "records").resolve())
+    assert config.device_mappings == ()
+
+    path = _write_node_config(
+        tmp_path,
+        "device_mappings = ["
+        '{ physical_device_id = "3", runtime_visible_device_id = "0", '
+        "visible_device_index = 0 }]",
+    )
+    config = load_node_bootstrap(path)
+    assert config.device_mappings == (RuntimeDeviceMapping("3", "0", 0),)
 
     path = _write_node_config(tmp_path, "unknown_option = true")
     with pytest.raises(ContractValidationError, match="unknown_option"):
@@ -86,6 +97,15 @@ def test_node_bootstrap_config_is_strict_and_normalizes_paths(tmp_path: Path) ->
 
     path = _write_node_config(tmp_path, "worker_rpc_bind_address = 1234")
     with pytest.raises(ContractValidationError, match="worker_rpc_bind_address"):
+        load_node_bootstrap(path)
+
+    path = _write_node_config(
+        tmp_path,
+        "device_mappings = ["
+        '{ physical_device_id = "3", runtime_visible_device_id = "0" }, '
+        '{ physical_device_id = "3", runtime_visible_device_id = "1" }]',
+    )
+    with pytest.raises(ContractValidationError, match="must be unique"):
         load_node_bootstrap(path)
 
     path.write_text(

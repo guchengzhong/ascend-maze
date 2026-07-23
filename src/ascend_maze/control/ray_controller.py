@@ -17,7 +17,13 @@ from ascend_maze.contracts.recording import (
 )
 from ascend_maze.contracts.runtime import RuntimeNodeBinding
 from ascend_maze.contracts.worker import WorkerPoolConfig
-from ascend_maze.data.ray_store import RayDataStore, RayDataStoreDescriptor
+from ascend_maze.contracts.submission import SubmissionState
+from ascend_maze.data.index import RunDataState
+from ascend_maze.data.ray_store import (
+    RayDataStore,
+    RayDataStoreDescriptor,
+    RayDataStoreOwnerUnavailableError,
+)
 from ascend_maze.placement import LeaseStatus, NodeCapacity, NodeObservation, NodeStatus
 from ascend_maze.placement import PlacementManager
 from ascend_maze.recording import InMemoryRecorder
@@ -48,10 +54,62 @@ from ascend_maze.control.node_rpc import (
     NodeRecoveryInventory,
 )
 from ascend_maze.control.recovery import (
+    ControllerCheckpoint,
     ControllerRecoveryStore,
     RecoveryIdentity,
     SqliteControllerRecoveryStore,
 )
+
+
+def _assert_quiescent_data_owner_rotation(checkpoint: ControllerCheckpoint) -> None:
+    runs_by_id = {item.run_id: item for item in checkpoint.runs}
+    for run in checkpoint.runs:
+        tombstone = run.index.tombstone
+        if (
+            run.destroy_result is None
+            or run.index.state is not RunDataState.DESTROYED
+            or tombstone is None
+            or not tombstone.destroy_succeeded
+        ):
+            raise StateTransitionError(
+                "cannot rotate unavailable DataStoreOwner while checkpoint Run "
+                f"is not successfully destroyed: {run.run_id}"
+            )
+        if run.index.workflow_inputs or run.index.task_outputs:
+            raise StateTransitionError(
+                "cannot rotate unavailable DataStoreOwner while checkpoint Run "
+                f"still contains DataHandles: {run.run_id}"
+            )
+    for submission in checkpoint.submissions:
+        if submission.state is SubmissionState.PREPARING:
+            raise StateTransitionError(
+                "cannot rotate unavailable DataStoreOwner while a submission is "
+                f"preparing: {submission.submission_id}"
+            )
+        if submission.state is SubmissionState.COMMITTED and (
+            submission.run_id is None or submission.run_id not in runs_by_id
+        ):
+            raise StateTransitionError(
+                "cannot rotate unavailable DataStoreOwner because a committed "
+                f"submission has no recovered Run: {submission.submission_id}"
+            )
+
+
+def _rotate_quiescent_data_owner(
+    checkpoint: ControllerCheckpoint,
+    *,
+    owner_generation: str,
+    descriptor: RayDataStoreDescriptor,
+) -> ControllerCheckpoint:
+    _assert_quiescent_data_owner_rotation(checkpoint)
+    return replace(
+        checkpoint,
+        data_owner_generation=owner_generation,
+        data_store_descriptor=descriptor,
+        submissions=tuple(
+            replace(item, workflow_inputs=()) for item in checkpoint.submissions
+        ),
+    )
 
 
 class RayHostController(InMemoryController):
@@ -126,19 +184,42 @@ class RayHostController(InMemoryController):
             descriptor, RayDataStoreDescriptor
         ):
             raise TypeError("recovered DataStore descriptor is not a Ray descriptor")
+        if descriptor is not None and descriptor.owner_namespace != ray_namespace:
+            raise StateTransitionError(
+                "recovered DataStoreOwner namespace does not match configured Ray "
+                "namespace"
+            )
         data_owner_generation = (
             generation
             if recovered_checkpoint is None
             else recovered_checkpoint.data_owner_generation
         )
-        data_store = (
-            RayDataStore.start(
+        if descriptor is None:
+            data_store = RayDataStore.start(
                 owner_generation=data_owner_generation,
                 namespace=ray_namespace,
             )
-            if descriptor is None
-            else RayDataStore.connect(descriptor)
-        )
+        else:
+            try:
+                data_store = RayDataStore.connect(descriptor)
+            except RayDataStoreOwnerUnavailableError:
+                assert recovered_checkpoint is not None
+                _assert_quiescent_data_owner_rotation(recovered_checkpoint)
+                data_owner_generation = new_id("data_owner")
+                data_store = RayDataStore.start(
+                    owner_generation=data_owner_generation,
+                    namespace=ray_namespace,
+                )
+                recovered_checkpoint = _rotate_quiescent_data_owner(
+                    recovered_checkpoint,
+                    owner_generation=data_owner_generation,
+                    descriptor=data_store.descriptor,
+                )
+                assert recovery_claim is not None
+                recovery_claim = replace(
+                    recovery_claim,
+                    checkpoint=recovered_checkpoint,
+                )
         effective_recorder = recorder or InMemoryRecorder()
         node_registry = node_registry or RayNodeRegistry()
         effective_placement = placement or PlacementManager()

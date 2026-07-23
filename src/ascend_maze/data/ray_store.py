@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from threading import RLock
+from time import perf_counter
 from typing import Any
 
 import ray
+from ray.exceptions import RayActorError
 
 from ascend_maze.contracts.data import (
     DataHandle,
@@ -14,7 +17,7 @@ from ascend_maze.contracts.data import (
     SharedFileRef,
     shared_file_metadata,
 )
-from ascend_maze.core.canonical import FrozenMap, canonical_bytes, canonical_digest
+from ascend_maze.core.canonical import FrozenMap, canonical_bytes
 from ascend_maze.core.errors import (
     CanonicalizationError,
     DataHandleInvalidError,
@@ -22,6 +25,14 @@ from ascend_maze.core.errors import (
     DataStoreWriteError,
 )
 from ascend_maze.core.identifiers import new_id
+
+
+def _elapsed_ms(started: float) -> float:
+    return max(0.0, (perf_counter() - started) * 1_000)
+
+
+class RayDataStoreOwnerUnavailableError(DataHandleInvalidError):
+    """The descriptor is valid, but its detached owner actor no longer exists."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,19 +56,54 @@ class _OwnerEntry:
     owner: DataOwner | None
 
 
+@dataclass(frozen=True, slots=True)
+class _PutMetrics:
+    source: str
+    canonicalize_ms: float
+    ray_put_ms: float
+    canonicalize_count: int
+    value_size_bytes: int | None
+
+
 class _DataStoreOwner:
     def __init__(self, owner_generation: str) -> None:
         self.owner_generation = owner_generation
         self._entries: dict[str, _OwnerEntry] = {}
         self._tombstones: set[str] = set()
         self._stage_count = 0
+        self._resolve_count = 0
+        self._resolve_batch_count = 0
         self._fail_stage_numbers: set[int] = set()
+        self._put_metrics: dict[str, int | float] = {
+            "canonicalize_ms": 0.0,
+            "ray_put_ms": 0.0,
+            "owner_stage_ms": 0.0,
+            "canonicalize_count": 0,
+            "value_size_bytes": 0,
+            "value_size_known_count": 0,
+            "value_size_unknown_count": 0,
+        }
+        for source in ("submission_input", "runtime_output", "code_package"):
+            self._put_metrics.update(
+                {
+                    f"{source}_put_count": 0,
+                    f"{source}_canonicalize_ms": 0.0,
+                    f"{source}_ray_put_ms": 0.0,
+                    f"{source}_owner_stage_ms": 0.0,
+                    f"{source}_canonicalize_count": 0,
+                    f"{source}_value_size_bytes": 0,
+                    f"{source}_value_size_known_count": 0,
+                    f"{source}_value_size_unknown_count": 0,
+                }
+            )
 
     def stage(
         self,
         handle: DataHandle,
         boxed_ref: list[ray.ObjectRef],
+        put_metrics: _PutMetrics,
     ) -> None:
+        stage_started = perf_counter()
         self._stage_count += 1
         if self._stage_count in self._fail_stage_numbers:
             self._fail_stage_numbers.remove(self._stage_count)
@@ -72,17 +118,30 @@ class _DataStoreOwner:
                 or existing.object_ref.hex() != boxed_ref[0].hex()
             ):
                 raise RuntimeError("staged_handle_id payload conflict")
-            return
-        self._entries[handle.staged_handle_id] = _OwnerEntry(
-            handle=handle,
-            object_ref=boxed_ref[0],
-            state="staged",
-            owner=None,
+        else:
+            self._entries[handle.staged_handle_id] = _OwnerEntry(
+                handle=handle,
+                object_ref=boxed_ref[0],
+                state="staged",
+                owner=None,
+            )
+            self._tombstones.discard(handle.staged_handle_id)
+        self._record_put_metrics(
+            put_metrics,
+            owner_stage_ms=_elapsed_ms(stage_started),
         )
-        self._tombstones.discard(handle.staged_handle_id)
 
     def resolve(self, handle: DataHandle) -> ray.ObjectRef:
+        self._resolve_count += 1
         return self._require_entry(handle).object_ref
+
+    def resolve_many(
+        self,
+        handles: tuple[DataHandle, ...],
+    ) -> tuple[ray.ObjectRef, ...]:
+        self._resolve_batch_count += 1
+        self._resolve_count += len(handles)
+        return tuple(self._require_entry(handle).object_ref for handle in handles)
 
     def state_of(self, handle: DataHandle) -> str:
         entry = self._entries.get(handle.staged_handle_id)
@@ -169,7 +228,7 @@ class _DataStoreOwner:
             self.release(handle)
         return len(handles)
 
-    def stats(self) -> dict[str, int | str]:
+    def stats(self) -> dict[str, int | float | str]:
         return {
             "owner_generation": self.owner_generation,
             "active_count": len(self._entries),
@@ -181,7 +240,41 @@ class _DataStoreOwner:
             ),
             "tombstone_count": len(self._tombstones),
             "stage_count": self._stage_count,
+            "resolve_count": self._resolve_count,
+            "resolve_batch_count": self._resolve_batch_count,
+            **self._put_metrics,
         }
+
+    def _record_put_metrics(
+        self,
+        metrics: _PutMetrics,
+        *,
+        owner_stage_ms: float,
+    ) -> None:
+        if metrics.source not in {
+            "submission_input",
+            "runtime_output",
+            "code_package",
+        }:
+            raise RuntimeError("RayDataStore put metrics source is invalid")
+        prefix = metrics.source
+        for key, value in (
+            ("canonicalize_ms", metrics.canonicalize_ms),
+            ("ray_put_ms", metrics.ray_put_ms),
+            ("owner_stage_ms", owner_stage_ms),
+            ("canonicalize_count", metrics.canonicalize_count),
+        ):
+            self._put_metrics[key] += value
+            self._put_metrics[f"{prefix}_{key}"] += value
+        self._put_metrics[f"{prefix}_put_count"] += 1
+        if metrics.value_size_bytes is None:
+            self._put_metrics["value_size_unknown_count"] += 1
+            self._put_metrics[f"{prefix}_value_size_unknown_count"] += 1
+            return
+        self._put_metrics["value_size_bytes"] += metrics.value_size_bytes
+        self._put_metrics[f"{prefix}_value_size_bytes"] += metrics.value_size_bytes
+        self._put_metrics["value_size_known_count"] += 1
+        self._put_metrics[f"{prefix}_value_size_known_count"] += 1
 
     def fail_on_stage_number(self, stage_number: int) -> None:
         if stage_number < 1:
@@ -249,11 +342,23 @@ class RayDataStore:
 
     @classmethod
     def connect(cls, descriptor: RayDataStoreDescriptor) -> "RayDataStore":
-        actor = ray.get_actor(
-            descriptor.owner_actor_name,
-            namespace=descriptor.owner_namespace,
-        )
-        stats = ray.get(actor.stats.remote())
+        try:
+            actor = ray.get_actor(
+                descriptor.owner_actor_name,
+                namespace=descriptor.owner_namespace,
+            )
+        except ValueError as exc:
+            raise RayDataStoreOwnerUnavailableError(
+                "DataStoreOwner actor is unavailable: "
+                f"{descriptor.owner_namespace}/{descriptor.owner_actor_name}"
+            ) from exc
+        try:
+            stats = ray.get(actor.stats.remote())
+        except RayActorError as exc:
+            raise RayDataStoreOwnerUnavailableError(
+                "DataStoreOwner actor exited before it could be connected: "
+                f"{descriptor.owner_namespace}/{descriptor.owner_actor_name}"
+            ) from exc
         if stats["owner_generation"] != descriptor.owner_generation:
             raise DataHandleInvalidError("DataStoreOwner generation changed")
         return cls(descriptor, actor)
@@ -271,7 +376,37 @@ class RayDataStore:
 
     def put_staged(self, value: Any, owner_generation: str) -> DataHandle:
         return self._put_staged(
-            value, owner_generation, FrozenMap((("backend", "ray"),))
+            value,
+            owner_generation,
+            FrozenMap((("backend", "ray"),)),
+            source="submission_input",
+            require_stable_digest=True,
+        )
+
+    def put_staged_for_submission_input(
+        self,
+        value: Any,
+        owner_generation: str,
+    ) -> DataHandle:
+        return self._put_staged(
+            value,
+            owner_generation,
+            FrozenMap((("backend", "ray"),)),
+            source="submission_input",
+            require_stable_digest=False,
+        )
+
+    def put_staged_for_code_package(
+        self,
+        value: Any,
+        owner_generation: str,
+    ) -> DataHandle:
+        return self._put_staged(
+            value,
+            owner_generation,
+            FrozenMap((("backend", "ray"),)),
+            source="code_package",
+            require_stable_digest=False,
         )
 
     def put_staged_for_runtime_node(
@@ -302,6 +437,8 @@ class RayDataStore:
                     ("source_runtime_generation", runtime_generation),
                 )
             ),
+            source="runtime_output",
+            require_stable_digest=False,
         )
 
     def _put_staged(
@@ -309,42 +446,104 @@ class RayDataStore:
         value: Any,
         owner_generation: str,
         metadata: FrozenMap[Any, Any],
+        *,
+        source: str,
+        require_stable_digest: bool,
     ) -> DataHandle:
         if owner_generation != self.descriptor.owner_generation:
             raise DataStoreWriteError("owner generation does not match DataStoreOwner")
         stable_digest: str | None = None
         size_bytes: int | None = None
+        canonicalize_count = 0
+        canonicalize_ms = 0.0
         if isinstance(value, SharedFileRef):
             metadata = FrozenMap(
                 (*metadata.items_tuple(), *shared_file_metadata(value))
             )
-        else:
+            size_bytes = value.size_bytes
+        elif require_stable_digest:
+            canonicalize_count = 1
+            canonicalize_started = perf_counter()
             try:
-                stable_digest = canonical_digest(value)
-                size_bytes = len(canonical_bytes(value))
+                payload = canonical_bytes(value)
+                canonicalize_ms = _elapsed_ms(canonicalize_started)
+                stable_digest = hashlib.sha256(payload).hexdigest()
+                size_bytes = len(payload)
             except CanonicalizationError:
-                pass
-        handle = DataHandle(
-            owner_generation=owner_generation,
-            staged_handle_id=new_id("data"),
-            stable_digest=stable_digest,
-            size_bytes=size_bytes,
-            metadata=metadata,
-        )
+                canonicalize_ms = _elapsed_ms(canonicalize_started)
         try:
+            ray_put_started = perf_counter()
             object_ref = ray.put(value, _owner=self._owner_actor)
-            ray.get(self._owner_actor.stage.remote(handle, [object_ref]))
+            ray_put_ms = _elapsed_ms(ray_put_started)
+            handle = DataHandle(
+                owner_generation=owner_generation,
+                staged_handle_id=new_id("data"),
+                stable_digest=stable_digest,
+                size_bytes=size_bytes,
+                metadata=FrozenMap(
+                    (
+                        *metadata.items_tuple(),
+                        ("ray_object_ref_id", object_ref.hex()),
+                    )
+                ),
+            )
+            ray.get(
+                self._owner_actor.stage.remote(
+                    handle,
+                    [object_ref],
+                    _PutMetrics(
+                        source=source,
+                        canonicalize_ms=canonicalize_ms,
+                        ray_put_ms=ray_put_ms,
+                        canonicalize_count=canonicalize_count,
+                        value_size_bytes=size_bytes,
+                    ),
+                )
+            )
         except Exception as exc:
             raise DataStoreWriteError(f"Ray put_staged failed: {exc}") from exc
         return handle
 
+    def resolve_ref(self, handle: DataHandle) -> ray.ObjectRef:
+        """Resolve one logical handle without materializing its payload."""
+
+        return self.resolve_refs((handle,))[0]
+
+    def resolve_refs(
+        self,
+        handles: tuple[DataHandle, ...],
+    ) -> tuple[ray.ObjectRef, ...]:
+        """Resolve logical handles to owner-backed ObjectRefs in one control RPC."""
+
+        if not isinstance(handles, tuple):
+            raise TypeError("resolve_refs handles must be a tuple")
+        for handle in handles:
+            if not isinstance(handle, DataHandle):
+                raise TypeError("resolve_refs requires DataHandle values")
+            self._validate_generation(handle)
+        if not handles:
+            return ()
+        try:
+            refs = ray.get(self._owner_actor.resolve_many.remote(handles))
+            if not isinstance(refs, tuple) or len(refs) != len(handles):
+                raise TypeError("DataStoreOwner returned an invalid ObjectRef batch")
+            for handle, object_ref in zip(handles, refs, strict=True):
+                if not isinstance(object_ref, ray.ObjectRef):
+                    raise TypeError("DataStoreOwner returned a non-ObjectRef value")
+                expected_id = handle.metadata.get("ray_object_ref_id")
+                if expected_id is not None and object_ref.hex() != expected_id:
+                    raise RuntimeError("DataHandle ObjectRef identity changed")
+            return refs
+        except Exception as exc:
+            raise DataHandleInvalidError(
+                f"Ray data handle cannot be resolved: {exc}"
+            ) from exc
+
     def get(self, handle: DataHandle) -> Any:
-        self._validate_generation(handle)
         with self._local_lock:
             self._local_get_count += 1
         try:
-            object_ref = ray.get(self._owner_actor.resolve.remote(handle))
-            return ray.get(object_ref)
+            return ray.get(self.resolve_ref(handle))
         except Exception as exc:
             raise DataHandleInvalidError(
                 f"Ray data handle cannot be read: {exc}"
@@ -388,8 +587,11 @@ class RayDataStore:
             ) from exc
         return value if isinstance(value, DataOwner) else None
 
-    def stats(self) -> dict[str, int | str]:
+    def stats(self) -> dict[str, int | float | str]:
         return dict(ray.get(self._owner_actor.stats.remote()))
+
+    def metrics_snapshot(self) -> dict[str, int | float | str]:
+        return self.stats()
 
     @property
     def active_count(self) -> int:

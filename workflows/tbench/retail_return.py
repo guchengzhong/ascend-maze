@@ -82,7 +82,7 @@ def task1_llm_process(
 
     response = chat(
         [{"role": "user", "content": prompt}],
-        max_tokens=512,
+        max_tokens=4096,
         temperature=0.0,
     )
     override = metadata.get("llm_output_override")

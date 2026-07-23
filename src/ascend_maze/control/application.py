@@ -24,6 +24,7 @@ from ascend_maze.config import LoadedConfig, load_model_catalog
 from ascend_maze.config.schema import MainConfig
 from ascend_maze.contracts.recording import ParquetRecorderConfig
 from ascend_maze.contracts.resources import ReservationVector
+from ascend_maze.contracts.runtime import RuntimeDeviceMapping
 from ascend_maze.contracts.worker import (
     WarmupManifest,
     WorkerPoolConfig,
@@ -43,8 +44,15 @@ from ascend_maze.core.errors import (
     EnvironmentValidationError,
 )
 from ascend_maze.core.identifiers import new_id
-from ascend_maze.inference import InferenceCoordinator, ModelCatalog
+from ascend_maze.inference import (
+    InferenceCoordinator,
+    InMemoryPortLeaseManager,
+    ModelCatalog,
+)
 from ascend_maze.inference.adapters.fake import FakeInferenceEngineAdapter
+from ascend_maze.inference.adapters.transformers_local import (
+    TransformersLocalInferenceEngineAdapter,
+)
 from ascend_maze.inference.adapters.vllm_ascend import (
     VllmAscendInferenceEngineAdapter,
 )
@@ -133,6 +141,9 @@ class ControllerApplication:
             environment=environment,
             config=platform_config,
         )
+        device_mappings = tuple(
+            RuntimeDeviceMapping.identity(item.device_id) for item in capacity.npus
+        )
         token = _read_secret(Path(config.control.cluster_token_file), "cluster token")
         cursor_key = _load_or_create_cursor_key(
             Path(config.recording.cursor_signing_key_file)
@@ -177,6 +188,7 @@ class ControllerApplication:
                 allowed_executables=(sys.executable,),
                 log_directory=Path(config.control.runtime_directory) / "model-logs",
                 hbm_recovery_tolerance_mb=config.worker.hbm_recovery_tolerance_mb,
+                device_mappings=device_mappings,
             )
             return NodeAgent(
                 identity=NodeAgentIdentity(
@@ -187,6 +199,7 @@ class ControllerApplication:
                     agent_generation=agent_generation,
                     environment_fingerprint=environment.environment_fingerprint,
                     producer_id=producer_id,
+                    device_mappings=device_mappings,
                 ),
                 authorization_token=token,
                 recorder=node_recorder,
@@ -400,9 +413,24 @@ def _inference(
             service_backend=fake,
             reconcile_interval_ms=loaded.config.inference.reconcile_interval_ms,
         )
+    if backends == {"transformers_local"}:
+        adapter = TransformersLocalInferenceEngineAdapter()
+        catalog = ModelCatalog(
+            document.specs,
+            adapters={"transformers_local": adapter},
+            environment_capabilities=("ascend", "transformers_local"),
+            max_single_npu_hbm_mb=placement.max_single_npu_allocatable_hbm_mb(),
+        )
+        return InferenceCoordinator(
+            catalog=catalog,
+            placement=placement,
+            service_backend=adapter,
+            port_leases=InMemoryPortLeaseManager(),
+            reconcile_interval_ms=loaded.config.inference.reconcile_interval_ms,
+        )
     if backends != {"vllm_ascend"}:
         raise ContractValidationError(
-            "one Controller generation cannot mix fake and vllm_ascend service backends"
+            "one Controller generation cannot mix inference service backends"
         )
     adapter = VllmAscendInferenceEngineAdapter(
         process_backend=service_backend,

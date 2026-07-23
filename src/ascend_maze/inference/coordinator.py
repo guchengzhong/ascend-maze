@@ -306,12 +306,14 @@ class InferenceCoordinator:
         if (
             instance.generation != lease.instance_generation
             or instance.placement_lease_id is None
+            or instance.npu_device_id is None
         ):
             raise RuntimeError("ModelRouteLease instance resources are stale")
         adapter = self.catalog.adapter(lease.model_id)
         config = adapter.worker_config(
             self.catalog.get(lease.model_id),
             instance_placement_lease_id=instance.placement_lease_id,
+            npu_device_id=instance.npu_device_id,
         )
         if config.adapter_name != lease.adapter_name:
             raise RuntimeError("Worker adapter does not match ModelRouteLease")

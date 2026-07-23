@@ -85,7 +85,7 @@ def chat_prompt(
     metadata: dict[str, object],
     override_key: str,
     *,
-    max_tokens: int = 1024,
+    max_tokens: int = 4096,
 ) -> tuple[str, str, dict[str, object]]:
     from ascend_maze.inference import chat
 
@@ -106,7 +106,7 @@ def chat_prompt_batch(
     metadata: dict[str, object],
     override_key: str,
     *,
-    max_tokens: int = 1024,
+    max_tokens: int = 4096,
 ) -> tuple[list[str], dict[str, object]]:
     from ascend_maze.inference import chat
 
@@ -142,7 +142,7 @@ def chat_image_prompt_batch(
     metadata: dict[str, object],
     override_key: str,
     *,
-    max_tokens: int = 1024,
+    max_tokens: int = 4096,
 ) -> tuple[list[str], dict[str, object]]:
     from ascend_maze.inference import chat
 

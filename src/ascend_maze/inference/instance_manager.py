@@ -266,6 +266,8 @@ class ModelInstanceManager:
         except Exception as exc:
             with self._lock:
                 current = self._require_generation(instance_id, generation)
+                if current.state is ModelInstanceState.STOPPED:
+                    return self._snapshot(current)
                 current.failure_reason = f"{type(exc).__name__}: {exc}"
                 self._transition(
                     current,
@@ -428,6 +430,8 @@ class ModelInstanceManager:
         except Exception as exc:
             with self._lock:
                 current = self._require_generation(instance_id, generation)
+                if current.state is ModelInstanceState.STOPPED:
+                    return self._snapshot(current)
                 current.failure_reason = f"{type(exc).__name__}: {exc}"
                 self._transition(current, ModelInstanceState.FAILED)
                 self._emit(

@@ -32,6 +32,7 @@ def encode_data_handle(handle: DataHandle) -> Any:
     source_node_id = handle.metadata.get("source_node_id")
     source_boot_id = handle.metadata.get("source_boot_id")
     source_generation = handle.metadata.get("source_runtime_generation")
+    ray_object_ref_id = handle.metadata.get("ray_object_ref_id")
     if source_node_id is not None and not isinstance(source_node_id, str):
         raise ContractValidationError("source_node_id metadata must be a string")
     if source_boot_id is not None and not isinstance(source_boot_id, str):
@@ -42,6 +43,8 @@ def encode_data_handle(handle: DataHandle) -> Any:
         raise ContractValidationError(
             "source_runtime_generation metadata must be an integer"
         )
+    if ray_object_ref_id is not None and not isinstance(ray_object_ref_id, str):
+        raise ContractValidationError("ray_object_ref_id metadata must be a string")
     return control_pb2.DataHandleMessage(
         owner_generation=handle.owner_generation,
         staged_handle_id=handle.staged_handle_id,
@@ -53,6 +56,7 @@ def encode_data_handle(handle: DataHandle) -> Any:
         source_node_id=source_node_id or "",
         source_boot_id=source_boot_id or "",
         source_runtime_generation=source_generation or 0,
+        ray_object_ref_id=ray_object_ref_id or "",
     )
 
 
@@ -71,6 +75,8 @@ def decode_data_handle(message: Any) -> DataHandle:
                 ),
             )
         )
+    if message.ray_object_ref_id:
+        metadata.append(("ray_object_ref_id", str(message.ray_object_ref_id)))
     return DataHandle(
         owner_generation=str(message.owner_generation),
         staged_handle_id=str(message.staged_handle_id),

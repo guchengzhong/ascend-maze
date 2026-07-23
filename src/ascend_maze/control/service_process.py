@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import inspect
 import os
 from pathlib import Path
@@ -15,7 +15,10 @@ from typing import IO, Any, Protocol
 import grpc
 
 from ascend_maze.contracts.resources import PlacementLease, ReservationVector
-from ascend_maze.contracts.runtime import RuntimeNodeBinding
+from ascend_maze.contracts.runtime import (
+    RuntimeDeviceMapping,
+    RuntimeNodeBinding,
+)
 from ascend_maze.core.canonical import FrozenMap
 from ascend_maze.core.identifiers import new_id
 from ascend_maze.inference.contracts import (
@@ -83,6 +86,7 @@ class NodeServiceProcessManager:
         port_bind_host: str = "127.0.0.1",
         hbm_recovery_tolerance_mb: int = 64,
         poll_interval_ms: int = 100,
+        device_mappings: tuple[RuntimeDeviceMapping, ...] = (),
         on_unexpected_exit: (
             Callable[[ServiceProcessExit], Awaitable[None] | None] | None
         ) = None,
@@ -127,6 +131,11 @@ class NodeServiceProcessManager:
         self.hbm_recovery_tolerance_mb = hbm_recovery_tolerance_mb
         self.poll_interval_ms = poll_interval_ms
         self.on_unexpected_exit = on_unexpected_exit
+        self._device_mappings = {
+            item.physical_device_id: item for item in device_mappings
+        }
+        if len(self._device_mappings) != len(device_mappings):
+            raise ValueError("service physical device mappings must be unique")
         self._next_port = first_port
         self._ports: dict[tuple[str, str, int], PortLease] = {}
         self._ports_by_owner: dict[tuple[str, int], PortLease] = {}
@@ -449,8 +458,26 @@ class NodeServiceProcessManager:
             raise RuntimeError("service request and PlacementLease instance differ")
         if lease.npu_device_id is None:
             raise RuntimeError("service PlacementLease has no physical NPU")
-        if request.environment.get("ASCEND_RT_VISIBLE_DEVICES") != lease.npu_device_id:
+        expected_runtime_device = self._runtime_device_mapping(
+            lease.npu_device_id
+        ).runtime_visible_device_id
+        if (
+            request.environment.get("ASCEND_RT_VISIBLE_DEVICES")
+            != expected_runtime_device
+        ):
             raise RuntimeError("service device visibility differs from PlacementLease")
+
+    def _runtime_device_mapping(
+        self, physical_device_id: str
+    ) -> RuntimeDeviceMapping:
+        if not self._device_mappings:
+            return RuntimeDeviceMapping.identity(physical_device_id)
+        try:
+            return self._device_mappings[physical_device_id]
+        except KeyError as exc:
+            raise RuntimeError(
+                "service PlacementLease device is absent from node topology"
+            ) from exc
 
     def _validate_node(self, node_id: str, boot_id: str) -> None:
         if (node_id, boot_id) != (self.node_id, self.boot_id):
@@ -652,6 +679,7 @@ class NodeAgentServiceProcessBackend:
         self._channels: dict[str, grpc.aio.Channel] = {}
         self._stubs: dict[str, object] = {}
         self._port_leases: dict[str, PortLease] = {}
+        self._released_port_leases: dict[str, PortLease] = {}
 
     async def acquire(
         self,
@@ -675,9 +703,18 @@ class NodeAgentServiceProcessBackend:
             raise RuntimeError("NodeAgent accepted port acquisition without a lease")
         lease = decode_port_lease(response.lease)
         self._port_leases[lease.port_lease_id] = lease
+        self._released_port_leases.pop(lease.port_lease_id, None)
         return lease
 
     async def release(self, lease: PortLease) -> bool:
+        tracked = self._port_leases.get(lease.port_lease_id)
+        released = self._released_port_leases.get(lease.port_lease_id)
+        if tracked is not None and tracked != lease:
+            raise RuntimeError("controller PortLease release identity is stale")
+        if released is not None:
+            if released != lease:
+                raise RuntimeError("controller PortLease release identity is stale")
+            return True
         binding = self._binding(lease.node_id, lease.boot_id)
         response = await self._stub(binding.agent_endpoint).ReleasePort(
             control_pb2.ReleaseServicePortRequest(
@@ -688,10 +725,14 @@ class NodeAgentServiceProcessBackend:
         )
         if response.accepted:
             self._port_leases.pop(lease.port_lease_id, None)
+            self._released_port_leases[lease.port_lease_id] = lease
             return True
         if response.error_code == "port_lease_not_found":
+            if tracked != lease:
+                return False
             self._port_leases.pop(lease.port_lease_id, None)
-            return False
+            self._released_port_leases[lease.port_lease_id] = lease
+            return True
         self._require_accepted(response, "service_port_release_failed")
         return True
 
@@ -704,6 +745,17 @@ class NodeAgentServiceProcessBackend:
         lease: PlacementLease,
     ) -> ServiceHandle:
         binding = self.node_registry.resolve_lease(lease)
+        if lease.npu_device_id is None:
+            raise RuntimeError("service PlacementLease has no physical NPU")
+        mapping = binding.device_mapping(lease.npu_device_id)
+        environment = dict(request.environment.items_tuple())
+        environment["ASCEND_RT_VISIBLE_DEVICES"] = (
+            mapping.runtime_visible_device_id
+        )
+        request = replace(
+            request,
+            environment=FrozenMap(tuple(sorted(environment.items()))),
+        )
         launch = control_pb2.ServiceLaunchSpecMessage(
             instance_id=request.instance_id,
             generation=request.generation,
@@ -800,6 +852,7 @@ class NodeAgentServiceProcessBackend:
         self._channels.clear()
         self._stubs.clear()
         self._port_leases.clear()
+        self._released_port_leases.clear()
         for channel in channels:
             await channel.close()
 

@@ -2,6 +2,7 @@
 
 from ascend_maze.data.in_memory import InMemoryDataStore
 from ascend_maze.data.index import (
+    DagContext,
     RunDataIndex,
     RunDataIndexCheckpoint,
     RunDataIndexRef,
@@ -11,6 +12,7 @@ from ascend_maze.data.index import (
 )
 
 __all__ = [
+    "DagContext",
     "InMemoryDataStore",
     "RunDataIndex",
     "RunDataIndexCheckpoint",

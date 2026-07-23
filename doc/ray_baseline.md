@@ -4,6 +4,13 @@
 task/actor 对照路径，不代表 Ascend-Maze Controller、Scheduler、Placement 或
 ModelRouter 的性能结论。
 
+从 2026-07-23 起，两个 baseline 脚本创建 workflow Ray Task 时统一设置
+`max_calls=1`。因此每个 Task 使用一次性 Ray Worker 进程，执行结束后该进程
+退出，不继承前一个 Task 的 Python、CANN 或模型运行时状态。实验 plan 的
+`executor.worker_max_calls` 和 smoke 单样本记录的 `worker_max_calls` 必须为 `1`。
+此前已生成的实验目录仍属于当时的 Ray 默认 Worker 复用口径，不能作为这一
+新口径的性能证据；需要重跑后才能进行直接性能比较。
+
 ## 1. 当前已经验证过什么
 
 截至 2026-07-22，已有两类验证：

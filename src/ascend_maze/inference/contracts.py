@@ -822,6 +822,7 @@ class InferenceEngineAdapter(Protocol):
         spec: ModelSpec,
         *,
         instance_placement_lease_id: str,
+        npu_device_id: str,
     ) -> InferenceWorkerConfig: ...
 
     def build_launch_request(

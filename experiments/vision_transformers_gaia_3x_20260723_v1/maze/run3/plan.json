@@ -1,0 +1,43 @@
+{
+  "data_root": "/home/user2/workplace/Ascend-Maze/data",
+  "discovery_failures": [],
+  "gaia_file_smoke_summary": true,
+  "inference_backend": "transformers",
+  "objective": "real_qwen_benchmark_workflow_smoke",
+  "output_dir": "/home/user2/workplace/Ascend-Maze/experiments/vision_transformers_gaia_3x_20260723_v1/maze/run3",
+  "runtime_backend": "ray",
+  "sample_offset": 0,
+  "samples": [
+    {
+      "dag_id": "df6561b2-7ee5-4540-baab-5095f742716a",
+      "dataset": "gaia",
+      "expected_answer": "17.056",
+      "family": "vision",
+      "query_index": 2,
+      "sample_id": "gaia.vision.df6561b2-7ee5-4540-baab-5095f742716a",
+      "source_files": [
+        "/home/user2/workplace/Ascend-Maze/data/gaia/2023/validation/df6561b2-7ee5-4540-baab-5095f742716a.png"
+      ],
+      "vision_mode": "true_multimodal",
+      "workflow": "vision"
+    }
+  ],
+  "samples_per_workflow": 1,
+  "schema_version": 1,
+  "tbench_smoke_overrides": true,
+  "text_model": {
+    "dtype": "bfloat16",
+    "max_model_len": 10240,
+    "max_num_batched_tokens": null,
+    "model_id": "qwen3-4b-smoke",
+    "path": "/home/user2/workplace/model_weight/model_from_hf/Qwen3-4B"
+  },
+  "vision_model": {
+    "dtype": "bfloat16",
+    "max_model_len": 12288,
+    "max_num_batched_tokens": 4096,
+    "model_id": "qwen2_5-vl-3b-smoke",
+    "path": "/home/user2/workplace/model_weight/model_from_hf/Qwen2.5-VL-3B-Instruct",
+    "vision_mode": "true_multimodal"
+  }
+}

@@ -92,10 +92,8 @@ def test_managed_ray_worker_uses_public_cli_and_owns_only_its_process_group(
     )
     assert worker.start() == "worker_node"
     command = popen_call["command"]
-    assert command[:4] == (
-        ray_cluster.sys.executable,
-        "-m",
-        "ray",
+    assert command[:2] == (
+        str(Path(ray_cluster.sys.executable).with_name("ray")),
         "start",
     )
     assert "--address=10.0.0.1:6379" in command

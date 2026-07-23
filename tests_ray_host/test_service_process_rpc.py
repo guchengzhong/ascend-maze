@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import signal
@@ -19,6 +19,7 @@ from ascend_maze.control.service_process import (
     NodeServiceProcessManager,
 )
 from ascend_maze.contracts.resources import PlacementLease, ReservationVector
+from ascend_maze.contracts.runtime import RuntimeDeviceMapping
 from ascend_maze.core.canonical import FrozenMap
 from ascend_maze.inference.contracts import ServiceLaunchRequest, ServiceProcessExit
 from ascend_maze.recording import InMemoryRecorder
@@ -120,7 +121,8 @@ async def _wait_port(backend, handle) -> None:
 
 def test_node_agent_service_rpc_lifecycle_and_unexpected_exit(tmp_path: Path) -> None:
     async def scenario() -> None:
-        identity = _identity()
+        mapping = RuntimeDeviceMapping("7", "0", 0)
+        identity = replace(_identity(), device_mappings=(mapping,))
         registry = RayNodeRegistry()
         exits: list[ServiceProcessExit] = []
         exit_received = asyncio.Event()
@@ -150,6 +152,7 @@ def test_node_agent_service_rpc_lifecycle_and_unexpected_exit(tmp_path: Path) ->
             last_port=32110,
             hbm_recovery_tolerance_mb=0,
             poll_interval_ms=10,
+            device_mappings=(mapping,),
         )
         agent = NodeAgent(
             identity=identity,
@@ -183,8 +186,22 @@ def test_node_agent_service_rpc_lifecycle_and_unexpected_exit(tmp_path: Path) ->
             assert result.hbm_recovered
             assert not result.forced_termination
             assert await backend.release(port)
+            assert await backend.release(port)
             assert backend.active_count() == 0
             assert exits == []
+
+            released_elsewhere = await backend.acquire(
+                node_id="node_a",
+                boot_id="boot_1",
+                owner_instance_id="instance_released_elsewhere",
+                generation=1,
+            )
+            assert await manager.release_port(released_elsewhere)
+            assert await backend.release(released_elsewhere)
+            assert await backend.release(released_elsewhere)
+            with pytest.raises(RuntimeError, match="identity is stale"):
+                await backend.release(replace(released_elsewhere, generation=2))
+            assert backend.active_count() == 0
 
             crash_port = await backend.acquire(
                 node_id="node_a",

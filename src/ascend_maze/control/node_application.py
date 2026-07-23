@@ -24,6 +24,7 @@ from ascend_maze.ascend import (
 )
 from ascend_maze.config import NodeBootstrapConfig
 from ascend_maze.contracts.recording import ExecutionRecorder, ParquetRecorderConfig
+from ascend_maze.contracts.runtime import RuntimeDeviceMapping
 from ascend_maze.control.contracts import NodeRuntimePolicy
 from ascend_maze.control.node_rpc import NodeAgent, NodeAgentIdentity
 from ascend_maze.control.process_lock import NodeProcessLock
@@ -38,6 +39,7 @@ from ascend_maze.core.errors import (
     EnvironmentValidationError,
 )
 from ascend_maze.core.identifiers import new_id
+from ascend_maze.placement import NodeCapacity
 from ascend_maze.recording import NoopRecorder, ParquetRecorder
 from ascend_maze.runtime.ray_cluster import ManagedRayWorkerNode
 
@@ -130,6 +132,10 @@ class NodeApplication:
                 environment=environment,
                 config=platform_config,
             )
+            device_mappings = _resolve_device_mappings(
+                capacity=capacity,
+                configured=config.device_mappings,
+            )
             worker = ManagedRayWorkerNode(
                 address=bootstrap.ray_address,
                 namespace=bootstrap.ray_namespace,
@@ -169,6 +175,7 @@ class NodeApplication:
                 allowed_executables=(sys.executable,),
                 log_directory=Path(config.runtime_directory) / "model-logs",
                 hbm_recovery_tolerance_mb=policy.hbm_recovery_tolerance_mb,
+                device_mappings=device_mappings,
             )
             agent = NodeAgent(
                 identity=NodeAgentIdentity(
@@ -181,6 +188,7 @@ class NodeApplication:
                     producer_id=(
                         f"node_agent:{config.node_id}:{boot_id}:{agent_generation}"
                     ),
+                    device_mappings=device_mappings,
                 ),
                 authorization_token=token,
                 recorder=recorder,
@@ -234,6 +242,24 @@ class NodeApplication:
                         await asyncio.to_thread(worker.close)
                 finally:
                     process_lock.close()
+
+
+def _resolve_device_mappings(
+    *,
+    capacity: NodeCapacity,
+    configured: tuple[RuntimeDeviceMapping, ...],
+) -> tuple[RuntimeDeviceMapping, ...]:
+    physical_ids = tuple(sorted(item.device_id for item in capacity.npus))
+    if not configured:
+        return tuple(RuntimeDeviceMapping.identity(item) for item in physical_ids)
+    configured_ids = tuple(
+        sorted(item.physical_device_id for item in configured)
+    )
+    if configured_ids != physical_ids:
+        raise EnvironmentValidationError(
+            "node device_mappings must exactly match discovered physical NPUs"
+        )
+    return tuple(sorted(configured))
 
 
 async def fetch_node_bootstrap(

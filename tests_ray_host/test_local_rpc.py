@@ -508,6 +508,13 @@ def test_submit_retries_same_prepared_handles_after_committed_response_loss(
         value = workflow.input("value")
         workflow.add_task(_echo, inputs={"value": value})
         try:
+            missing = await client.get_submission_status(
+                "response_loss_submission"
+            )
+            assert missing == {
+                "found": False,
+                "submission_id": "response_loss_submission",
+            }
             outcome = await client.submit(
                 workflow,
                 inputs={"value": "same staged input"},
@@ -518,6 +525,26 @@ def test_submit_retries_same_prepared_handles_after_committed_response_loss(
             assert outcome["replayed"] is True
             assert len(controller.list_runs()) == 1
             assert client.prepared_submission_count == 0
+            status = await client.get_submission_status(
+                "response_loss_submission"
+            )
+            assert status["found"] is True
+            assert status["submission"]["run_id"] == outcome["run_id"]
+
+            second_client = UdsRuntimeClient(
+                socket_path,
+                data_store=controller.data_store,
+                data_owner_generation=controller.data_owner_generation,
+            )
+            conflicting = await second_client.prepare_submission(
+                workflow,
+                inputs={"value": "same staged input"},
+                submission_id="response_loss_submission",
+            )
+            active_before_conflict = controller.data_store.active_count
+            with pytest.raises(ControlRpcError, match="different payload"):
+                await second_client.submit_prepared(conflicting)
+            assert controller.data_store.active_count == active_before_conflict - 1
         finally:
             await server.close(grace_seconds=0)
             await controller.close(force=True, drain_timeout_ms=0)
@@ -569,15 +596,22 @@ def test_local_prepared_submission_rejects_payload_conflict_before_reupload(
         value = workflow.input("value")
         workflow.add_task(_echo, inputs={"value": value})
         try:
+            first_value = {"payload": "first"}
             first = await client.prepare_submission(
                 workflow,
-                inputs={"value": "first"},
+                inputs={"value": first_value},
                 submission_id="conflicting_submission",
             )
+            cached = await client.prepare_submission(
+                workflow,
+                inputs={"value": first_value},
+                submission_id="conflicting_submission",
+            )
+            assert cached is first
             with pytest.raises(SubmissionConflictError, match="another payload"):
                 await client.prepare_submission(
                     workflow,
-                    inputs={"value": "second"},
+                    inputs={"value": {"payload": "first"}},
                     submission_id="conflicting_submission",
                 )
             assert client.prepared_submission_count == 1

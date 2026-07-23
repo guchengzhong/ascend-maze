@@ -14,6 +14,7 @@ from ascend_maze.contracts.recording import (
     RunRecordingContext,
 )
 from ascend_maze.core.canonical import FrozenMap
+from ascend_maze.contracts.runtime import RuntimeDeviceMapping
 from ascend_maze.core.clock import ManualClock
 from ascend_maze.placement import (
     NodeCapacity,
@@ -68,6 +69,7 @@ def _identity(
     *,
     generation: str = "agent_1",
     environment: str = ENVIRONMENT,
+    device_mappings: tuple[RuntimeDeviceMapping, ...] = (),
 ) -> NodeAgentIdentity:
     return NodeAgentIdentity(
         cluster_id="cluster_1",
@@ -77,6 +79,7 @@ def _identity(
         agent_generation=generation,
         environment_fingerprint=environment,
         producer_id=f"node_agent:node_a:{generation}",
+        device_mappings=device_mappings,
     )
 
 
@@ -86,7 +89,12 @@ def _event() -> RuntimeEvent:
         staged_handle_id="data_1",
         stable_digest="a" * 64,
         size_bytes=7,
-        metadata=FrozenMap((("backend", "ray"),)),
+        metadata=FrozenMap(
+            (
+                ("backend", "ray"),
+                ("ray_object_ref_id", "f" * 56),
+            )
+        ),
     )
     error = ErrorInfo(
         schema_version=1,
@@ -204,7 +212,9 @@ def test_node_capacity_round_trip_registers_unknown_node_before_validation() -> 
         )
         endpoint = await controller.start()
         agent = NodeAgent(
-            identity=_identity(),
+            identity=_identity(
+                device_mappings=(RuntimeDeviceMapping("7", "0", 0),)
+            ),
             authorization_token=b"test-token",
             node_capacity=capacity,
         )
@@ -212,6 +222,9 @@ def test_node_capacity_round_trip_registers_unknown_node_before_validation() -> 
             await agent.start(controller_endpoint=endpoint)
             assert registered == {"node_a": capacity}
             assert registry.binding("node_a").ray_node_id == "ray_node_a"
+            assert registry.binding("node_a").device_mappings == (
+                RuntimeDeviceMapping("7", "0", 0),
+            )
             assert registry.status("node_a") is RuntimeNodeStatus.HEALTHY
         finally:
             await agent.close(grace_seconds=0)

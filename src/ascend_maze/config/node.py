@@ -12,6 +12,7 @@ if sys.version_info >= (3, 11):
 else:  # pragma: no cover
     import tomli as tomllib
 
+from ascend_maze.contracts.runtime import RuntimeDeviceMapping
 from ascend_maze.core.errors import ContractValidationError
 
 
@@ -30,6 +31,7 @@ class NodeBootstrapConfig:
     ray_temp_directory: str
     ray_num_cpus: int
     recording_root_directory: str
+    device_mappings: tuple[RuntimeDeviceMapping, ...] = ()
 
 
 _ALLOWED = frozenset(
@@ -46,6 +48,7 @@ _ALLOWED = frozenset(
         "ray_temp_directory",
         "ray_num_cpus",
         "recording_root_directory",
+        "device_mappings",
     }
 )
 
@@ -113,6 +116,7 @@ def load_node_bootstrap(path: str | Path) -> NodeBootstrapConfig:
             ),
             "recording_root_directory",
         ),
+        "device_mappings": _device_mappings(document.get("device_mappings", [])),
     }
     for name in (
         "ray_num_cpus",
@@ -121,6 +125,49 @@ def load_node_bootstrap(path: str | Path) -> NodeBootstrapConfig:
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ContractValidationError(f"node.{name}: must be positive")
     return NodeBootstrapConfig(**values)  # type: ignore[arg-type]
+
+
+def _device_mappings(value: object) -> tuple[RuntimeDeviceMapping, ...]:
+    if not isinstance(value, list):
+        raise ContractValidationError("node.device_mappings: must be an array")
+    mappings: list[RuntimeDeviceMapping] = []
+    allowed = {
+        "physical_device_id",
+        "runtime_visible_device_id",
+        "visible_device_index",
+    }
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ContractValidationError(
+                f"node.device_mappings[{index}]: must be a table"
+            )
+        unknown = sorted(set(item) - allowed)
+        if unknown:
+            raise ContractValidationError(
+                f"node.device_mappings[{index}].{unknown[0]}: unknown field"
+            )
+        try:
+            mappings.append(
+                RuntimeDeviceMapping(
+                    physical_device_id=item.get("physical_device_id"),  # type: ignore[arg-type]
+                    runtime_visible_device_id=item.get(  # type: ignore[arg-type]
+                        "runtime_visible_device_id"
+                    ),
+                    visible_device_index=item.get(  # type: ignore[arg-type]
+                        "visible_device_index", 0
+                    ),
+                )
+            )
+        except ContractValidationError as exc:
+            raise ContractValidationError(
+                f"node.device_mappings[{index}]: {exc}"
+            ) from exc
+    physical_ids = tuple(item.physical_device_id for item in mappings)
+    if len(physical_ids) != len(set(physical_ids)):
+        raise ContractValidationError(
+            "node.device_mappings: physical_device_id values must be unique"
+        )
+    return tuple(sorted(mappings))
 
 
 def _string(document: dict[str, object], name: str) -> str:

@@ -1,0 +1,126 @@
+{
+  "cleanup_errors": [],
+  "discovery_failure_count": 0,
+  "exit_code": 0,
+  "failed": 0,
+  "families": [
+    {
+      "cleanup_errors": [],
+      "controller_shutdown": {
+        "active_run_ids_at_start": [],
+        "cleanup_confirmed": true,
+        "drained_run_ids": [],
+        "errors": [],
+        "exit_code": 0,
+        "finished_at_ms": 2614978864,
+        "flush_results": [],
+        "incomplete_resources": [],
+        "lifecycle_state": "stopped",
+        "mode": "force",
+        "recording_complete": true,
+        "recording_run_ids": [],
+        "started_at_ms": 2614978858,
+        "steps": [
+          "draining",
+          "new_work_rejected",
+          "dispatch_stopped",
+          "runs_drained",
+          "remaining_runs_cancelled",
+          "models_stopped",
+          "worker_pool_stopped",
+          "leases_confirmed_or_quarantined",
+          "recorder_flushed_closed",
+          "runtime_generation_stopped",
+          "control_transports_stopped",
+          "stopped"
+        ],
+        "terminated_run_ids": []
+      },
+      "failed": 0,
+      "failures_path": "/home/user2/workplace/Ascend-Maze/experiments/transformers_all14_completion_20260723_v1/maze/multimodal_vqa_complex/vision_failures.jsonl",
+      "family": "vision",
+      "inference_backend": "transformers",
+      "model_path": "/home/user2/workplace/model_weight/model_from_hf/Qwen2.5-VL-3B-Instruct",
+      "records_path": "/home/user2/workplace/Ascend-Maze/experiments/transformers_all14_completion_20260723_v1/maze/multimodal_vqa_complex/vision_records.jsonl",
+      "runtime_backend": "ray",
+      "sample_count": 1,
+      "service_launches": [],
+      "service_log_tails": {},
+      "status": "completed",
+      "succeeded": 1,
+      "target_model_id": "qwen2_5-vl-3b-smoke"
+    }
+  ],
+  "final_devices": [
+    {
+      "chip_type": "910B3",
+      "health": "healthy",
+      "physical_device_id": "0",
+      "processes": [],
+      "total_hbm_mb": 65536,
+      "used_hbm_mb": 3213
+    },
+    {
+      "chip_type": "910B3",
+      "health": "healthy",
+      "physical_device_id": "1",
+      "processes": [],
+      "total_hbm_mb": 65536,
+      "used_hbm_mb": 3206
+    },
+    {
+      "chip_type": "910B3",
+      "health": "healthy",
+      "physical_device_id": "2",
+      "processes": [],
+      "total_hbm_mb": 65536,
+      "used_hbm_mb": 3207
+    },
+    {
+      "chip_type": "910B3",
+      "health": "healthy",
+      "physical_device_id": "3",
+      "processes": [],
+      "total_hbm_mb": 65536,
+      "used_hbm_mb": 3205
+    },
+    {
+      "chip_type": "910B3",
+      "health": "healthy",
+      "physical_device_id": "4",
+      "processes": [],
+      "total_hbm_mb": 65536,
+      "used_hbm_mb": 3206
+    },
+    {
+      "chip_type": "910B3",
+      "health": "healthy",
+      "physical_device_id": "5",
+      "processes": [],
+      "total_hbm_mb": 65536,
+      "used_hbm_mb": 3207
+    },
+    {
+      "chip_type": "910B3",
+      "health": "healthy",
+      "physical_device_id": "6",
+      "processes": [],
+      "total_hbm_mb": 65536,
+      "used_hbm_mb": 3206
+    },
+    {
+      "chip_type": "910B3",
+      "health": "healthy",
+      "physical_device_id": "7",
+      "processes": [],
+      "total_hbm_mb": 65536,
+      "used_hbm_mb": 3206
+    }
+  ],
+  "output_dir": "/home/user2/workplace/Ascend-Maze/experiments/transformers_all14_completion_20260723_v1/maze/multimodal_vqa_complex",
+  "residual_vllm_processes": [],
+  "result": "succeeded",
+  "sample_count": 1,
+  "schema_version": 1,
+  "succeeded": 1
+}

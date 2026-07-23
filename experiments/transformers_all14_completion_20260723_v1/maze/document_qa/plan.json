@@ -1,0 +1,43 @@
+{
+  "data_root": "/home/user2/workplace/Ascend-Maze/data",
+  "discovery_failures": [],
+  "gaia_file_smoke_summary": true,
+  "inference_backend": "transformers",
+  "objective": "real_qwen_benchmark_workflow_smoke",
+  "output_dir": "/home/user2/workplace/Ascend-Maze/experiments/transformers_all14_completion_20260723_v1/maze/document_qa",
+  "runtime_backend": "ray",
+  "sample_offset": 0,
+  "samples": [
+    {
+      "dag_id": "15159365-296d-41d0-90f7-d39c4a93c556",
+      "dataset": "openagi",
+      "expected_answer": "7. Februar 2016\n2015\nDenver Broncos\nCarolina Panthers\nDenver Broncos\n2015\nDenver Broncos\nSanta Clara, Kalifornien.\nSuper Bowl\nDenver Broncos\nCam Newton\n8\n1995\nArizona Cardinals\nNew England Patriots\nArizona Cardinals\nNew England Patriots\nNew England Patriots\nvier\nCam Newton",
+      "family": "text",
+      "query_index": 140,
+      "sample_id": "openagi.document_qa.15159365-296d-41d0-90f7-d39c4a93c556",
+      "source_files": [
+        "/home/user2/workplace/Ascend-Maze/data/openagi/document_qa/15159365-296d-41d0-90f7-d39c4a93c556/inputs/context.txt"
+      ],
+      "vision_mode": null,
+      "workflow": "document_qa"
+    }
+  ],
+  "samples_per_workflow": 1,
+  "schema_version": 1,
+  "tbench_smoke_overrides": true,
+  "text_model": {
+    "dtype": "bfloat16",
+    "max_model_len": 10240,
+    "max_num_batched_tokens": null,
+    "model_id": "qwen3-4b-smoke",
+    "path": "/home/user2/workplace/model_weight/model_from_hf/Qwen3-4B"
+  },
+  "vision_model": {
+    "dtype": "bfloat16",
+    "max_model_len": 12288,
+    "max_num_batched_tokens": 4096,
+    "model_id": "qwen2_5-vl-3b-smoke",
+    "path": "/home/user2/workplace/model_weight/model_from_hf/Qwen2.5-VL-3B-Instruct",
+    "vision_mode": "true_multimodal"
+  }
+}

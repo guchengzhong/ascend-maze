@@ -327,6 +327,11 @@ class LocalControlStub:
                 request_serializer=ascend__maze_dot_control_dot_proto_dot_control__pb2.SubmitWorkflowRequest.SerializeToString,
                 response_deserializer=ascend__maze_dot_control_dot_proto_dot_control__pb2.ControlResponseMessage.FromString,
                 _registered_method=True)
+        self.GetSubmission = channel.unary_unary(
+                '/ascend_maze.control.v1.LocalControl/GetSubmission',
+                request_serializer=ascend__maze_dot_control_dot_proto_dot_control__pb2.ControlQueryRequest.SerializeToString,
+                response_deserializer=ascend__maze_dot_control_dot_proto_dot_control__pb2.ControlResponseMessage.FromString,
+                _registered_method=True)
         self.GetClusterSnapshot = channel.unary_unary(
                 '/ascend_maze.control.v1.LocalControl/GetClusterSnapshot',
                 request_serializer=ascend__maze_dot_control_dot_proto_dot_control__pb2.ControlQueryRequest.SerializeToString,
@@ -441,6 +446,12 @@ class LocalControlServicer:
         raise NotImplementedError('Method not implemented!')
 
     def SubmitWorkflow(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetSubmission(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -575,6 +586,11 @@ def add_LocalControlServicer_to_server(servicer, server):
             'SubmitWorkflow': grpc.unary_unary_rpc_method_handler(
                     servicer.SubmitWorkflow,
                     request_deserializer=ascend__maze_dot_control_dot_proto_dot_control__pb2.SubmitWorkflowRequest.FromString,
+                    response_serializer=ascend__maze_dot_control_dot_proto_dot_control__pb2.ControlResponseMessage.SerializeToString,
+            ),
+            'GetSubmission': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetSubmission,
+                    request_deserializer=ascend__maze_dot_control_dot_proto_dot_control__pb2.ControlQueryRequest.FromString,
                     response_serializer=ascend__maze_dot_control_dot_proto_dot_control__pb2.ControlResponseMessage.SerializeToString,
             ),
             'GetClusterSnapshot': grpc.unary_unary_rpc_method_handler(
@@ -775,6 +791,33 @@ class LocalControl:
             target,
             '/ascend_maze.control.v1.LocalControl/SubmitWorkflow',
             ascend__maze_dot_control_dot_proto_dot_control__pb2.SubmitWorkflowRequest.SerializeToString,
+            ascend__maze_dot_control_dot_proto_dot_control__pb2.ControlResponseMessage.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetSubmission(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ascend_maze.control.v1.LocalControl/GetSubmission',
+            ascend__maze_dot_control_dot_proto_dot_control__pb2.ControlQueryRequest.SerializeToString,
             ascend__maze_dot_control_dot_proto_dot_control__pb2.ControlResponseMessage.FromString,
             options,
             channel_credentials,

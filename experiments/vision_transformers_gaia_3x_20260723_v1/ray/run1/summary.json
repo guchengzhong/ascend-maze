@@ -1,0 +1,47 @@
+{
+  "cleanup_errors": [],
+  "discovery_failure_count": 0,
+  "exit_code": 0,
+  "failed": 0,
+  "families": [
+    {
+      "cleanup_errors": [],
+      "failed": 0,
+      "failures_path": "/home/user2/workplace/Ascend-Maze/experiments/vision_transformers_gaia_3x_20260723_v1/ray/run1/vision_failures.jsonl",
+      "family": "vision",
+      "inference_backend": "transformers",
+      "records_path": "/home/user2/workplace/Ascend-Maze/experiments/vision_transformers_gaia_3x_20260723_v1/ray/run1/vision_records.jsonl",
+      "sample_count": 1,
+      "service_config": null,
+      "service_log_tails": {},
+      "status": "completed",
+      "succeeded": 1,
+      "target_model_id": "qwen2_5-vl-3b-smoke",
+      "transformers_config": {
+        "device_id": "0",
+        "dtype": "bfloat16",
+        "enable_thinking": false,
+        "family": "vision",
+        "generation_method": "manual_greedy",
+        "max_model_len": 12288,
+        "model_id": "qwen2_5-vl-3b-smoke",
+        "model_kind": "vision_language",
+        "model_path": "/home/user2/workplace/model_weight/model_from_hf/Qwen2.5-VL-3B-Instruct",
+        "qwen2_5_vl_cpu_unique_consecutive_workaround": true,
+        "request_timeout_ms": 900000,
+        "runtime_library_paths": [
+          "/usr/local/Ascend/cann-9.0.0-beta.2/opp/built-in/op_impl/host_aicpu",
+          "/usr/local/Ascend/cann-9.0.0-beta.2/opp/built-in/op_impl/aicpu/aicpu_kernel/lib/Ascend"
+        ],
+        "tokenizer_path": "/home/user2/workplace/model_weight/model_from_hf/Qwen2.5-VL-3B-Instruct",
+        "trust_remote_code": true
+      }
+    }
+  ],
+  "output_dir": "/home/user2/workplace/Ascend-Maze/experiments/vision_transformers_gaia_3x_20260723_v1/ray/run1",
+  "residual_vllm_processes": [],
+  "result": "succeeded",
+  "sample_count": 1,
+  "schema_version": 1,
+  "succeeded": 1
+}

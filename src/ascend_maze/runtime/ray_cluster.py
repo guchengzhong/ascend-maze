@@ -175,10 +175,11 @@ class ManagedRayWorkerNode:
         self._log_stream = log_stream
         environment = dict(os.environ)
         environment["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
+        ray_cli = Path(sys.executable).with_name("ray")
+        if not ray_cli.is_file():
+            raise RuntimeError(f"Ray CLI is unavailable beside Python: {ray_cli}")
         command = (
-            sys.executable,
-            "-m",
-            "ray",
+            str(ray_cli),
             "start",
             f"--address={self.address}",
             f"--node-ip-address={self.node_ip}",
@@ -193,12 +194,6 @@ class ManagedRayWorkerNode:
         )
         deadline = time.monotonic() + self.startup_timeout_seconds
         try:
-            ray.init(address=self.address, namespace=self.namespace)
-            existing_node_ids = {
-                str(item["NodeID"])
-                for item in ray.nodes()
-                if bool(item.get("Alive"))
-            }
             process = subprocess.Popen(
                 command,
                 stdin=subprocess.DEVNULL,
@@ -208,6 +203,14 @@ class ManagedRayWorkerNode:
                 start_new_session=True,
             )
             self.process = process
+            # A remote driver can block while Ray tries to attach it to a
+            # raylet. Start this node's raylet first so the bootstrap driver
+            # has a local node when it connects to the GCS.
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"managed Ray worker exited with code {process.returncode}"
+                )
+            ray.init(address=self.address, namespace=self.namespace)
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     raise RuntimeError(
@@ -218,7 +221,6 @@ class ManagedRayWorkerNode:
                     for item in ray.nodes()
                     if bool(item.get("Alive"))
                     and str(item.get("NodeManagerAddress")) == self.node_ip
-                    and str(item["NodeID"]) not in existing_node_ids
                 )
                 if len(matches) == 1:
                     self.node_id = matches[0]

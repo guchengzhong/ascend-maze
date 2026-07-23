@@ -52,14 +52,105 @@ def test_ray_baseline_plan_uses_plain_ray_executor() -> None:
     assert not failures
     assert len(samples) == 1
     assert plan["objective"] == "ray_correctness_baseline"
+    assert plan["inference_backend"] == "vllm"
     assert plan["executor"] == {
         "kind": "plain_ray_task_actor",
         "dag_policy": "sequential_topological_order",
+        "worker_max_calls": 1,
         "uses_ascend_maze_controller": False,
         "uses_ascend_maze_scheduler": False,
         "uses_ascend_maze_runtime_client": False,
     }
     assert plan["text_model"]["model_id"] == "qwen3-4b-smoke"
+
+
+def test_ray_baseline_transformers_plan_and_config() -> None:
+    tool = _load_tool()
+    args = tool.parse_args(
+        [
+            "--dataset",
+            "tbench",
+            "--workflow",
+            "retail_cancel",
+            "--family",
+            "text",
+            "--samples-per-workflow",
+            "1",
+            "--inference-backend",
+            "transformers",
+            "--plan-only",
+        ]
+    )
+    args.data_root = REPO_ROOT / "data"
+    args.text_model_path = Path("/models/text")
+    args.vision_model_path = Path("/models/vision")
+    samples, failures = tool._discover(args)  # noqa: SLF001
+
+    plan = tool._build_plan(  # noqa: SLF001
+        args=args,
+        output_dir=REPO_ROOT / "experiments" / "ray_baseline_smoke" / "unit",
+        samples=samples,
+        discovery_failures=failures,
+    )
+    config = tool._family_transformers_config(  # noqa: SLF001
+        args=args,
+        family="text",
+        preflight={"runtime_library_paths": ("/aicpu",)},
+    )
+
+    assert not failures
+    assert plan["inference_backend"] == "transformers"
+    assert config == {
+        "family": "text",
+        "model_id": "qwen3-4b-smoke",
+        "model_path": "/models/text",
+        "tokenizer_path": "/models/text",
+        "device_id": "0",
+        "dtype": "bfloat16",
+        "generation_method": "manual_greedy",
+        "model_kind": "text",
+        "max_model_len": 10240,
+        "trust_remote_code": False,
+        "enable_thinking": False,
+        "request_timeout_ms": 180_000,
+        "runtime_library_paths": ("/aicpu",),
+    }
+
+
+def test_ray_baseline_transformers_vision_config() -> None:
+    tool = _load_tool()
+    args = tool.parse_args(
+        [
+            "--inference-backend",
+            "transformers",
+            "--family",
+            "vision",
+        ]
+    )
+    args.vision_model_path = Path("/models/qwen2.5-vl")
+
+    config = tool._family_transformers_config(  # noqa: SLF001
+        args=args,
+        family="vision",
+        preflight={"runtime_library_paths": ("/aicpu",)},
+    )
+
+    assert config == {
+        "family": "vision",
+        "model_id": "qwen2_5-vl-3b-smoke",
+        "model_path": "/models/qwen2.5-vl",
+        "tokenizer_path": "/models/qwen2.5-vl",
+        "device_id": "0",
+        "dtype": "bfloat16",
+        "generation_method": "manual_greedy",
+        "model_kind": "vision_language",
+        "max_model_len": 12288,
+        "trust_remote_code": True,
+        "enable_thinking": False,
+        "request_timeout_ms": 180_000,
+        "runtime_library_paths": ("/aicpu",),
+        "qwen2_5_vl_cpu_unique_consecutive_workaround": True,
+    }
 
 
 def test_ray_baseline_vllm_argv_uses_model_alias_and_vision_options() -> None:

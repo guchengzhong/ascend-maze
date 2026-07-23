@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from time import perf_counter
 from threading import RLock
-from typing import Callable
+from typing import Callable, cast
 
 from ascend_maze.contracts.errors import ErrorInfo
 from ascend_maze.contracts.recording import ProducerFlushResult, RunRecordingContext
@@ -59,6 +60,59 @@ class _DispatchRecord:
     terminal: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class FakeTaskTimingRecord:
+    dispatch_id: str
+    run_id: str
+    task_id: str
+    attempt: int
+    task_kind: str
+    execution_target: str
+    route_lease_id: str | None
+    started_at_ms: int
+    status: str
+    error_code: str | None
+    input_fetch_ms: int
+    callable_execute_ms: int
+    chat_request_ms: int
+    output_put_ms: int
+    task_total_ms: int
+    input_handle_count: int
+    output_count: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "dispatch_id": self.dispatch_id,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "attempt": self.attempt,
+            "task_kind": self.task_kind,
+            "execution_target": self.execution_target,
+            "route_lease_id": self.route_lease_id,
+            "started_at_ms": self.started_at_ms,
+            "status": self.status,
+            "error_code": self.error_code,
+            "input_fetch_ms": self.input_fetch_ms,
+            "callable_execute_ms": self.callable_execute_ms,
+            "chat_request_ms": self.chat_request_ms,
+            "output_put_ms": self.output_put_ms,
+            "task_total_ms": self.task_total_ms,
+            "input_handle_count": self.input_handle_count,
+            "output_count": self.output_count,
+            "task_runtime_overhead_ms": max(
+                0,
+                self.task_total_ms
+                - self.input_fetch_ms
+                - self.callable_execute_ms
+                - self.output_put_ms,
+            ),
+            "callable_minus_chat_ms": max(
+                0,
+                self.callable_execute_ms - self.chat_request_ms,
+            ),
+        }
+
+
 class FakeRuntimeBackend:
     """Run ordinary Python functions while preserving distributed event boundaries."""
 
@@ -81,6 +135,7 @@ class FakeRuntimeBackend:
         self._code: dict[str, _CodeRecord] = {}
         self._dispatches: dict[str, _DispatchRecord] = {}
         self._attempt_dispatches: dict[tuple[str, str, int], str] = {}
+        self._task_timings: list[FakeTaskTimingRecord] = []
         self._plans: dict[tuple[str, int], FakeExecutionPlan] = {}
         self._registered_callables: dict[str, Callable[..., object]] = {}
         self._retired_runs: set[str] = set()
@@ -293,6 +348,27 @@ class FakeRuntimeBackend:
         record = self._dispatches.get(dispatch_id)
         return record is None or record.terminal
 
+    def task_timing_records(
+        self,
+        run_id: str | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        with self._lock:
+            records = [
+                record.as_dict()
+                for record in self._task_timings
+                if run_id is None or record.run_id == run_id
+            ]
+        return tuple(
+            sorted(
+                records,
+                key=lambda item: (
+                    cast(int, item["started_at_ms"]),
+                    str(item["task_id"]),
+                    cast(int, item["attempt"]),
+                ),
+            )
+        )
+
     def producer_for_lease(self, lease: PlacementLease) -> str | None:
         del lease
         return None
@@ -333,9 +409,20 @@ class FakeRuntimeBackend:
 
     async def _execute(self, record: _DispatchRecord) -> None:
         request = record.request
+        task_started_at_ms: int | None = None
+        task_started_perf: float | None = None
+        input_fetch_ms = 0
+        callable_execute_ms = 0
+        output_put_ms = 0
+        input_handle_count = 0
+        output_count = 0
+        terminal_status = "unknown"
+        terminal_error_code: str | None = None
         try:
             await self._delay(record.plan.start_delay_ms)
             if record.plan.fail_before_start is not None:
+                terminal_status = "dispatch_failed"
+                terminal_error_code = record.plan.fail_before_start
                 self._emit_failure(
                     record,
                     RuntimeEventKind.DISPATCH_FAILED,
@@ -349,6 +436,8 @@ class FakeRuntimeBackend:
                 if not self.inference.activate_route(
                     request.model_route.route_lease_id
                 ):
+                    terminal_status = "dispatch_failed"
+                    terminal_error_code = "model_route_invalidated"
                     self._emit_failure(
                         record,
                         RuntimeEventKind.DISPATCH_FAILED,
@@ -368,8 +457,12 @@ class FakeRuntimeBackend:
                     occurred_at_ms=monotonic_time_ms(),
                 )
             )
+            task_started_at_ms = monotonic_time_ms()
+            task_started_perf = perf_counter()
             await self._delay(record.plan.execution_delay_ms)
             if record.plan.fail_after_start is not None:
+                terminal_status = "failed"
+                terminal_error_code = record.plan.fail_after_start
                 self._emit_failure(
                     record,
                     RuntimeEventKind.TASK_FAILED,
@@ -378,13 +471,17 @@ class FakeRuntimeBackend:
                 )
                 return
             kwargs: dict[str, object] = {}
+            started = perf_counter()
             for argument in request.arguments:
                 if argument.kind == "literal":
                     kwargs[argument.name] = argument.literal
                 elif argument.kind == "data_handle":
                     assert argument.data_handle is not None
+                    input_handle_count += 1
                     kwargs[argument.name] = self.data_store.get(argument.data_handle)
+            input_fetch_ms = _elapsed_ms(started)
             try:
+                started = perf_counter()
                 if request.execution_target is ExecutionTarget.MODEL_SERVICE:
                     assert self.inference is not None
                     assert request.model_route is not None
@@ -401,7 +498,11 @@ class FakeRuntimeBackend:
                         )
                 else:
                     result = await asyncio.to_thread(record.func, **kwargs)
+                callable_execute_ms = _elapsed_ms(started)
             except InferenceCallError as exc:
+                callable_execute_ms = _elapsed_ms(started)
+                terminal_status = "failed"
+                terminal_error_code = exc.error_code
                 self._emit_failure(
                     record,
                     RuntimeEventKind.TASK_FAILED,
@@ -411,6 +512,9 @@ class FakeRuntimeBackend:
                 )
                 return
             except Exception as exc:
+                callable_execute_ms = _elapsed_ms(started)
+                terminal_status = "failed"
+                terminal_error_code = "user_code_failed"
                 self._emit_failure(
                     record,
                     RuntimeEventKind.TASK_FAILED,
@@ -422,6 +526,8 @@ class FakeRuntimeBackend:
             if not isinstance(result, dict) or tuple(sorted(result)) != tuple(
                 sorted(request.expected_outputs)
             ):
+                terminal_status = "failed"
+                terminal_error_code = "invalid_task_output"
                 self._emit_failure(
                     record,
                     RuntimeEventKind.TASK_FAILED,
@@ -431,14 +537,20 @@ class FakeRuntimeBackend:
                 return
             output_handles = []
             try:
+                started = perf_counter()
                 for output_name in request.expected_outputs:
                     handle = self.data_store.put_staged(
                         result[output_name], self.owner_generation
                     )
                     output_handles.append((output_name, handle))
+                output_put_ms = _elapsed_ms(started)
+                output_count = len(output_handles)
             except Exception as exc:
+                output_put_ms = _elapsed_ms(started)
                 for _, handle in output_handles:
                     self.data_store.release(handle)
+                terminal_status = "failed"
+                terminal_error_code = "result_publish_failed"
                 self._emit_failure(
                     record,
                     RuntimeEventKind.TASK_FAILED,
@@ -461,7 +573,9 @@ class FakeRuntimeBackend:
             self._emit(event)
             if record.plan.duplicate_terminal_event:
                 self._emit(event)
+            terminal_status = "succeeded"
         except asyncio.CancelledError:
+            terminal_status = "cancelled"
             self._emit(
                 RuntimeEvent.create(
                     kind=RuntimeEventKind.TASK_CANCELLED,
@@ -475,6 +589,29 @@ class FakeRuntimeBackend:
                 )
             )
         finally:
+            if task_started_at_ms is not None and task_started_perf is not None:
+                chat_request_ms = self._chat_request_ms(record)
+                timing = FakeTaskTimingRecord(
+                    dispatch_id=request.dispatch_id,
+                    run_id=request.run_id,
+                    task_id=request.task_id,
+                    attempt=request.attempt,
+                    task_kind=request.task_kind,
+                    execution_target=request.execution_target.value,
+                    route_lease_id=record.handle.route_lease_id,
+                    started_at_ms=task_started_at_ms,
+                    status=terminal_status,
+                    error_code=terminal_error_code,
+                    input_fetch_ms=input_fetch_ms,
+                    callable_execute_ms=callable_execute_ms,
+                    chat_request_ms=chat_request_ms,
+                    output_put_ms=output_put_ms,
+                    task_total_ms=_elapsed_ms(task_started_perf),
+                    input_handle_count=input_handle_count,
+                    output_count=output_count,
+                )
+                with self._lock:
+                    self._task_timings.append(timing)
             record.terminal = True
             if record.request.run_id in self._retired_runs:
                 self._drop_dispatch(record.request.dispatch_id)
@@ -557,6 +694,14 @@ class FakeRuntimeBackend:
         ):
             self._retired_runs.discard(run_id)
 
+    def _chat_request_ms(self, record: _DispatchRecord) -> int:
+        if self.inference is None or record.handle.route_lease_id is None:
+            return 0
+        return sum(
+            item.duration_ms
+            for item in self.inference.request_records(record.handle.route_lease_id)
+        )
+
     @staticmethod
     async def _delay(milliseconds: int) -> None:
         if milliseconds > 0:
@@ -586,3 +731,7 @@ class FakeRuntimeBackend:
         package: CodePackage,
     ) -> None:
         validate_loaded_callable(func, package)
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((perf_counter() - started) * 1_000))

@@ -1212,6 +1212,26 @@ class SchedulerCore:
                         ),
                         payload={
                             "dispatch_id": dispatch_id,
+                            "node_id": placement.lease.node_id,
+                            "affinity_hit": placement.affinity_hit,
+                            "input_object_refs": tuple(
+                                {
+                                    "input_name": argument.name,
+                                    "data_handle_id": argument.data_handle.staged_handle_id,
+                                    "object_ref_id": argument.data_handle.metadata.get(
+                                        "ray_object_ref_id"
+                                    ),
+                                }
+                                for argument in request.arguments
+                                if argument.kind == "data_handle"
+                                and argument.data_handle is not None
+                                and isinstance(
+                                    argument.data_handle.metadata.get(
+                                        "ray_object_ref_id"
+                                    ),
+                                    str,
+                                )
+                            ),
                             "model_id": (
                                 None if route_lease is None else route_lease.model_id
                             ),
@@ -1569,6 +1589,10 @@ class SchedulerCore:
                 model_instance_id=(
                     None if expected_route is None else expected_route.instance_id
                 ),
+                payload={
+                    "node_id": self.placement.lease_snapshot(event.lease_id).lease.node_id,
+                    "worker_pid": event.worker_pid,
+                },
             )
 
     async def _task_result(self, event: RuntimeEvent) -> None:

@@ -1,0 +1,79 @@
+{
+  "data_root": "/home/user2/workplace/Ascend-Maze/data",
+  "discovery_failures": [],
+  "executor": {
+    "dag_policy": "sequential_topological_order",
+    "kind": "plain_ray_task_actor",
+    "uses_ascend_maze_controller": false,
+    "uses_ascend_maze_runtime_client": false,
+    "uses_ascend_maze_scheduler": false,
+    "worker_max_calls": 1
+  },
+  "gaia_file_smoke_summary": true,
+  "inference_backend": "transformers",
+  "objective": "ray_correctness_baseline",
+  "output_dir": "/home/user2/workplace/Ascend-Maze/experiments/transformers_all14_completion_20260723_v1/ray/multimodal_vqa_complex",
+  "ray": {
+    "address": null,
+    "namespace": "transformers-openagi-vqa-ray-v1",
+    "task_num_cpus": 1.0
+  },
+  "sample_offset": 0,
+  "samples": [
+    {
+      "dag_id": "85f93b0d-4bfc-4150-9f0d-6074808789f5",
+      "dataset": "openagi",
+      "expected_answer": "Pier\nPickup, Pickup-LKW\nBostonbulle, Boston-Tier\nZebra\nlimousine, Limousine\nBustard\nSonnenuhr\nGefängnis, Gefängnishaus\nBrieföffner, Papiermesser, Papiermesser\nOhr, Spike, Kapitulum\nRinglet, Ringlet Schmetterling\nVier-Seiten-Poster\nGasmaske, Atemschutz, Gashelm\nFensterschatten\nPosaune\nBäckerei, Bäckerei, Backerei\nGewehr\nRaumheizung\nPflüge, Pflüge\nGroßer Schweizer Berghund",
+      "family": "vision",
+      "query_index": 180,
+      "sample_id": "openagi.multimodal_vqa_complex.85f93b0d-4bfc-4150-9f0d-6074808789f5",
+      "source_files": [
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/81.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/82.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/83.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/84.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/85.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/86.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/87.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/88.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/89.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/9.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/90.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/91.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/92.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/93.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/94.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/95.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/96.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/97.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/98.jpg",
+        "/home/user2/workplace/Ascend-Maze/data/openagi/multimodal_vqa_complex/85f93b0d-4bfc-4150-9f0d-6074808789f5/inputs/images/99.jpg"
+      ],
+      "vision_mode": "true_multimodal",
+      "workflow": "multimodal_vqa_complex"
+    }
+  ],
+  "samples_per_workflow": 1,
+  "schema_version": 1,
+  "tbench_smoke_overrides": true,
+  "text_model": {
+    "dtype": "bfloat16",
+    "launch_options": {},
+    "max_model_len": 10240,
+    "max_num_batched_tokens": null,
+    "model_id": "qwen3-4b-smoke",
+    "path": "/home/user2/workplace/model_weight/model_from_hf/Qwen3-4B"
+  },
+  "vision_model": {
+    "dtype": "bfloat16",
+    "launch_options": {
+      "generation_config": "vllm",
+      "qwen2_5_vl_cpu_unique_consecutive_workaround": true
+    },
+    "max_model_len": 12288,
+    "max_num_batched_tokens": 4096,
+    "model_id": "qwen2_5-vl-3b-smoke",
+    "path": "/home/user2/workplace/model_weight/model_from_hf/Qwen2.5-VL-3B-Instruct",
+    "vision_mode": "true_multimodal"
+  }
+}

@@ -251,15 +251,17 @@ def test_submission_response_loss_replays_original_run_and_conflict_releases_upl
         assert controller.data_store.state_of(input_handle) == "adopted"
 
         same_content_client = InMemoryRuntimeClient(controller)
+        status = same_content_client.get_submission_status("submission_stable")
+        assert status is not None
+        assert status.run_id == committed.run_id
         same_content = same_content_client.prepare_submission(
             workflow,
             inputs={"value": "first"},
             submission_id="submission_stable",
         )
         redundant_handle = same_content.request.workflow_inputs[0][1]
-        same_replay = await same_content_client.submit_prepared(same_content)
-        assert same_replay.run_id == committed.run_id
-        assert same_replay.replayed
+        with pytest.raises(SubmissionConflictError):
+            await same_content_client.submit_prepared(same_content)
         with pytest.raises(DataHandleInvalidError, match="released"):
             controller.data_store.get(redundant_handle)
 

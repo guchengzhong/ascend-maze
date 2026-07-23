@@ -39,7 +39,6 @@ from ascend_maze.control.proto import control_pb2 as _control_pb2
 from ascend_maze.control.proto import control_pb2_grpc
 from ascend_maze.core.canonical import FrozenMap, canonical_digest, freeze_canonical
 from ascend_maze.core.errors import (
-    CanonicalizationError,
     ContractValidationError,
     RunNotTerminalError,
     StateTransitionError,
@@ -132,6 +131,33 @@ class _LocalControlServicer:
             "data_store_descriptor": api.data_store_descriptor,
         }
         return self._query(request.meta, payload, snapshot_version=snapshot_version)
+
+    async def GetSubmission(self, request: Any, context: Any) -> Any:
+        del context
+        submission_id = str(request.resource_id)
+        if not submission_id:
+            return self._error(
+                request.meta,
+                "invalid_argument",
+                "submission_id is required",
+            )
+        try:
+            outcome = self._api().submission_outcome(submission_id)
+        except KeyError:
+            return self._query(
+                request.meta,
+                {
+                    "found": False,
+                    "submission_id": submission_id,
+                },
+            )
+        return self._query(
+            request.meta,
+            {
+                "found": True,
+                "submission": outcome,
+            },
+        )
 
     async def SubmitWorkflow(self, request: Any, context: Any) -> Any:
         del context
@@ -997,9 +1023,6 @@ class UdsRuntimeClient:
                 ]
             )
         resolved_submission_id = submission_id or new_id("submission")
-        signature = tuple(
-            (name, self._value_identity(inputs[name])) for name in sorted(inputs)
-        )
         options_value = execution_options or {}
         frozen_options = freeze_canonical(options_value)
         if not isinstance(frozen_options, FrozenMap):
@@ -1010,6 +1033,10 @@ class UdsRuntimeClient:
         )
         existing = self._prepared.get(resolved_submission_id)
         if existing is not None:
+            signature = tuple(
+                (name, self._source_identity(inputs[name]))
+                for name in sorted(inputs)
+            )
             old = existing.request
             if (
                 old.compiled.workflow_fingerprint != compiled.workflow_fingerprint
@@ -1029,7 +1056,7 @@ class UdsRuntimeClient:
                 if isinstance(value, SharedFileRef):
                     validate_shared_file_ref(value, self.shared_filesystem_roots)
                 handle = await asyncio.to_thread(
-                    self.data_store.put_staged,
+                    self.data_store.put_staged_for_submission_input,
                     value,
                     self.data_owner_generation,
                 )
@@ -1038,6 +1065,10 @@ class UdsRuntimeClient:
             for _, handle in handles:
                 self.data_store.release(handle)
             raise
+        signature = tuple(
+            (name, self._source_identity(inputs[name]))
+            for name in sorted(inputs)
+        )
         identities = tuple(
             run_input_identity(name, inputs[name], handle) for name, handle in handles
         )
@@ -1155,6 +1186,20 @@ class UdsRuntimeClient:
             execution_options=execution_options,
         )
         return await self.submit_prepared(prepared, timeout_seconds=timeout_seconds)
+
+    async def get_submission_status(
+        self,
+        submission_id: str,
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> dict[str, object]:
+        if not isinstance(submission_id, str) or not submission_id:
+            raise ValueError("submission_id is required")
+        return await self.query(
+            "GetSubmission",
+            resource_id=submission_id,
+            timeout_seconds=timeout_seconds,
+        )
 
     async def run(
         self,
@@ -1543,7 +1588,7 @@ class UdsRuntimeClient:
                 pass
 
     @staticmethod
-    def _value_identity(value: object) -> tuple[str, ...]:
+    def _source_identity(value: object) -> tuple[str, ...]:
         if isinstance(value, SharedFileRef):
             return (
                 "shared_file",
@@ -1551,15 +1596,12 @@ class UdsRuntimeClient:
                 value.content_sha256,
                 str(value.size_bytes),
             )
-        try:
-            return ("digest", canonical_digest(value))
-        except CanonicalizationError:
-            return (
-                "object",
-                type(value).__module__,
-                type(value).__qualname__,
-                str(id(value)),
-            )
+        return (
+            "object",
+            type(value).__module__,
+            type(value).__qualname__,
+            str(id(value)),
+        )
 
 
 class ControlRpcError(RuntimeError):

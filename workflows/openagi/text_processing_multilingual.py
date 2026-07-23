@@ -178,7 +178,7 @@ def task5a_text_analysis_summarize(
         prompt,
         metadata,
         "summary_output_override",
-        max_tokens=256,
+        max_tokens=4096,
     )
     return {
         "dag_id": dag_id,
@@ -203,7 +203,7 @@ def task5b_text_analysis_sentiment(
         prompt,
         metadata,
         "sentiment_output_override",
-        max_tokens=128,
+        max_tokens=4096,
     )
     return {
         "dag_id": dag_id,

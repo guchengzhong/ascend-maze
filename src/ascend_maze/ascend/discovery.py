@@ -216,20 +216,72 @@ def discover_ascend_environment(
     )
 
 
+def _physical_host_memory_bytes() -> int:
+    return int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+
+
+def _cgroup_memory_bytes(*names: str) -> int | None:
+    for name in names:
+        path = Path(name)
+        try:
+            raw = path.read_text(encoding="ascii").strip()
+        except OSError:
+            continue
+        if raw == "max":
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        if value > 0:
+            return value
+    return None
+
+
 def _host_memory_mb() -> int:
-    return int(
-        os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024)
+    physical = _physical_host_memory_bytes()
+    cgroup_limit = _cgroup_memory_bytes(
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        "/sys/fs/cgroup/memory.max",
     )
+    effective = physical
+    if cgroup_limit is not None and cgroup_limit < physical:
+        effective = cgroup_limit
+    return effective // (1024 * 1024)
 
 
 def _host_available_memory_mb() -> int:
+    available_bytes: int | None = None
     try:
         for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
             if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) // 1024
+                available_bytes = int(line.split()[1]) * 1024
+                break
     except (OSError, ValueError, IndexError):
         pass
-    raise RuntimeError("cannot read host available memory")
+    if available_bytes is None:
+        raise RuntimeError("cannot read host available memory")
+    cgroup_limit = _cgroup_memory_bytes(
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        "/sys/fs/cgroup/memory.max",
+    )
+    cgroup_used = _cgroup_memory_bytes(
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        "/sys/fs/cgroup/memory.current",
+    )
+    if cgroup_limit is not None and cgroup_used is not None:
+        available_bytes = min(
+            available_bytes,
+            max(0, cgroup_limit - cgroup_used),
+        )
+    return available_bytes // (1024 * 1024)
+
+
+def _available_cpu_count() -> int:
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:  # pragma: no cover - non-Linux fallback
+        return os.cpu_count() or 1
 
 
 def build_ascend_node_observation(
@@ -289,7 +341,7 @@ def build_ascend_node_capacity(
         node_id=node_id,
         boot_id=boot_id,
         node_ip=node_ip,
-        cpu_total=os.cpu_count() or 1,
+        cpu_total=_available_cpu_count(),
         mem_total_mb=_host_memory_mb(),
         cpu_system_reserved=cpu_system_reserved,
         mem_system_reserved_mb=mem_system_reserved_mb,

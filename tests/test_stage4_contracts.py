@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import pickle
 
 import pytest
 
@@ -28,7 +29,11 @@ from ascend_maze.contracts.resources import (
     ResourceObservation,
     ResourceSpec,
 )
-from ascend_maze.contracts.runtime import DeviceBinding, RuntimeNodeBinding
+from ascend_maze.contracts.runtime import (
+    DeviceBinding,
+    RuntimeDeviceMapping,
+    RuntimeNodeBinding,
+)
 from ascend_maze.core.canonical import (
     FrozenMap,
     canonical_bytes,
@@ -37,6 +42,7 @@ from ascend_maze.core.canonical import (
 from ascend_maze.core.errors import ContractValidationError
 from ascend_maze.lifecycle import RunStatus
 from ascend_maze.inference import AttemptInferenceSummary, InferenceRequestRecord
+from ascend_maze.inference.contracts import InferenceWorkerConfig
 from ascend_maze.placement import (
     NodeCapacity,
     NodeObservation,
@@ -48,6 +54,7 @@ from ascend_maze.placement import (
 from ascend_maze.resources import DeclaredOnlyAnchorProvider, StaticAnchorProvider
 from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 from ascend_maze.runtime.fake import FakeExecutionPlan
+from ascend_maze.runtime.ray_backend import _bind_transformers_local_worker
 from stage4_task_fixtures import (
     impossible_npu,
     no_retry_npu,
@@ -211,12 +218,31 @@ def test_device_binding_is_derived_only_from_one_npu_lease() -> None:
         2,
     )
     runtime_binding = RuntimeNodeBinding(
-        "node_a", "boot_a", "ray", 3, "agent", "endpoint", "producer"
+        "node_a",
+        "boot_a",
+        "ray",
+        3,
+        "agent",
+        "endpoint",
+        "producer",
+        device_mappings=(RuntimeDeviceMapping("7", "0", 0),),
     )
     binding = DeviceBinding.from_lease(lease, runtime_binding)
     assert binding.physical_device_id == "7"
+    assert binding.runtime_visible_device_id == "0"
     assert binding.visible_device_index == 0
-    assert binding.environment_variables["ASCEND_RT_VISIBLE_DEVICES"] == "7"
+    assert binding.environment_variables["ASCEND_RT_VISIBLE_DEVICES"] == "0"
+    assert pickle.loads(pickle.dumps(binding)) == binding
+
+    bare_metal = DeviceBinding.from_lease(
+        lease,
+        RuntimeNodeBinding(
+            "node_a", "boot_a", "ray", 3, "agent", "endpoint", "producer"
+        ),
+    )
+    assert bare_metal.physical_device_id == "7"
+    assert bare_metal.runtime_visible_device_id == "7"
+    assert bare_metal.environment_variables["ASCEND_RT_VISIBLE_DEVICES"] == "7"
     with pytest.raises(ContractValidationError, match="one leased NPU slot"):
         DeviceBinding.from_lease(
             PlacementLease(
@@ -235,6 +261,36 @@ def test_device_binding_is_derived_only_from_one_npu_lease() -> None:
             ),
             runtime_binding,
         )
+
+
+def test_transformers_worker_uses_runtime_visible_container_device() -> None:
+    runtime_binding = RuntimeNodeBinding(
+        "node_a",
+        "boot_a",
+        "ray",
+        3,
+        "agent",
+        "endpoint",
+        "producer",
+        device_mappings=(RuntimeDeviceMapping("7", "0", 0),),
+    )
+    config = InferenceWorkerConfig(
+        adapter_name="transformers_local",
+        instance_placement_lease_id="model_lease",
+        request_timeout_ms=1_000,
+        adapter_options=FrozenMap((("device_id", "7"),)),
+    )
+
+    mapped_config, device = _bind_transformers_local_worker(
+        config,
+        runtime_binding,
+        physical_device_id="7",
+    )
+
+    assert mapped_config.adapter_options["device_id"] == "0"
+    assert device.physical_device_id == "7"
+    assert device.runtime_visible_device_id == "0"
+    assert device.environment_variables["ASCEND_RT_VISIBLE_DEVICES"] == "0"
 
 
 def test_static_anchor_and_one_oom_revision_are_deterministic() -> None:

@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
+
+from ascend_maze.contracts.recording import ExecutionEvent
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -165,6 +168,157 @@ def test_qwen_benchmark_smoke_rewrites_model_anchors_before_compile() -> None:
     assert compiled_models == {"local-qwen-smoke"}
 
 
+def test_qwen_benchmark_smoke_collects_task_timing_records() -> None:
+    tool = _load_tool()
+
+    class Runtime:
+        def task_timing_records(self, run_id: str):
+            assert run_id == "run_1"
+            return (
+                {
+                    "run_id": "run_1",
+                    "task_id": "task_a",
+                    "attempt": 1,
+                    "task_total_ms": 15,
+                    "input_fetch_ms": 2,
+                    "callable_execute_ms": 10,
+                    "chat_request_ms": 7,
+                    "output_put_ms": 1,
+                    "task_runtime_overhead_ms": 2,
+                    "callable_minus_chat_ms": 3,
+                },
+            )
+
+    class Controller:
+        runtime = Runtime()
+
+    records = tool._task_timing_records(  # noqa: SLF001
+        Controller(),
+        "run_1",
+        {"task_alpha": "task_a"},
+    )
+    assert records == [
+        {
+            "run_id": "run_1",
+            "task_id": "task_a",
+            "attempt": 1,
+            "task_total_ms": 15,
+            "input_fetch_ms": 2,
+            "callable_execute_ms": 10,
+            "chat_request_ms": 7,
+            "output_put_ms": 1,
+            "task_runtime_overhead_ms": 2,
+            "callable_minus_chat_ms": 3,
+            "task_name": "task_alpha",
+        }
+    ]
+    assert tool._task_timing_summary(records) == {  # noqa: SLF001
+        "task_count": 1,
+        "task_total_ms": 15,
+        "dispatch_prepare_ms": 0,
+        "worker_startup_ms": 0,
+        "dispatch_wait_ms": 0,
+        "input_fetch_ms": 2,
+        "callable_execute_ms": 10,
+        "chat_request_ms": 7,
+        "output_put_ms": 1,
+        "task_runtime_overhead_ms": 2,
+        "callable_minus_chat_ms": 3,
+    }
+
+
+def test_qwen_benchmark_smoke_records_ray_binding_evidence() -> None:
+    tool = _load_tool()
+    event = ExecutionEvent(
+        schema_version=1,
+        event_id="event_1",
+        experiment_id="run_1",
+        run_id="run_1",
+        task_id="task_a",
+        attempt=1,
+        lease_id="lease_1",
+        route_lease_id=None,
+        model_instance_id=None,
+        event_type="task_dispatched",
+        producer_id="controller:test",
+        producer_sequence=1,
+        node_id=None,
+        device_id=None,
+        monotonic_time_ms=1,
+        wall_time_ms=1,
+        duration_ms=None,
+        payload={
+            "node_id": "node_a",
+            "affinity_hit": True,
+            "input_object_refs": (
+                {
+                    "input_name": "backend_data",
+                    "data_handle_id": "data_1",
+                    "object_ref_id": "object_1",
+                },
+            ),
+        },
+    )
+
+    class Recorder:
+        def events(self, run_id: str):
+            assert run_id == "run_1"
+            return (event,)
+
+    class Controller:
+        recorder = Recorder()
+
+    records = tool._run_event_records(  # noqa: SLF001
+        Controller(),
+        "run_1",
+        {"task_alpha": "task_a"},
+    )
+
+    assert len(records) == 1
+    assert records[0]["task_name"] == "task_alpha"
+    assert records[0]["event_type"] == "task_dispatched"
+    assert records[0]["payload"] == {
+        "node_id": "node_a",
+        "affinity_hit": True,
+        "input_object_refs": [
+            {
+                "input_name": "backend_data",
+                "data_handle_id": "data_1",
+                "object_ref_id": "object_1",
+            }
+        ],
+    }
+
+
+def test_residual_vllm_processes_only_reports_owned_process_groups(
+    monkeypatch,
+) -> None:
+    tool = _load_tool()
+    process_table = "\n".join(
+        (
+            "100 1 100 S python -m vllm.entrypoints.openai.api_server "
+            "--model /models/qwen --port 32060",
+            "200 1 200 S python -m vllm.entrypoints.openai.api_server "
+            "--model /models/qwen --port 32271",
+            "201 200 200 S python -m vllm.entrypoints.openai.api_server "
+            "--model /models/qwen --port 32271",
+        )
+    )
+    monkeypatch.setattr(
+        tool.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=process_table),
+    )
+
+    residual = tool._residual_vllm_processes(  # noqa: SLF001
+        (Path("/models/qwen"),),
+        (32060, 32271),
+        owned_process_group_ids=(100,),
+    )
+
+    assert residual == [process_table.splitlines()[0]]
+
+
 def test_qwen_benchmark_smoke_rejects_incomplete_model_artifact(
     tmp_path: Path,
 ) -> None:
@@ -224,7 +378,69 @@ def test_qwen_benchmark_smoke_plan_only_cli_writes_plan(tmp_path: Path) -> None:
     assert (tmp_path / "plan.json").is_file()
     assert (tmp_path / "summary.json").is_file()
     plan = json.loads((tmp_path / "plan.json").read_text())
+    assert plan["inference_backend"] == "vllm"
+    assert plan["text_model"]["max_model_len"] == 10240
     assert plan["vision_model"]["model_id"] == "qwen2_5-vl-3b-smoke"
     assert plan["vision_model"]["path"].endswith("Qwen2.5-VL-3B-Instruct")
-    assert plan["vision_model"]["max_model_len"] == 4096
+    assert plan["vision_model"]["max_model_len"] == 12288
     assert plan["vision_model"]["max_num_batched_tokens"] == 4096
+
+
+def test_qwen_benchmark_smoke_plan_records_transformers_backend(tmp_path: Path) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_PATH),
+            "--plan-only",
+            "--inference-backend",
+            "transformers",
+            "--dataset",
+            "tbench",
+            "--workflow",
+            "retail_cancel",
+            "--family",
+            "text",
+            "--samples-per-workflow",
+            "1",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        cwd=str(REPO_ROOT),
+        env={
+            **os.environ,
+            "PYTHONPATH": f"{REPO_ROOT / 'src'}:{REPO_ROOT}",
+        },
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    plan = json.loads((tmp_path / "plan.json").read_text())
+    assert plan["inference_backend"] == "transformers"
+    assert [sample["family"] for sample in plan["samples"]] == ["text"]
+
+
+def test_qwen_benchmark_smoke_configures_transformers_vision_path() -> None:
+    tool = _load_tool()
+
+    options = tool._transformers_local_launch_options(  # noqa: SLF001
+        device_id="6",
+        request_timeout_ms=900_000,
+        runtime_paths=("/opt/ascend/host_aicpu",),
+        trust_remote_code=False,
+        is_vision=True,
+    )
+
+    assert options == {
+        "device_id": "6",
+        "enable_thinking": False,
+        "generation_method": "manual_greedy",
+        "model_kind": "vision_language",
+        "qwen2_5_vl_cpu_unique_consecutive_workaround": True,
+        "request_timeout_ms": 900_000,
+        "runtime_library_paths": ("/opt/ascend/host_aicpu",),
+        "trust_remote_code": False,
+    }

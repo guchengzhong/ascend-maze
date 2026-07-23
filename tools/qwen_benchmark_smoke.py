@@ -78,6 +78,14 @@ DEFAULT_MODULES = (
     "prometheus_client",
     "acl",
 )
+VLLM_MODULES = DEFAULT_MODULES
+TRANSFORMERS_LOCAL_MODULES = (
+    "torch",
+    "torch_npu",
+    "transformers",
+    "PIL",
+    "acl",
+)
 TEXT_MODEL_ID = "qwen3-4b-smoke"
 VISION_MODEL_ID = "qwen2_5-vl-3b-smoke"
 
@@ -216,6 +224,166 @@ def _jsonable(value: object) -> object:
     if isinstance(value, (list, tuple, set, frozenset)):
         return [_jsonable(item) for item in value]
     return value
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.perf_counter() - started) * 1_000))
+
+
+def _prepend_env_paths(name: str, paths: Iterable[str]) -> None:
+    new_paths = tuple(str(item) for item in paths if str(item))
+    if not new_paths:
+        return
+    existing = tuple(item for item in os.environ.get(name, "").split(os.pathsep) if item)
+    merged: list[str] = []
+    for item in (*new_paths, *existing):
+        if item not in merged:
+            merged.append(item)
+    os.environ[name] = os.pathsep.join(merged)
+
+
+def _data_store_metrics_snapshot(controller: object) -> dict[str, object] | None:
+    data_store = getattr(controller, "data_store", None)
+    snapshot = getattr(data_store, "metrics_snapshot", None)
+    if callable(snapshot):
+        return dict(snapshot())
+    stats = getattr(data_store, "stats", None)
+    if callable(stats):
+        return dict(stats())
+    return None
+
+
+def _data_store_metrics_delta(
+    before: Mapping[str, object] | None,
+    after: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    if before is None or after is None:
+        return None
+    delta: dict[str, object] = {}
+    for key, value in after.items():
+        old = before.get(key)
+        if isinstance(value, bool) or isinstance(old, bool):
+            continue
+        if isinstance(value, int) and isinstance(old, int):
+            delta[key] = value - old
+        elif isinstance(value, (int, float)) and isinstance(old, (int, float)):
+            delta[key] = round(float(value) - float(old), 3)
+    return delta
+
+
+def _transformers_local_records(
+    inference: object,
+    inference_records: object,
+) -> list[dict[str, object]]:
+    if not isinstance(inference_records, list):
+        return []
+    route_ids = {
+        item.get("route_lease_id")
+        for item in inference_records
+        if isinstance(item, Mapping) and isinstance(item.get("route_lease_id"), str)
+    }
+    if not route_ids:
+        return []
+    catalog = getattr(inference, "catalog", None)
+    adapters = getattr(catalog, "adapters", None)
+    if not callable(adapters):
+        return []
+    records: list[dict[str, object]] = []
+    for adapter in adapters():
+        snapshot = getattr(adapter, "invocation_records", None)
+        if not callable(snapshot):
+            continue
+        for item in snapshot():
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("route_lease_id") in route_ids:
+                records.append(dict(item))
+    return records
+
+
+def _task_timing_records(
+    controller: object,
+    run_id: str,
+    task_id_by_name: Mapping[str, str],
+) -> list[dict[str, object]]:
+    runtime = getattr(controller, "runtime", None)
+    snapshot = getattr(runtime, "task_timing_records", None)
+    if not callable(snapshot):
+        return []
+    task_name_by_id = {task_id: task_name for task_name, task_id in task_id_by_name.items()}
+    records: list[dict[str, object]] = []
+    for item in snapshot(run_id):
+        if not isinstance(item, Mapping):
+            continue
+        record = dict(item)
+        task_id = record.get("task_id")
+        if isinstance(task_id, str):
+            record["task_name"] = task_name_by_id.get(task_id)
+        records.append(record)
+    return records
+
+
+def _task_timing_summary(
+    records: list[dict[str, object]],
+) -> dict[str, int]:
+    fields = (
+        "task_total_ms",
+        "dispatch_prepare_ms",
+        "worker_startup_ms",
+        "dispatch_wait_ms",
+        "input_fetch_ms",
+        "callable_execute_ms",
+        "chat_request_ms",
+        "output_put_ms",
+        "task_runtime_overhead_ms",
+        "callable_minus_chat_ms",
+    )
+    summary: dict[str, int] = {"task_count": len(records)}
+    for field in fields:
+        total = 0
+        for record in records:
+            value = record.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                total += value
+        summary[field] = total
+    return summary
+
+
+def _run_event_records(
+    controller: object,
+    run_id: str,
+    task_id_by_name: Mapping[str, str],
+) -> list[dict[str, object]]:
+    recorder = getattr(controller, "recorder", None)
+    events = getattr(recorder, "events", None)
+    if not callable(events):
+        return []
+    task_name_by_id = {
+        task_id: task_name for task_name, task_id in task_id_by_name.items()
+    }
+    records: list[dict[str, object]] = []
+    for event in events(run_id):
+        payload = _jsonable(event)
+        if not isinstance(payload, Mapping):
+            continue
+        record = dict(payload)
+        task_id = record.get("task_id")
+        if isinstance(task_id, str):
+            record["task_name"] = task_name_by_id.get(task_id)
+        records.append(record)
+    return records
+
+
+def _model_request_ms(records: object) -> int:
+    if not isinstance(records, list):
+        return 0
+    total = 0
+    for item in records:
+        if isinstance(item, Mapping):
+            duration = item.get("duration_ms")
+            if isinstance(duration, int) and not isinstance(duration, bool):
+                total += duration
+    return total
 
 
 def emit(name: str, value: object) -> None:
@@ -398,7 +566,12 @@ def _tail_logs(log_dir: Path, lines: int = 120) -> dict[str, str]:
     return result
 
 
-def _residual_vllm_processes(model_paths: Iterable[Path], ports: tuple[int, ...]) -> list[str]:
+def _residual_vllm_processes(
+    model_paths: Iterable[Path],
+    ports: tuple[int, ...],
+    *,
+    owned_process_group_ids: Iterable[int] | None = None,
+) -> list[str]:
     completed = subprocess.run(
         ["ps", "-eo", "pid,ppid,pgid,stat,cmd"],
         text=True,
@@ -407,11 +580,27 @@ def _residual_vllm_processes(model_paths: Iterable[Path], ports: tuple[int, ...]
         check=False,
     )
     resolved_model_paths = tuple(str(path) for path in model_paths)
+    owned_groups = (
+        None
+        if owned_process_group_ids is None
+        else frozenset(int(item) for item in owned_process_group_ids)
+    )
     residual: list[str] = []
     for line in completed.stdout.splitlines():
         if "grep" in line or "rg " in line:
             continue
-        if "vllm.entrypoints.openai.api_server" in line and (
+        columns = line.strip().split(maxsplit=4)
+        if len(columns) < 5:
+            continue
+        try:
+            pid = int(columns[0])
+            process_group_id = int(columns[2])
+        except ValueError:
+            continue
+        is_owned = owned_groups is None or (
+            pid in owned_groups or process_group_id in owned_groups
+        )
+        if is_owned and "vllm.entrypoints.openai.api_server" in line and (
             any(model_path in line for model_path in resolved_model_paths)
             or any(f"--port {port}" in line for port in ports)
         ):
@@ -1374,7 +1563,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run migrated GAIA/OpenAGI/tau-bench workflows through local "
-            "Qwen vLLM-Ascend services."
+            "Qwen Transformers or vLLM-Ascend inference."
         )
     )
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
@@ -1386,6 +1575,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--python-executable", type=Path, default=_default_python())
     parser.add_argument("--device-id", default="0")
+    parser.add_argument(
+        "--inference-backend",
+        choices=("vllm", "transformers"),
+        default="vllm",
+        help=(
+            "Inference backend for model tasks. 'transformers' is a cold-load "
+            "text/vision path that loads the model inside every chat() call."
+        ),
+    )
     parser.add_argument(
         "--dataset",
         action="append",
@@ -1412,8 +1610,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples-per-workflow", type=int, default=1)
     parser.add_argument("--sample-offset", type=int, default=0)
     parser.add_argument("--max-inline-file-bytes", type=int, default=64 * 1024 * 1024)
-    parser.add_argument("--text-max-model-len", type=int, default=4096)
-    parser.add_argument("--vision-max-model-len", type=int, default=4096)
+    parser.add_argument("--text-max-model-len", type=int, default=10240)
+    parser.add_argument("--vision-max-model-len", type=int, default=12288)
     parser.add_argument(
         "--text-dtype",
         choices=("bfloat16", "float16"),
@@ -1506,6 +1704,14 @@ def parse_args() -> argparse.Namespace:
             "model prompt."
         ),
     )
+    parser.add_argument(
+        "--unsafe-no-deepcopy-large-values",
+        action="store_true",
+        help=(
+            "Removed InMemory-only option. Formal benchmark execution always "
+            "uses RayRuntimeBackend and RayDataStore."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1532,6 +1738,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--first-port cannot exceed --last-port")
     if args.run_timeout_seconds <= 0:
         raise SystemExit("--run-timeout-seconds must be positive")
+    if args.unsafe_no_deepcopy_large_values:
+        raise SystemExit(
+            "--unsafe-no-deepcopy-large-values is unavailable on the formal Ray path"
+        )
 
 
 async def _run_family(
@@ -1547,10 +1757,22 @@ async def _run_family(
 ) -> dict[str, object]:
     from ascend_maze.ascend.contracts import AscendCorrectnessConfig
     from ascend_maze.ascend.discovery import build_ascend_node_capacity
-    from ascend_maze.control import InMemoryController, InMemoryRuntimeClient
+    import ray
+
+    from ascend_maze.control import InMemoryRuntimeClient
+    from ascend_maze.control.node_rpc import NodeAgent, NodeAgentIdentity
+    from ascend_maze.control.ray_controller import RayHostController
     from ascend_maze.control.service_process import NodeServiceProcessManager
     from ascend_maze.core.canonical import canonical_digest
-    from ascend_maze.inference import InferenceCoordinator, ModelCatalog, ModelSpec
+    from ascend_maze.inference import (
+        InferenceCoordinator,
+        InMemoryPortLeaseManager,
+        ModelCatalog,
+        ModelSpec,
+    )
+    from ascend_maze.inference.adapters.transformers_local import (
+        TransformersLocalInferenceEngineAdapter,
+    )
     from ascend_maze.inference.adapters.vllm_ascend import (
         VllmAscendInferenceEngineAdapter,
     )
@@ -1582,8 +1804,11 @@ async def _run_family(
                 ),
             }
             launched_services.append(payload)
+            handle = await super().launch(request, lease)
+            payload["process_id"] = handle.process_id
+            payload["process_group_id"] = handle.process_id
             emit("SERVICE_LAUNCH_JSON", payload)
-            return await super().launch(request, lease)
+            return handle
 
     correctness = AscendCorrectnessConfig(
         task_slots_total=1,
@@ -1612,36 +1837,46 @@ async def _run_family(
     node = replace(node, npus=selected_npus)
 
     is_vision = family == "vision"
-    launch_options: dict[str, object] = {
-        "block_size": 128,
-        "enable_prefix_caching": False,
-        "enforce_eager": True,
-        "gpu_memory_utilization": (
-            float(args.vision_gpu_memory_utilization)
-            if is_vision
-            else float(args.text_gpu_memory_utilization)
-        ),
-        "log_level": str(args.log_level),
-        "max_num_seqs": int(args.max_num_seqs),
-    }
-    max_num_batched_tokens = (
-        args.vision_max_num_batched_tokens
-        if is_vision
-        else args.text_max_num_batched_tokens
-    )
-    if max_num_batched_tokens is not None:
-        launch_options["max_num_batched_tokens"] = int(max_num_batched_tokens)
     trust_remote_code = (
         bool(args.vision_trust_remote_code)
         if is_vision
         else bool(args.text_trust_remote_code)
     )
-    if trust_remote_code:
-        launch_options["trust_remote_code"] = True
+    if args.inference_backend == "transformers":
+        launch_options = _transformers_local_launch_options(
+            device_id=str(args.device_id),
+            request_timeout_ms=int(args.request_timeout_ms),
+            runtime_paths=runtime_paths,
+            trust_remote_code=trust_remote_code,
+            is_vision=is_vision,
+        )
+    else:
+        launch_options = {
+            "block_size": 128,
+            "enable_prefix_caching": False,
+            "enforce_eager": True,
+            "gpu_memory_utilization": (
+                float(args.vision_gpu_memory_utilization)
+                if is_vision
+                else float(args.text_gpu_memory_utilization)
+            ),
+            "log_level": str(args.log_level),
+            "max_num_seqs": int(args.max_num_seqs),
+        }
+        max_num_batched_tokens = (
+            args.vision_max_num_batched_tokens
+            if is_vision
+            else args.text_max_num_batched_tokens
+        )
+        if max_num_batched_tokens is not None:
+            launch_options["max_num_batched_tokens"] = int(max_num_batched_tokens)
+        if trust_remote_code:
+            launch_options["trust_remote_code"] = True
 
     if is_vision:
-        launch_options["generation_config"] = "vllm"
-        launch_options["qwen2_5_vl_cpu_unique_consecutive_workaround"] = True
+        if args.inference_backend == "vllm":
+            launch_options["generation_config"] = "vllm"
+            launch_options["qwen2_5_vl_cpu_unique_consecutive_workaround"] = True
         weight_hbm_mb = 18_000
         runtime_hbm_mb = 8_000
         kv_cache_hbm_mb = 20_000
@@ -1656,13 +1891,19 @@ async def _run_family(
         max_model_len = int(args.text_max_model_len)
         dtype = str(args.text_dtype)
 
+    backend_name = (
+        "transformers_local"
+        if args.inference_backend == "transformers"
+        else "vllm_ascend"
+    )
+
     spec = ModelSpec(
         model_id=target_model_id,
         catalog_revision=f"benchmark-smoke-{family}-{_artifact_revision(model_path)[:12]}",
         artifact_path=str(model_path),
         tokenizer_path=str(model_path),
         artifact_revision=_artifact_revision(model_path),
-        backend="vllm_ascend",
+        backend=backend_name,
         dtype=dtype,
         quantization=None,
         tensor_parallel_size=1,
@@ -1676,7 +1917,7 @@ async def _run_family(
         npu_slots=1,
         allow_colocation=False,
         request_capacity=1,
-        required_capabilities=("vllm_ascend",),
+        required_capabilities=(backend_name,),
         environment_fingerprint=environment.environment_fingerprint,
         launch_options=launch_options,
         warmup_request={
@@ -1698,8 +1939,11 @@ async def _run_family(
 
     service_manager: Any = None
     controller: Any = None
+    ray_started_here = False
     family_summary: dict[str, object] = {
         "family": family,
+        "runtime_backend": "ray",
+        "inference_backend": str(args.inference_backend),
         "target_model_id": target_model_id,
         "model_path": str(model_path),
         "sample_count": len(samples),
@@ -1713,30 +1957,39 @@ async def _run_family(
     cleanup_errors: list[str] = []
 
     try:
-        service_manager = _LoggingProcessManager(
-            node_id=node_id,
-            boot_id=boot_id,
-            device_monitor=device_adapter,
-            allowed_executables=(str(args.python_executable),),
-            log_directory=log_dir,
-            first_port=int(args.first_port),
-            last_port=int(args.last_port),
-            port_bind_host="127.0.0.1",
-            hbm_recovery_tolerance_mb=args.hbm_recovery_tolerance_mb,
-            poll_interval_ms=500,
-        )
-        port_wrapper = _PortLeaseWrapper(service_manager)
-        adapter = VllmAscendInferenceEngineAdapter(
-            process_backend=service_manager,
-            python_executable=str(args.python_executable),
-            endpoint_host_resolver=lambda lease: "127.0.0.1",
-            bind_host="127.0.0.1",
-            runtime_library_preloads=preloads,
-            runtime_library_paths=runtime_paths,
-            request_timeout_ms=int(args.request_timeout_ms),
-            probe_timeout_ms=int(args.startup_timeout_ms),
-            probe_interval_ms=1_000,
-        )
+        if args.inference_backend == "transformers":
+            adapter = TransformersLocalInferenceEngineAdapter()
+            service_backend = adapter
+            port_leases = InMemoryPortLeaseManager(
+                first_port=int(args.first_port),
+                last_port=int(args.last_port),
+            )
+        else:
+            service_manager = _LoggingProcessManager(
+                node_id=node_id,
+                boot_id=boot_id,
+                device_monitor=device_adapter,
+                allowed_executables=(str(args.python_executable),),
+                log_directory=log_dir,
+                first_port=int(args.first_port),
+                last_port=int(args.last_port),
+                port_bind_host="127.0.0.1",
+                hbm_recovery_tolerance_mb=args.hbm_recovery_tolerance_mb,
+                poll_interval_ms=500,
+            )
+            service_backend = service_manager
+            port_leases = _PortLeaseWrapper(service_manager)
+            adapter = VllmAscendInferenceEngineAdapter(
+                process_backend=service_manager,
+                python_executable=str(args.python_executable),
+                endpoint_host_resolver=lambda lease: "127.0.0.1",
+                bind_host="127.0.0.1",
+                runtime_library_preloads=preloads,
+                runtime_library_paths=runtime_paths,
+                request_timeout_ms=int(args.request_timeout_ms),
+                probe_timeout_ms=int(args.startup_timeout_ms),
+                probe_interval_ms=1_000,
+            )
         placement = PlacementManager(
             host_mem_headroom_mb=correctness.host_mem_headroom_mb,
             npu_hbm_headroom_mb=correctness.npu_hbm_headroom_mb,
@@ -1744,8 +1997,8 @@ async def _run_family(
         )
         catalog = ModelCatalog(
             (spec,),
-            adapters={"vllm_ascend": adapter},
-            environment_capabilities=("ascend", "vllm_ascend"),
+            adapters={backend_name: adapter},
+            environment_capabilities=("ascend", backend_name),
             max_single_npu_hbm_mb=max(
                 npu.total_hbm_mb - npu.system_reserved_hbm_mb
                 for npu in node.npus
@@ -1754,14 +2007,16 @@ async def _run_family(
         inference = InferenceCoordinator(
             catalog=catalog,
             placement=placement,
-            service_backend=service_manager,
-            port_leases=port_wrapper,
+            service_backend=service_backend,
+            port_leases=port_leases,
             reconcile_interval_ms=500,
         )
         config_fingerprint = canonical_digest(
             {
                 "profile": "qwen-benchmark-smoke",
                 "family": family,
+                "runtime_backend": "ray",
+                "inference_backend": str(args.inference_backend),
                 "environment_fingerprint": environment.environment_fingerprint,
                 "model_catalog_digest": catalog.content_digest,
                 "device": str(args.device_id),
@@ -1770,7 +2025,35 @@ async def _run_family(
                 "runtime_library_paths": runtime_paths,
             }
         )
-        controller = InMemoryController(
+        ray_namespace = (
+            f"ascend-maze-qwen-{family}-{os.getpid()}-{int(time.time() * 1000)}"
+        )
+        if not ray.is_initialized():
+            ray.init(
+                namespace=ray_namespace,
+                include_dashboard=False,
+                log_to_driver=False,
+            )
+            ray_started_here = True
+        else:
+            ray_namespace = ray.get_runtime_context().namespace
+        head_agent = NodeAgent(
+            identity=NodeAgentIdentity(
+                cluster_id=f"qwen_benchmark_{family}",
+                node_id=node.node_id,
+                boot_id=node.boot_id,
+                ray_node_id=ray.get_runtime_context().get_node_id(),
+                agent_generation=f"agent_{family}_{int(time.time() * 1000)}",
+                environment_fingerprint=environment.environment_fingerprint,
+                producer_id=f"node_agent:{node.node_id}:benchmark",
+            ),
+            authorization_token=b"qwen-benchmark-smoke",
+            heartbeat_interval_ms=250,
+        )
+        controller = RayHostController(
+            cluster_id=f"qwen_benchmark_{family}",
+            authorization_token=b"qwen-benchmark-smoke",
+            ray_namespace=ray_namespace,
             config_fingerprint=config_fingerprint,
             environment_fingerprint=environment.environment_fingerprint,
             build_revision=_git_revision(),
@@ -1780,6 +2063,7 @@ async def _run_family(
             dispatch_timeout_ms=int(args.startup_timeout_ms),
             shutdown_drain_timeout_ms=5_000,
             shutdown_cleanup_timeout_ms=120_000,
+            head_node_agent=head_agent,
         )
         await controller.start()
         client = InMemoryRuntimeClient(controller)
@@ -1818,6 +2102,8 @@ async def _run_family(
                     f"service_manager_close:{type(exc).__name__}:{exc}"
                 )
                 emit("SERVICE_MANAGER_CLOSE_ERROR", traceback.format_exc())
+        if ray_started_here:
+            ray.shutdown()
 
     family_summary.update(
         {
@@ -1832,6 +2118,28 @@ async def _run_family(
     return family_summary
 
 
+def _transformers_local_launch_options(
+    *,
+    device_id: str,
+    request_timeout_ms: int,
+    runtime_paths: tuple[str, ...],
+    trust_remote_code: bool,
+    is_vision: bool,
+) -> dict[str, object]:
+    options: dict[str, object] = {
+        "device_id": device_id,
+        "enable_thinking": False,
+        "generation_method": "manual_greedy",
+        "model_kind": "vision_language" if is_vision else "text",
+        "request_timeout_ms": request_timeout_ms,
+        "runtime_library_paths": runtime_paths,
+        "trust_remote_code": trust_remote_code,
+    }
+    if is_vision:
+        options["qwen2_5_vl_cpu_unique_consecutive_workaround"] = True
+    return options
+
+
 async def _run_one_sample(
     *,
     controller: Any,
@@ -1841,7 +2149,10 @@ async def _run_one_sample(
     target_model_id: str,
     run_timeout_seconds: float,
 ) -> dict[str, object]:
+    sample_started = time.perf_counter()
     started_ms = int(time.time() * 1000)
+    data_store_metrics_start = _data_store_metrics_snapshot(controller)
+    latency_metrics: dict[str, object] = {}
     record: dict[str, object] = {
         "schema_version": 1,
         "sample": sample.manifest(),
@@ -1851,7 +2162,10 @@ async def _run_one_sample(
     }
     run_id: str | None = None
     destroyed = False
+    client_e2e_started: float | None = None
+    client_e2e_finished: float | None = None
     try:
+        stage_started = time.perf_counter()
         workflow, model_aliases = _build_workflow(
             sample.dataset,
             sample.workflow,
@@ -1862,6 +2176,7 @@ async def _run_one_sample(
             task.task_name: task_id
             for task_id, task in compiled.tasks.items_tuple()
         }
+        latency_metrics["prepare_ms"] = _elapsed_ms(stage_started)
         record["workflow_fingerprint"] = compiled.workflow_fingerprint
         record["model_aliases"] = model_aliases
         record["task_id_by_name"] = task_id_by_name
@@ -1881,13 +2196,31 @@ async def _run_one_sample(
                 "submission_id": submission_id,
             },
         )
-        outcome = await client.submit(
+        client_e2e_started = time.perf_counter()
+        stage_started = time.perf_counter()
+        prepare_submit_started = time.perf_counter()
+        prepared = client.prepare_submission(
             workflow,
             inputs=sample.inputs,
             submission_id=submission_id,
             session_key=f"{submission_id}-session",
             run_deadline_ms=int(run_timeout_seconds * 1_000),
         )
+        latency_metrics["client_prepare_submission_ms"] = _elapsed_ms(
+            prepare_submit_started
+        )
+        latency_metrics["client_prepare_trace"] = _jsonable(
+            getattr(client, "last_prepare_trace", {})
+        )
+        controller_submit_started = time.perf_counter()
+        outcome = await client.submit_prepared(prepared)
+        latency_metrics["controller_submit_roundtrip_ms"] = _elapsed_ms(
+            controller_submit_started
+        )
+        latency_metrics["controller_submit_trace"] = _jsonable(
+            getattr(controller, "last_submit_trace", {})
+        )
+        latency_metrics["submit_ms"] = _elapsed_ms(stage_started)
         record["submission"] = {
             "submission_id": outcome.submission_id,
             "state": outcome.state.value,
@@ -1899,30 +2232,73 @@ async def _run_one_sample(
         if outcome.run_id is None:
             raise RuntimeError("submission did not produce a run_id")
         run_id = outcome.run_id
+        stage_started = time.perf_counter()
         snapshot = await _wait_terminal_or_cancel(
             controller=controller,
             inference=inference,
             run_id=run_id,
             timeout_seconds=run_timeout_seconds,
         )
+        latency_metrics["wait_terminal_ms"] = _elapsed_ms(stage_started)
         terminal = _run_snapshot_payload(snapshot)
         record["run_terminal"] = terminal
+        if snapshot.status.value == "succeeded":
+            record["status"] = "succeeded"
+            stage_started = time.perf_counter()
+            record["exit_task_results"] = {
+                compiled.tasks[task_id].task_name: controller.result(run_id, task_id)
+                for task_id in compiled.exit_tasks
+            }
+            latency_metrics["final_result_fetch_ms"] = _elapsed_ms(stage_started)
+        else:
+            record["status"] = f"failed:{snapshot.status.value}"
+            record["failure"] = terminal.get("failure")
+        client_e2e_finished = time.perf_counter()
+
+        # Detailed evidence is intentionally collected outside client E2E. The
+        # user-visible request is complete once the exit-task results return.
         record["inference_records"] = [
             asdict(item)
             for item in inference.request_records()
             if item.run_id == run_id
         ]
+        record["task_timing_records"] = _task_timing_records(
+            controller,
+            run_id,
+            task_id_by_name,
+        )
+        record["transformers_local_records"] = _transformers_local_records(
+            inference,
+            record["inference_records"],
+        )
+        for timing in record["task_timing_records"]:
+            metrics = timing.get("inference_metrics")
+            if isinstance(metrics, list):
+                record["transformers_local_records"].extend(
+                    dict(item) for item in metrics if isinstance(item, Mapping)
+                )
+        record["task_timing_summary"] = _task_timing_summary(
+            record["task_timing_records"]
+        )
+        latency_metrics["model_request_ms"] = _model_request_ms(
+            record["inference_records"]
+        )
         if snapshot.status.value == "succeeded":
-            record["status"] = "succeeded"
+            stage_started = time.perf_counter()
             record["task_results"] = {
                 task_name: controller.result(run_id, task_id)
                 for task_name, task_id in sorted(task_id_by_name.items())
             }
-        else:
-            record["status"] = f"failed:{snapshot.status.value}"
-            record["failure"] = terminal.get("failure")
+            latency_metrics["result_fetch_ms"] = _elapsed_ms(stage_started)
+        record["run_events"] = _run_event_records(
+            controller,
+            run_id,
+            task_id_by_name,
+        )
+        stage_started = time.perf_counter()
         destroy = await controller.destroy_run(run_id, force=True)
         destroyed = True
+        latency_metrics["destroy_ms"] = _elapsed_ms(stage_started)
         record["destroy_result"] = _jsonable(destroy)
     except Exception as exc:
         record["status"] = "unexpected_exception"
@@ -1930,6 +2306,7 @@ async def _run_one_sample(
         record["traceback"] = traceback.format_exc()
         emit("SAMPLE_EXCEPTION_TRACEBACK", record["traceback"])
     finally:
+        cleanup_started = time.perf_counter()
         if run_id is not None and not destroyed:
             try:
                 await controller.cancel_run(run_id, reason="sample_cleanup")
@@ -1944,8 +2321,30 @@ async def _run_one_sample(
                 record.setdefault("cleanup_errors", []).append(
                     f"destroy_run:{type(exc).__name__}:{exc}"
                 )
+        if "destroy_ms" not in latency_metrics and cleanup_started is not None:
+            latency_metrics["cleanup_ms"] = _elapsed_ms(cleanup_started)
         record["finished_at_ms"] = int(time.time() * 1000)
         record["duration_ms"] = int(record["finished_at_ms"]) - started_ms
+        latency_metrics["total_sample_ms"] = _elapsed_ms(sample_started)
+        if client_e2e_started is not None:
+            end = client_e2e_finished or time.perf_counter()
+            client_e2e_ms = max(0, int((end - client_e2e_started) * 1_000))
+            latency_metrics["client_e2e_ms"] = client_e2e_ms
+            model_ms = latency_metrics.get("model_request_ms")
+            if isinstance(model_ms, int):
+                latency_metrics["client_e2e_minus_model_ms"] = (
+                    client_e2e_ms - model_ms
+                )
+        record["latency_metrics"] = latency_metrics
+        data_store_metrics_end = _data_store_metrics_snapshot(controller)
+        record["data_store_metrics"] = {
+            "start": data_store_metrics_start,
+            "end": data_store_metrics_end,
+            "delta": _data_store_metrics_delta(
+                data_store_metrics_start,
+                data_store_metrics_end,
+            ),
+        }
         emit(
             "SAMPLE_RESULT_JSON",
             {
@@ -2079,6 +2478,8 @@ async def run_smoke(args: argparse.Namespace) -> int:
         "objective": "real_qwen_benchmark_workflow_smoke",
         "data_root": str(args.data_root),
         "output_dir": str(output_dir),
+        "inference_backend": str(args.inference_backend),
+        "runtime_backend": "ray",
         "samples_per_workflow": int(args.samples_per_workflow),
         "sample_offset": int(args.sample_offset),
         "tbench_smoke_overrides": bool(args.tbench_smoke_overrides),
@@ -2154,12 +2555,12 @@ async def run_smoke(args: argparse.Namespace) -> int:
 
     if not samples:
         return preflight_failed("sample discovery produced no runnable samples")
+    families_present = {sample.family for sample in samples}
     if not args.python_executable.is_file():
         return preflight_failed(
             f"python executable does not exist: {args.python_executable}"
         )
 
-    families_present = {sample.family for sample in samples}
     required_model_paths: list[Path] = []
     if "text" in families_present:
         required_model_paths.append(args.text_model_path)
@@ -2192,8 +2593,13 @@ async def run_smoke(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        current_modules = check_current_python_modules()
-        service_modules = check_service_python_modules(args.python_executable)
+        module_set = (
+            TRANSFORMERS_LOCAL_MODULES
+            if args.inference_backend == "transformers"
+            else VLLM_MODULES
+        )
+        current_modules = check_current_python_modules(module_set)
+        service_modules = check_service_python_modules(args.python_executable, module_set)
         emit("CURRENT_PYTHON_MODULES_JSON", current_modules)
         emit("SERVICE_PYTHON_MODULES_JSON", service_modules)
         device_adapter = DcmiDeviceAdapter()
@@ -2207,6 +2613,8 @@ async def run_smoke(args: argparse.Namespace) -> int:
         environment = discover_ascend_environment(device_adapter)
         preloads = dict(discover_atb_runtime_library_preloads())
         runtime_paths = discover_aicpu_runtime_library_paths()
+        if args.inference_backend == "transformers":
+            _prepend_env_paths("LD_LIBRARY_PATH", runtime_paths)
         emit("ASCEND_ENVIRONMENT_FINGERPRINT", environment.environment_fingerprint)
         emit(
             "ASCEND_ENVIRONMENT_VERSIONS_JSON",
@@ -2214,9 +2622,9 @@ async def run_smoke(args: argparse.Namespace) -> int:
         )
         emit("ATB_RUNTIME_PRELOADS_JSON", preloads)
         emit("AICPU_RUNTIME_LIBRARY_PATHS_JSON", runtime_paths)
-        if not preloads:
+        if args.inference_backend == "vllm" and not preloads:
             raise SmokePreflightError("ATB runtime preload libmki.so was not found")
-        if not runtime_paths:
+        if args.inference_backend == "vllm" and not runtime_paths:
             raise SmokePreflightError("AICPU runtime library paths were not found")
     except SmokePreflightError as exc:
         return preflight_failed(
@@ -2267,6 +2675,7 @@ async def run_smoke(args: argparse.Namespace) -> int:
                 "FAMILY_START_JSON",
                 {
                     "family": family,
+                    "inference_backend": str(args.inference_backend),
                     "sample_count": len(family_samples),
                     "model_path": str(
                         args.text_model_path
@@ -2306,7 +2715,17 @@ async def run_smoke(args: argparse.Namespace) -> int:
         emit("FINAL_ASCEND_DEVICES_JSON", final_devices)
 
     ports = tuple(range(int(args.first_port), int(args.last_port) + 1))
-    residual = _residual_vllm_processes(required_model_paths, ports)
+    owned_process_group_ids = tuple(
+        int(service["process_group_id"])
+        for summary in summaries
+        for service in summary.get("service_launches", ())
+        if isinstance(service, dict) and "process_group_id" in service
+    )
+    residual = _residual_vllm_processes(
+        required_model_paths,
+        ports,
+        owned_process_group_ids=owned_process_group_ids,
+    )
     emit("FINAL_RESIDUAL_VLLM_PROCESSES_JSON", residual)
     total_failed = sum(int(summary.get("failed", 0)) for summary in summaries)
     total_succeeded = sum(int(summary.get("succeeded", 0)) for summary in summaries)

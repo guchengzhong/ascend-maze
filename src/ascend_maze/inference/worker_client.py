@@ -12,6 +12,10 @@ from ascend_maze.inference.adapters.vllm_ascend import (
     VllmHttpResponse,
     VllmHttpTransport,
 )
+from ascend_maze.inference.adapters.transformers_local import (
+    TransformersLocalGenerationConfig,
+    TransformersLocalGenerationSession,
+)
 from ascend_maze.inference.contracts import (
     ChatRequest,
     ChatResponse,
@@ -38,6 +42,8 @@ def create_worker_inference_client(
         return VllmAscendWorkerClient(request_timeout_ms=config.request_timeout_ms)
     if config.adapter_name == "fake":
         return FakeWorkerInferenceClient(config.adapter_options)
+    if config.adapter_name == "transformers_local":
+        return TransformersLocalWorkerInferenceClient(config.adapter_options)
     raise InferenceCallError(
         "model_adapter_unsupported",
         f"unsupported Worker inference adapter: {config.adapter_name}",
@@ -128,6 +134,119 @@ class FakeWorkerInferenceClient:
 
     async def close(self) -> None:
         return None
+
+
+class TransformersLocalWorkerInferenceClient:
+    def __init__(
+        self,
+        options: FrozenMap[CanonicalValue, CanonicalValue],
+    ) -> None:
+        model_path = options.get("model_path")
+        tokenizer_path = options.get("tokenizer_path")
+        dtype = options.get("dtype")
+        max_model_len = options.get("max_model_len")
+        device_id = options.get("device_id")
+        trust_remote_code = options.get("trust_remote_code", False)
+        enable_thinking = options.get("enable_thinking", False)
+        runtime_library_paths = options.get("runtime_library_paths", ())
+        generation_method = options.get("generation_method", "generate")
+        model_kind = options.get("model_kind", "text")
+        unique_consecutive_workaround = options.get(
+            "qwen2_5_vl_cpu_unique_consecutive_workaround", False
+        )
+        if not isinstance(model_path, str) or not isinstance(tokenizer_path, str):
+            raise InferenceCallError(
+                "model_adapter_config_invalid",
+                "transformers_local model/tokenizer paths are invalid",
+            )
+        if not isinstance(dtype, str) or not isinstance(device_id, str):
+            raise InferenceCallError(
+                "model_adapter_config_invalid",
+                "transformers_local dtype/device are invalid",
+            )
+        if isinstance(max_model_len, bool) or not isinstance(max_model_len, int):
+            raise InferenceCallError(
+                "model_adapter_config_invalid",
+                "transformers_local max_model_len is invalid",
+            )
+        if not isinstance(trust_remote_code, bool) or not isinstance(
+            enable_thinking, bool
+        ):
+            raise InferenceCallError(
+                "model_adapter_config_invalid",
+                "transformers_local boolean options are invalid",
+            )
+        if not isinstance(runtime_library_paths, tuple) or any(
+            not isinstance(item, str) for item in runtime_library_paths
+        ):
+            raise InferenceCallError(
+                "model_adapter_config_invalid",
+                "transformers_local runtime library paths are invalid",
+            )
+        if not isinstance(generation_method, str):
+            raise InferenceCallError(
+                "model_adapter_config_invalid",
+                "transformers_local generation method is invalid",
+            )
+        if not isinstance(model_kind, str):
+            raise InferenceCallError(
+                "model_adapter_config_invalid",
+                "transformers_local model kind is invalid",
+            )
+        if not isinstance(unique_consecutive_workaround, bool):
+            raise InferenceCallError(
+                "model_adapter_config_invalid",
+                "transformers_local Qwen2.5-VL workaround flag is invalid",
+            )
+        self.config = TransformersLocalGenerationConfig(
+            model_path=model_path,
+            tokenizer_path=tokenizer_path,
+            dtype=dtype,
+            max_model_len=max_model_len,
+            device_id=device_id,
+            trust_remote_code=trust_remote_code,
+            enable_thinking=enable_thinking,
+            runtime_library_paths=tuple(
+                item for item in runtime_library_paths if isinstance(item, str)
+            ),
+            generation_method=generation_method,
+            model_kind=model_kind,
+            qwen2_5_vl_cpu_unique_consecutive_workaround=(
+                unique_consecutive_workaround
+            ),
+        )
+        self._generation_session = TransformersLocalGenerationSession(self.config)
+        self._invocation_records: list[dict[str, object]] = []
+
+    async def invoke_chat(
+        self,
+        context: ModelRouteContext,
+        request: ChatRequest,
+    ) -> ChatResponse:
+        response, metrics = await asyncio.to_thread(
+            self._generation_session.generate,
+            request,
+        )
+        self._invocation_records.append(
+            {
+                "adapter": "transformers_local",
+                "route_lease_id": context.route_lease_id,
+                "model_id": context.model_id,
+                "instance_id": context.instance_id,
+                "instance_generation": context.instance_generation,
+                "call_index": len(self._invocation_records) + 1,
+                **metrics,
+            }
+        )
+        return response
+
+    def invocation_records(self) -> tuple[dict[str, object], ...]:
+        return tuple(dict(item) for item in self._invocation_records)
+
+    async def close(self) -> None:
+        cleanup_ms = await asyncio.to_thread(self._generation_session.close)
+        if self._invocation_records:
+            self._invocation_records[-1]["cleanup_ms"] = cleanup_ms
 
 
 def _decode_vllm_response(

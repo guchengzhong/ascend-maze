@@ -271,6 +271,35 @@ class DispatchHandle:
             raise ContractValidationError("attempt must be a positive integer")
 
 
+@dataclass(frozen=True, slots=True, order=True)
+class RuntimeDeviceMapping:
+    physical_device_id: str
+    runtime_visible_device_id: str
+    visible_device_index: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("physical_device_id", "runtime_visible_device_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ContractValidationError(f"{name} is required")
+        if (
+            isinstance(self.visible_device_index, bool)
+            or not isinstance(self.visible_device_index, int)
+            or self.visible_device_index < 0
+        ):
+            raise ContractValidationError(
+                "visible_device_index must be a non-negative integer"
+            )
+
+    @classmethod
+    def identity(cls, physical_device_id: str) -> "RuntimeDeviceMapping":
+        return cls(
+            physical_device_id=physical_device_id,
+            runtime_visible_device_id=physical_device_id,
+            visible_device_index=0,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeNodeBinding:
     node_id: str
@@ -281,6 +310,7 @@ class RuntimeNodeBinding:
     agent_endpoint: str
     producer_id: str
     records_locally: bool = False
+    device_mappings: tuple[RuntimeDeviceMapping, ...] = ()
 
     def __post_init__(self) -> None:
         for name in (
@@ -302,6 +332,32 @@ class RuntimeNodeBinding:
             raise ContractValidationError("runtime_generation must be positive")
         if not isinstance(self.records_locally, bool):
             raise ContractValidationError("records_locally must be a boolean")
+        if not isinstance(self.device_mappings, tuple) or any(
+            not isinstance(item, RuntimeDeviceMapping)
+            for item in self.device_mappings
+        ):
+            raise ContractValidationError(
+                "device_mappings must contain RuntimeDeviceMapping values"
+            )
+        ordered = tuple(
+            sorted(self.device_mappings, key=lambda item: item.physical_device_id)
+        )
+        physical_ids = tuple(item.physical_device_id for item in ordered)
+        if len(physical_ids) != len(set(physical_ids)):
+            raise ContractValidationError(
+                "physical device IDs must be unique in RuntimeNodeBinding"
+            )
+        object.__setattr__(self, "device_mappings", ordered)
+
+    def device_mapping(self, physical_device_id: str) -> RuntimeDeviceMapping:
+        for mapping in self.device_mappings:
+            if mapping.physical_device_id == physical_device_id:
+                return mapping
+        if not self.device_mappings:
+            return RuntimeDeviceMapping.identity(physical_device_id)
+        raise ContractValidationError(
+            f"physical device {physical_device_id!r} is absent from node topology"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +367,7 @@ class DeviceBinding:
     boot_id: str
     runtime_generation: int
     physical_device_id: str
+    runtime_visible_device_id: str
     visible_device_index: int
     environment_variables: FrozenMap[str, str]
 
@@ -320,6 +377,7 @@ class DeviceBinding:
             "node_id",
             "boot_id",
             "physical_device_id",
+            "runtime_visible_device_id",
         ):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ContractValidationError(f"{name} is required")
@@ -329,9 +387,13 @@ class DeviceBinding:
             or self.runtime_generation < 1
         ):
             raise ContractValidationError("runtime_generation must be positive")
-        if self.visible_device_index != 0:
+        if (
+            isinstance(self.visible_device_index, bool)
+            or not isinstance(self.visible_device_index, int)
+            or self.visible_device_index < 0
+        ):
             raise ContractValidationError(
-                "stage-four local NPU workers require visible_device_index=0"
+                "visible_device_index must be a non-negative integer"
             )
         frozen = freeze_canonical(self.environment_variables)
         if not isinstance(frozen, FrozenMap) or any(
@@ -342,9 +404,9 @@ class DeviceBinding:
                 "environment_variables must map strings to strings"
             )
         visible = frozen.get("ASCEND_RT_VISIBLE_DEVICES")
-        if visible != self.physical_device_id:
+        if visible != self.runtime_visible_device_id:
             raise ContractValidationError(
-                "ASCEND_RT_VISIBLE_DEVICES must select the leased physical device"
+                "ASCEND_RT_VISIBLE_DEVICES must select the runtime-visible device"
             )
         object.__setattr__(self, "environment_variables", frozen)
 
@@ -362,15 +424,22 @@ class DeviceBinding:
             raise ContractValidationError(
                 "PlacementLease generation does not match RuntimeNodeBinding"
             )
+        mapping = binding.device_mapping(lease.npu_device_id)
         return cls(
             lease_id=lease.lease_id,
             node_id=lease.node_id,
             boot_id=lease.boot_id,
             runtime_generation=binding.runtime_generation,
             physical_device_id=lease.npu_device_id,
-            visible_device_index=0,
+            runtime_visible_device_id=mapping.runtime_visible_device_id,
+            visible_device_index=mapping.visible_device_index,
             environment_variables=FrozenMap(
-                (("ASCEND_RT_VISIBLE_DEVICES", lease.npu_device_id),)
+                (
+                    (
+                        "ASCEND_RT_VISIBLE_DEVICES",
+                        mapping.runtime_visible_device_id,
+                    ),
+                )
             ),
         )
 

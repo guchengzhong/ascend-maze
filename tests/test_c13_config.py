@@ -214,3 +214,52 @@ def test_complete_model_catalog_is_validated_and_fingerprinted(tmp_path: Path) -
     )
     with pytest.raises(ContractValidationError, match="directory does not exist"):
         load_model_catalog(catalog, environment_fingerprint="e" * 64)
+
+
+def test_model_catalog_accepts_transformers_local_backend(tmp_path: Path) -> None:
+    artifact = tmp_path / "qwen"
+    artifact.mkdir()
+    catalog = tmp_path / "transformers-models.toml"
+    catalog.write_text(
+        "\n".join(
+            (
+                "schema_version = 1",
+                'catalog_revision = "transformers_catalog_1"',
+                "[[models]]",
+                'model_id = "qwen-local"',
+                'artifact_path = "qwen"',
+                'tokenizer_path = "qwen"',
+                'artifact_revision = "artifact_1"',
+                'backend = "transformers_local"',
+                'dtype = "bfloat16"',
+                "tensor_parallel_size = 1",
+                "max_model_len = 10240",
+                "instance_cpu_num = 4",
+                "instance_host_mem_mb = 16384",
+                "weight_hbm_mb = 7500",
+                "runtime_hbm_mb = 4000",
+                "kv_cache_hbm_mb = 22000",
+                "instance_hbm_mb = 36000",
+                "npu_slots = 1",
+                "allow_colocation = false",
+                "request_capacity = 1",
+                'required_capabilities = ["transformers_local"]',
+                "[models.launch_options]",
+                'generation_method = "manual_greedy"',
+                'model_kind = "text"',
+                "request_timeout_ms = 600000",
+                "trust_remote_code = true",
+                "[models.warmup_request]",
+                'prompt = "ready"',
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    document = load_model_catalog(
+        catalog,
+        environment_fingerprint="e" * 64,
+    )
+
+    assert document.specs[0].backend == "transformers_local"
+    assert document.specs[0].launch_options["generation_method"] == "manual_greedy"

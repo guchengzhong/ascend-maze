@@ -8,6 +8,7 @@ import hmac
 import os
 from pathlib import Path
 import stat
+from time import perf_counter
 from typing import Callable
 
 from ascend_maze.api.workflow import Workflow
@@ -20,9 +21,8 @@ from ascend_maze.contracts.submission import (
     SubmissionState,
     hash_session_key,
 )
-from ascend_maze.core.canonical import FrozenMap, canonical_digest, freeze_canonical
+from ascend_maze.core.canonical import FrozenMap, freeze_canonical
 from ascend_maze.core.errors import (
-    CanonicalizationError,
     ContractValidationError,
     DataHandleInvalidError,
     SubmissionAbortedError,
@@ -56,6 +56,7 @@ class InMemoryRuntimeClient:
             shared_filesystem_roots
         )
         self._prepared: dict[str, PreparedSubmission] = {}
+        self.last_prepare_trace: dict[str, object] = {}
 
     def prepare_submission(
         self,
@@ -67,6 +68,9 @@ class InMemoryRuntimeClient:
         run_deadline_ms: int | None = None,
         execution_options: dict[str, object] | None = None,
     ) -> PreparedSubmission:
+        trace_started = perf_counter()
+        trace: dict[str, object] = {}
+        stage_started = perf_counter()
         if isinstance(workflow, Workflow):
             compiled = workflow._compiled or workflow.compile()
             callables_by_definition: dict[str, Callable[..., object]] = {}
@@ -76,15 +80,17 @@ class InMemoryRuntimeClient:
         else:
             compiled = workflow
             callables_by_definition = {}
+        trace["compile_or_resolve_ms"] = _elapsed_ms(stage_started)
+
+        stage_started = perf_counter()
         if set(inputs) != set(compiled.workflow_inputs):
             missing = sorted(set(compiled.workflow_inputs) - set(inputs))
             extra = sorted(set(inputs) - set(compiled.workflow_inputs))
             raise ValueError(f"workflow input mismatch; missing={missing}, extra={extra}")
+        trace["input_validation_ms"] = _elapsed_ms(stage_started)
+
         resolved_submission_id = submission_id or new_id("submission")
-        signature = tuple(
-            (name, self._value_identity(inputs[name]))
-            for name in sorted(inputs)
-        )
+        stage_started = perf_counter()
         frozen_execution_options = freeze_canonical(execution_options or {})
         if not isinstance(frozen_execution_options, FrozenMap):
             raise TypeError("execution_options must freeze to a mapping")
@@ -92,8 +98,17 @@ class InMemoryRuntimeClient:
             run_deadline_ms=run_deadline_ms,
             execution_options=frozen_execution_options,
         )
+        trace["options_ms"] = _elapsed_ms(stage_started)
+        trace["staged_input_count"] = len(inputs)
+
         existing = self._prepared.get(resolved_submission_id)
         if existing is not None:
+            stage_started = perf_counter()
+            signature = tuple(
+                (name, self._source_identity(inputs[name]))
+                for name in sorted(inputs)
+            )
+            trace["input_signature_ms"] = _elapsed_ms(stage_started)
             old = existing.request
             if (
                 old.compiled.workflow_fingerprint != compiled.workflow_fingerprint
@@ -106,10 +121,14 @@ class InMemoryRuntimeClient:
                 raise SubmissionConflictError(
                     "local submission_id is already prepared with another payload"
                 )
+            trace["prepared_cache_hit"] = True
+            trace["total_ms"] = _elapsed_ms(trace_started)
+            self.last_prepare_trace = trace
             return existing
 
         handles: list[tuple[str, DataHandle]] = []
         try:
+            stage_started = perf_counter()
             for name in sorted(inputs):
                 value = inputs[name]
                 if isinstance(value, SharedFileRef):
@@ -119,19 +138,32 @@ class InMemoryRuntimeClient:
                 handles.append(
                     (
                         name,
-                        self.controller.data_store.put_staged(
+                        self.controller.data_store.put_staged_for_submission_input(
                             value, self.controller.data_owner_generation
                         ),
                     )
                 )
+            trace["input_staging_ms"] = _elapsed_ms(stage_started)
         except Exception:
             for _, handle in handles:
                 self.controller.data_store.release(handle)
             raise
+
+        stage_started = perf_counter()
+        signature = tuple(
+            (name, self._source_identity(inputs[name]))
+            for name in sorted(inputs)
+        )
+        trace["input_signature_ms"] = _elapsed_ms(stage_started)
+
+        stage_started = perf_counter()
         identities = tuple(
             run_input_identity(name, inputs[name], handle)
             for name, handle in handles
         )
+        trace["input_identity_ms"] = _elapsed_ms(stage_started)
+
+        stage_started = perf_counter()
         contract = SubmissionContract.create(
             submission_id=resolved_submission_id,
             workflow_fingerprint=compiled.workflow_fingerprint,
@@ -140,18 +172,26 @@ class InMemoryRuntimeClient:
             options=options,
             config_fingerprint=self.controller.config_fingerprint,
         )
+        trace["contract_ms"] = _elapsed_ms(stage_started)
+
+        stage_started = perf_counter()
+        code_packages = build_code_packages(
+            compiled,
+            environment_fingerprint=self.controller.environment_fingerprint,
+            callables_by_definition=callables_by_definition,
+        )
+        trace["code_package_ms"] = _elapsed_ms(stage_started)
         request = SubmitRequest(
             compiled=compiled,
-            code_packages=build_code_packages(
-                compiled,
-                environment_fingerprint=self.controller.environment_fingerprint,
-                callables_by_definition=callables_by_definition,
-            ),
+            code_packages=code_packages,
             workflow_inputs=tuple(handles),
             contract=contract,
         )
         prepared = PreparedSubmission(request=request, input_signature=signature)
         self._prepared[resolved_submission_id] = prepared
+        trace["prepared_cache_hit"] = False
+        trace["total_ms"] = _elapsed_ms(trace_started)
+        self.last_prepare_trace = trace
         return prepared
 
     async def submit_prepared(
@@ -237,7 +277,7 @@ class InMemoryRuntimeClient:
                 pass
 
     @staticmethod
-    def _value_identity(value: object) -> tuple[str, ...]:
+    def _source_identity(value: object) -> tuple[str, ...]:
         if isinstance(value, SharedFileRef):
             return (
                 "shared_file",
@@ -245,15 +285,24 @@ class InMemoryRuntimeClient:
                 value.content_sha256,
                 str(value.size_bytes),
             )
+        return (
+            "object",
+            type(value).__module__,
+            type(value).__qualname__,
+            str(id(value)),
+        )
+
+    def get_submission_status(self, submission_id: str) -> SubmissionOutcome | None:
+        if not isinstance(submission_id, str) or not submission_id:
+            raise ValueError("submission_id is required")
         try:
-            return ("digest", canonical_digest(value))
-        except CanonicalizationError:
-            return (
-                "object",
-                type(value).__module__,
-                type(value).__qualname__,
-                str(id(value)),
-            )
+            return self.controller.submission_outcome(submission_id)
+        except KeyError:
+            return None
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((perf_counter() - started) * 1_000))
 
 
 def validate_shared_file_ref(

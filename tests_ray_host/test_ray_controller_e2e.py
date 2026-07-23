@@ -131,6 +131,32 @@ def test_ray_host_controller_completes_submit_result_destroy_closure(
             assert controller.ray_data_store.staged_count == 0
             assert controller.ray_runtime.active_dispatch_count(outcome.run_id) == 0
 
+            run_events = controller.recorder.events(outcome.run_id)
+            dispatched = {
+                event.task_id: event
+                for event in run_events
+                if event.event_type == "task_dispatched"
+            }
+            assert set(dispatched) == {loaded.task_id, result_task.task_id}
+            assert dispatched[loaded.task_id].payload["node_id"] == "node_a"
+            assert dispatched[loaded.task_id].payload["affinity_hit"] is False
+            assert dispatched[result_task.task_id].payload["node_id"] == "node_a"
+            assert dispatched[result_task.task_id].payload["affinity_hit"] is True
+            for event in dispatched.values():
+                input_refs = event.payload["input_object_refs"]
+                assert len(input_refs) == 1
+                assert input_refs[0]["object_ref_id"]
+                assert input_refs[0]["data_handle_id"]
+            worker_started = [
+                event
+                for event in run_events
+                if event.event_type == "worker_started"
+                and event.producer_id == controller.controller_producer_id
+            ]
+            assert len(worker_started) == 2
+            assert all(event.payload["node_id"] == "node_a" for event in worker_started)
+            assert all(event.payload["worker_pid"] > 0 for event in worker_started)
+
             destroyed = await controller.destroy_run(outcome.run_id)
             repeated = await controller.destroy_run(outcome.run_id)
             assert repeated is destroyed
@@ -393,6 +419,136 @@ def test_node_registration_resource_change_wakes_queued_run(
             assert controller.placement.active_lease_count(outcome.run_id) == 0
             destroyed = await controller.destroy_run(outcome.run_id)
             assert destroyed.flush_result.recording_complete
+        finally:
+            if agent is not None:
+                await agent.close(grace_seconds=0)
+            await controller.close()
+
+    asyncio.run(scenario())
+
+
+def test_ray_host_fanout_reuses_one_shared_output_object_ref(
+    ray_namespace: str,
+) -> None:
+    async def scenario() -> None:
+        @task
+        def initialize(payload: dict[str, object]):
+            return {"backend_data": payload}
+
+        @task
+        def read_left(backend_data: dict[str, object]):
+            return {"left": backend_data["marker"]}
+
+        @task
+        def read_right(backend_data: dict[str, object]):
+            return {"right": backend_data["marker"]}
+
+        controller = RayHostController(
+            cluster_id="cluster_shared_output",
+            authorization_token=b"test-token",
+            ray_namespace=ray_namespace,
+            config_fingerprint=CONFIG,
+            environment_fingerprint=ENVIRONMENT,
+            build_revision="test_build",
+            node_capacities=(_node(),),
+        )
+        agent: NodeAgent | None = None
+        try:
+            await controller.start()
+            identity = NodeAgentIdentity(
+                cluster_id="cluster_shared_output",
+                node_id="node_a",
+                boot_id="boot_1",
+                ray_node_id=ray.get_runtime_context().get_node_id(),
+                agent_generation="agent_shared_output",
+                environment_fingerprint=ENVIRONMENT,
+                producer_id="node_agent:node_a:agent_shared_output",
+            )
+            agent = NodeAgent(
+                identity=identity,
+                authorization_token=b"test-token",
+                heartbeat_interval_ms=50,
+            )
+            await agent.start(controller_endpoint=controller.node_rpc_endpoint)
+
+            workflow = Workflow("ray-shared-output")
+            payload = workflow.input("payload")
+            initialized = workflow.add_task(
+                initialize,
+                inputs={"payload": payload},
+            )
+            left = workflow.add_task(
+                read_left,
+                inputs={"backend_data": initialized.outputs["backend_data"]},
+            )
+            right = workflow.add_task(
+                read_right,
+                inputs={"backend_data": initialized.outputs["backend_data"]},
+            )
+            outcome = await InMemoryRuntimeClient(controller).submit(
+                workflow,
+                inputs={"payload": {"marker": "shared"}},
+                submission_id="submission_shared_output",
+            )
+            assert outcome.run_id is not None
+            terminal = await controller.wait_run(outcome.run_id, timeout_seconds=20)
+            assert terminal.status is RunStatus.SUCCEEDED
+            assert controller.ray_data_store.local_get_count == 0
+
+            run_events = controller.recorder.events(outcome.run_id)
+            dispatched = {
+                event.task_id: event
+                for event in run_events
+                if event.event_type == "task_dispatched"
+            }
+            shared_refs = []
+            for consumer in (left, right):
+                event = dispatched[consumer.task_id]
+                assert event.payload["node_id"] == "node_a"
+                assert event.payload["affinity_hit"] is True
+                inputs = event.payload["input_object_refs"]
+                assert len(inputs) == 1
+                assert inputs[0]["input_name"] == "backend_data"
+                shared_refs.append(
+                    (
+                        inputs[0]["data_handle_id"],
+                        inputs[0]["object_ref_id"],
+                    )
+                )
+            assert shared_refs[0] == shared_refs[1]
+
+            context = controller.indexes.dag_context(outcome.run_id)
+            ref = context.reference
+            backend_handle = context.task_output_handle(
+                initialized.task_id,
+                "backend_data",
+                controller_generation=ref.controller_generation,
+                index_generation=ref.index_generation,
+            )
+            assert shared_refs[0] == (
+                backend_handle.staged_handle_id,
+                backend_handle.metadata["ray_object_ref_id"],
+            )
+            assert controller.result(outcome.run_id, left.task_id) == {
+                "left": "shared"
+            }
+            assert controller.result(outcome.run_id, right.task_id) == {
+                "right": "shared"
+            }
+
+            worker_started = [
+                event
+                for event in run_events
+                if event.event_type == "worker_started"
+                and event.producer_id == controller.controller_producer_id
+            ]
+            assert len(worker_started) == 3
+            assert all(event.payload["node_id"] == "node_a" for event in worker_started)
+            assert all(event.payload["worker_pid"] > 0 for event in worker_started)
+
+            destroyed = await controller.destroy_run(outcome.run_id)
+            assert destroyed.tombstone.destroy_succeeded
+            assert controller.ray_data_store.active_count == 0
         finally:
             if agent is not None:
                 await agent.close(grace_seconds=0)
@@ -811,15 +967,17 @@ def test_ray_submission_response_loss_replays_and_conflict_releases_upload(
             assert controller.ray_data_store.state_of(committed_input) == "adopted"
 
             same_client = InMemoryRuntimeClient(controller)
+            status = same_client.get_submission_status("submission_stable_ray")
+            assert status is not None
+            assert status.run_id == replay.run_id
             redundant = same_client.prepare_submission(
                 workflow,
                 inputs={"value": "first"},
                 submission_id="submission_stable_ray",
             )
             redundant_handle = redundant.request.workflow_inputs[0][1]
-            same_replay = await same_client.submit_prepared(redundant)
-            assert same_replay.replayed
-            assert same_replay.run_id == replay.run_id
+            with pytest.raises(SubmissionConflictError):
+                await same_client.submit_prepared(redundant)
             with pytest.raises(DataHandleInvalidError):
                 controller.ray_data_store.get(redundant_handle)
 

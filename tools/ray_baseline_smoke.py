@@ -4,7 +4,8 @@
 This is an experimental comparison runner, intentionally kept outside
 ``src/ascend_maze``.  It reuses the migrated workflow definitions and sampling
 logic from ``qwen_benchmark_smoke.py``, but executes the compiled DAG through
-ordinary Ray tasks and a Ray actor-owned vLLM-Ascend OpenAI-compatible service.
+ordinary Ray tasks and either a Ray actor-owned vLLM-Ascend service or a
+text-only per-task Transformers cold-load path.
 
 The baseline does not use the Ascend-Maze scheduler, controller, placement
 manager, runtime client or C11 model router.  It is meant to answer a narrower
@@ -57,6 +58,7 @@ import qwen_benchmark_smoke as qwen_smoke  # noqa: E402
 
 RAY_BASELINE_OBJECTIVE = "ray_correctness_baseline"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "experiments" / "ray_baseline_smoke"
+RAY_TASK_MAX_CALLS = 1
 
 
 class RayBaselineError(RuntimeError):
@@ -570,32 +572,146 @@ class _RayActorChatAdapter:
         return ChatResponse(**response)
 
 
+class _RayTransformersChatAdapter:
+    def __init__(self, config: Mapping[str, object]) -> None:
+        from ascend_maze.inference.adapters.transformers_local import (
+            TransformersLocalGenerationConfig,
+            TransformersLocalGenerationSession,
+        )
+
+        generation_config = TransformersLocalGenerationConfig(
+            model_path=str(config["model_path"]),
+            tokenizer_path=str(config.get("tokenizer_path", config["model_path"])),
+            dtype=str(config["dtype"]),
+            max_model_len=int(config["max_model_len"]),
+            device_id=str(config["device_id"]),
+            trust_remote_code=bool(config.get("trust_remote_code", False)),
+            enable_thinking=bool(config.get("enable_thinking", False)),
+            generation_method=str(config.get("generation_method", "generate")),
+            model_kind=str(config.get("model_kind", "text")),
+            qwen2_5_vl_cpu_unique_consecutive_workaround=bool(
+                config.get(
+                    "qwen2_5_vl_cpu_unique_consecutive_workaround",
+                    False,
+                )
+            ),
+            runtime_library_paths=tuple(config.get("runtime_library_paths", ())),
+        )
+        self.session = TransformersLocalGenerationSession(generation_config)
+        self.invocation_records: list[dict[str, object]] = []
+
+    async def invoke_chat(self, context: Any, request: Any) -> Any:
+        from ascend_maze.inference.contracts import InferenceCallError
+
+        try:
+            response, metrics = await asyncio.to_thread(
+                self.session.generate,
+                request,
+            )
+        except InferenceCallError:
+            raise
+        except Exception as exc:
+            raise InferenceCallError(
+                "model_inference_failed",
+                f"Ray baseline transformers call failed: {type(exc).__name__}: {exc}",
+            ) from exc
+        self.invocation_records.append(
+            {
+                "adapter": "ray_baseline_transformers_local",
+                "route_lease_id": context.route_lease_id,
+                "model_id": context.model_id,
+                "instance_id": context.instance_id,
+                "instance_generation": context.instance_generation,
+                "call_index": len(self.invocation_records) + 1,
+                **metrics,
+            }
+        )
+        return response
+
+    async def close(self) -> None:
+        cleanup_ms = await asyncio.to_thread(self.session.close)
+        if self.invocation_records:
+            self.invocation_records[-1]["cleanup_ms"] = cleanup_ms
+
+
 def _execute_workflow_task_remote(
     *,
     task_payload: Mapping[str, object],
     kwargs: Mapping[str, object],
     route_payload: Mapping[str, object] | None,
     service_actor: Any | None,
+    inference_backend: str,
+    transformers_config: Mapping[str, object] | None,
+    dispatch_started_wall_ns: int,
 ) -> dict[str, object]:
     """Run one compiled task in a normal Ray worker process."""
+    import ray
+
+    worker_entry_wall_ns = time.time_ns()
+    task_started_perf = time.perf_counter()
+    worker_startup_ms = max(
+        0, int((worker_entry_wall_ns - dispatch_started_wall_ns) / 1_000_000)
+    )
+    input_started_perf = time.perf_counter()
+    bound_kwargs = dict(kwargs)
+    input_fetch_ms = qwen_smoke._elapsed_ms(input_started_perf)  # noqa: SLF001
     _install_repo_path()
-    started = time.monotonic()
+    callable_started_perf: float | None = None
+    callable_execute_ms = 0
     inference_records: list[dict[str, object]] = []
+    transformers_local_records: list[dict[str, object]] = []
+    transformers_adapter: _RayTransformersChatAdapter | None = None
+    runtime_context = ray.get_runtime_context()
+    worker_node_id = runtime_context.get_node_id()
+    worker_node_ip = ray.util.get_node_ip_address()
+
+    def task_timing(status: str, error_code: str | None) -> dict[str, object]:
+        chat_request_ms = sum(
+            int(item.get("duration_ms", 0))
+            for item in inference_records
+            if isinstance(item.get("duration_ms"), int)
+            and not isinstance(item.get("duration_ms"), bool)
+        )
+        task_total_ms = qwen_smoke._elapsed_ms(task_started_perf)  # noqa: SLF001
+        return {
+            "started_at_ms": worker_entry_wall_ns // 1_000_000,
+            "status": status,
+            "error_code": error_code,
+            "dispatch_prepare_ms": 0,
+            "worker_startup_ms": worker_startup_ms,
+            "worker_startup_scope": "ray_schedule_and_input_materialization",
+            "dispatch_wait_ms": worker_startup_ms,
+            "input_fetch_ms": input_fetch_ms,
+            "input_fetch_scope": "ray_materialized_argument_binding",
+            "callable_execute_ms": callable_execute_ms,
+            "chat_request_ms": chat_request_ms,
+            "callable_minus_chat_ms": max(
+                0, callable_execute_ms - chat_request_ms
+            ),
+            "output_put_ms": 0,
+            "output_put_scope": "computed_by_driver_after_ray_get",
+            "task_total_ms": task_total_ms,
+            "task_runtime_overhead_ms": max(
+                0, task_total_ms - input_fetch_ms - callable_execute_ms
+            ),
+        }
+
     try:
         from ascend_maze.contracts.runtime import ModelRouteLease
         from ascend_maze.inference.context import (
             AttemptInferenceSession,
             install_route_session,
         )
-        from ascend_maze.inference.contracts import InferenceCallError
 
         func = _load_callable(
             str(task_payload["module"]),
             str(task_payload["qualname"]),
         )
         if route_payload is not None:
-            if service_actor is None:
+            if inference_backend == "vllm" and service_actor is None:
                 raise RayBaselineError("model task has no Ray service actor")
+            if inference_backend == "transformers" and transformers_config is None:
+                raise RayBaselineError("model task has no transformers config")
             now_ms = int(time.time() * 1000)
             lease = ModelRouteLease(
                 route_lease_id=str(route_payload["route_lease_id"]),
@@ -606,7 +722,11 @@ def _execute_workflow_task_remote(
                 catalog_revision="ray-baseline",
                 instance_id=str(route_payload["instance_id"]),
                 instance_generation=1,
-                adapter_name="ray_baseline_vllm_openai",
+                adapter_name=(
+                    "ray_baseline_transformers_local"
+                    if inference_backend == "transformers"
+                    else "ray_baseline_vllm_openai"
+                ),
                 endpoint_id=str(route_payload["endpoint_id"]),
                 instance_node_id="ray-local",
                 instance_boot_id="ray-baseline",
@@ -615,19 +735,40 @@ def _execute_workflow_task_remote(
                 dispatch_deadline_ms=now_ms + int(route_payload["deadline_ms"]),
             )
             router = _BaselineRouteRouter()
+            adapter = (
+                _RayTransformersChatAdapter(transformers_config or {})
+                if inference_backend == "transformers"
+                else _RayActorChatAdapter(service_actor)
+            )
+            if isinstance(adapter, _RayTransformersChatAdapter):
+                transformers_adapter = adapter
             session = AttemptInferenceSession(
                 lease=lease,
                 router=router,
-                adapter=_RayActorChatAdapter(service_actor),
+                adapter=adapter,
                 instance_placement_lease_id=f"ray-baseline-placement-{lease.instance_id}",
                 record_sink=lambda record: inference_records.append(asdict(record)),
             )
+            callable_started_perf = time.perf_counter()
             with install_route_session(session):
-                result = func(**dict(kwargs))
+                result = func(**bound_kwargs)
+            callable_execute_ms = qwen_smoke._elapsed_ms(  # noqa: SLF001
+                callable_started_perf
+            )
             inference_summary = asdict(session.summary())
             inference_summary["max_inflight"] = router.max_inflight
+            if transformers_adapter is not None:
+                asyncio.run(transformers_adapter.close())
+                transformers_local_records.extend(
+                    transformers_adapter.invocation_records
+                )
+                transformers_adapter = None
         else:
-            result = func(**dict(kwargs))
+            callable_started_perf = time.perf_counter()
+            result = func(**bound_kwargs)
+            callable_execute_ms = qwen_smoke._elapsed_ms(  # noqa: SLF001
+                callable_started_perf
+            )
             inference_summary = None
         expected_outputs = tuple(str(item) for item in task_payload["expected_outputs"])  # type: ignore[index]
         if not isinstance(result, dict):
@@ -637,28 +778,51 @@ def _execute_workflow_task_remote(
                 "task output names mismatch: "
                 f"expected={sorted(expected_outputs)} actual={sorted(result)}"
             )
+        timing = task_timing("succeeded", None)
         return {
             "status": "succeeded",
             "outputs": result,
             "inference_records": inference_records,
+            "transformers_local_records": transformers_local_records,
             "inference_summary": inference_summary,
-            "duration_ms": max(0, int((time.monotonic() - started) * 1_000)),
+            "duration_ms": timing["task_total_ms"],
             "worker_pid": os.getpid(),
+            "worker_node_id": worker_node_id,
+            "worker_node_ip": worker_node_ip,
+            "task_timing": timing,
         }
     except Exception as exc:
+        if transformers_adapter is not None:
+            try:
+                asyncio.run(transformers_adapter.close())
+            except Exception:
+                pass
+            finally:
+                transformers_local_records.extend(
+                    transformers_adapter.invocation_records
+                )
+        if callable_started_perf is not None and callable_execute_ms == 0:
+            callable_execute_ms = qwen_smoke._elapsed_ms(  # noqa: SLF001
+                callable_started_perf
+            )
         error_code = (
             exc.error_code
             if hasattr(exc, "error_code") and isinstance(exc.error_code, str)
             else "ray_baseline_task_failed"
         )
+        timing = task_timing("failed", error_code)
         return {
             "status": "failed",
             "error_code": error_code,
             "error": f"{type(exc).__name__}: {exc}",
             "traceback": traceback.format_exc(),
             "inference_records": inference_records,
-            "duration_ms": max(0, int((time.monotonic() - started) * 1_000)),
+            "transformers_local_records": transformers_local_records,
+            "duration_ms": timing["task_total_ms"],
             "worker_pid": os.getpid(),
+            "worker_node_id": worker_node_id,
+            "worker_node_ip": worker_node_ip,
+            "task_timing": timing,
         }
 
 
@@ -720,6 +884,8 @@ def _run_one_sample_ray(
     *,
     ray_task: Any,
     service_actor: Any,
+    inference_backend: str,
+    transformers_config: Mapping[str, object] | None,
     sample: Any,
     target_model_id: str,
     run_timeout_seconds: float,
@@ -727,6 +893,7 @@ def _run_one_sample_ray(
 ) -> dict[str, object]:
     import ray
 
+    sample_started = time.perf_counter()
     started_ms = int(time.time() * 1000)
     run_id = (
         "ray-baseline-"
@@ -742,11 +909,16 @@ def _run_one_sample_ray(
         "started_at_ms": started_ms,
         "status": "not_started",
         "executor": "ray_task_actor_sequential_dag",
+        "worker_max_calls": RAY_TASK_MAX_CALLS,
     }
+    latency_metrics: dict[str, object] = {}
+    client_e2e_started: float | None = None
+    client_e2e_finished: float | None = None
     if run_salt is not None:
         record["run_salt"] = run_salt
     outstanding_ref: Any | None = None
     try:
+        stage_started = time.perf_counter()
         workflow, model_aliases = qwen_smoke._build_workflow(  # noqa: SLF001
             sample.dataset,
             sample.workflow,
@@ -761,10 +933,15 @@ def _run_one_sample_ray(
         record["model_aliases"] = model_aliases
         record["task_id_by_name"] = task_id_by_name
         record["topological_order"] = list(compiled.topological_order)
+        latency_metrics["prepare_ms"] = qwen_smoke._elapsed_ms(  # noqa: SLF001
+            stage_started
+        )
 
         task_outputs: dict[str, dict[str, object]] = {}
         task_records: list[dict[str, object]] = []
+        task_timing_records: list[dict[str, object]] = []
         inference_records: list[dict[str, object]] = []
+        transformers_local_records: list[dict[str, object]] = []
         deadline = time.monotonic() + run_timeout_seconds
         emit(
             "RAY_SAMPLE_START_JSON",
@@ -775,6 +952,8 @@ def _run_one_sample_ray(
                 "run_id": run_id,
             },
         )
+        record["client_e2e_started_at_ms"] = int(time.time() * 1_000)
+        client_e2e_started = time.perf_counter()
         for task_id in compiled.topological_order:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -793,18 +972,68 @@ def _run_one_sample_ray(
                     "run_id": run_id,
                     "model_id": node.model_anchor.model,
                     "instance_id": f"ray-baseline-{sample.family}-instance",
-                    "endpoint_id": "ray-actor://vllm",
+                    "endpoint_id": (
+                        "ray-task://transformers-local"
+                        if inference_backend == "transformers"
+                        else "ray-actor://vllm"
+                    ),
                     "deadline_ms": max(1, int(remaining * 1_000)),
                 }
             payload = _task_payload(compiled, node)
+            dispatch_started_wall_ns = time.time_ns()
+            dispatch_started_perf = time.perf_counter()
             outstanding_ref = ray_task.remote(
                 task_payload=payload,
                 kwargs=kwargs,
                 route_payload=route_payload,
                 service_actor=service_actor if route_payload is not None else None,
+                inference_backend=inference_backend,
+                transformers_config=(
+                    transformers_config if route_payload is not None else None
+                ),
+                dispatch_started_wall_ns=dispatch_started_wall_ns,
+            )
+            dispatch_prepare_ms = qwen_smoke._elapsed_ms(  # noqa: SLF001
+                dispatch_started_perf
             )
             result = ray.get(outstanding_ref, timeout=remaining)
+            ray_roundtrip_ms = qwen_smoke._elapsed_ms(  # noqa: SLF001
+                dispatch_started_perf
+            )
             outstanding_ref = None
+            task_timing = dict(result.get("task_timing", {}))
+            task_timing.update(
+                {
+                    "dispatch_id": f"{run_id}-{task_id}",
+                    "run_id": run_id,
+                    "task_id": task_id,
+                    "task_name": node.task_name,
+                    "attempt": 1,
+                    "task_kind": payload["task_kind"],
+                    "execution_target": (
+                        "model_service"
+                        if node.model_anchor is not None
+                        else "local_worker"
+                    ),
+                    "route_lease_id": (
+                        None
+                        if route_payload is None
+                        else route_payload["route_lease_id"]
+                    ),
+                    "dispatch_prepare_ms": dispatch_prepare_ms,
+                    "ray_roundtrip_ms": ray_roundtrip_ms,
+                }
+            )
+            worker_startup_ms = int(task_timing.get("worker_startup_ms", 0))
+            task_total_ms = int(task_timing.get("task_total_ms", 0))
+            task_timing["output_put_ms"] = max(
+                0,
+                ray_roundtrip_ms - worker_startup_ms - task_total_ms,
+            )
+            task_timing["output_put_scope"] = (
+                "ray_result_serialization_and_transfer_upper_bound"
+            )
+            task_timing_records.append(task_timing)
             task_record = {
                 "task_id": task_id,
                 "task_name": node.task_name,
@@ -818,6 +1047,8 @@ def _run_one_sample_ray(
                 "status": result["status"],
                 "duration_ms": result.get("duration_ms"),
                 "worker_pid": result.get("worker_pid"),
+                "worker_node_id": result.get("worker_node_id"),
+                "worker_node_ip": result.get("worker_node_ip"),
                 "inference_summary": result.get("inference_summary"),
             }
             if result["status"] != "succeeded":
@@ -831,13 +1062,27 @@ def _run_one_sample_ray(
             outputs = dict(result["outputs"])
             task_outputs[task_id] = outputs
             task_record["output_names"] = sorted(outputs)
+            task_transformers_records = result.get("transformers_local_records", [])
+            if task_transformers_records:
+                task_record["transformers_local_records"] = task_transformers_records
             task_records.append(task_record)
             inference_records.extend(result.get("inference_records", []))
+            transformers_local_records.extend(task_transformers_records)
         else:
             record["status"] = "succeeded"
+        client_e2e_finished = time.perf_counter()
+        record["client_e2e_finished_at_ms"] = int(time.time() * 1_000)
 
         record["tasks"] = task_records
+        record["task_timing_records"] = task_timing_records
+        record["task_timing_summary"] = qwen_smoke._task_timing_summary(  # noqa: SLF001
+            task_timing_records
+        )
         record["inference_records"] = inference_records
+        record["transformers_local_records"] = transformers_local_records
+        latency_metrics["model_request_ms"] = qwen_smoke._model_request_ms(  # noqa: SLF001
+            inference_records
+        )
         record["task_results"] = {
             compiled.tasks[task_id].task_name: outputs
             for task_id, outputs in sorted(
@@ -858,6 +1103,20 @@ def _run_one_sample_ray(
     finally:
         record["finished_at_ms"] = int(time.time() * 1000)
         record["duration_ms"] = int(record["finished_at_ms"]) - started_ms
+        latency_metrics["total_sample_ms"] = qwen_smoke._elapsed_ms(  # noqa: SLF001
+            sample_started
+        )
+        if client_e2e_started is not None:
+            end = client_e2e_finished or time.perf_counter()
+            record.setdefault("client_e2e_finished_at_ms", int(time.time() * 1_000))
+            client_e2e_ms = max(0, int((end - client_e2e_started) * 1_000))
+            latency_metrics["client_e2e_ms"] = client_e2e_ms
+            model_ms = latency_metrics.get("model_request_ms")
+            if isinstance(model_ms, int):
+                latency_metrics["client_e2e_minus_model_ms"] = (
+                    client_e2e_ms - model_ms
+                )
+        record["latency_metrics"] = latency_metrics
         emit(
             "RAY_SAMPLE_RESULT_JSON",
             {
@@ -890,6 +1149,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--python-executable", type=Path, default=qwen_smoke._default_python())  # noqa: SLF001
     parser.add_argument("--device-id", default="0")
     parser.add_argument(
+        "--inference-backend",
+        choices=("vllm", "transformers"),
+        default="vllm",
+        help=(
+            "Inference backend for model tasks. 'transformers' is a cold-load "
+            "text/vision path that loads the model inside every Ray task chat() call."
+        ),
+    )
+    parser.add_argument(
         "--dataset",
         action="append",
         choices=("gaia", "openagi", "tbench"),
@@ -910,8 +1178,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--samples-per-workflow", type=int, default=1)
     parser.add_argument("--sample-offset", type=int, default=0)
     parser.add_argument("--max-inline-file-bytes", type=int, default=64 * 1024 * 1024)
-    parser.add_argument("--text-max-model-len", type=int, default=4096)
-    parser.add_argument("--vision-max-model-len", type=int, default=4096)
+    parser.add_argument("--text-max-model-len", type=int, default=10240)
+    parser.add_argument("--vision-max-model-len", type=int, default=12288)
     parser.add_argument(
         "--text-dtype",
         choices=("bfloat16", "float16"),
@@ -1021,12 +1289,14 @@ def _build_plan(
         "executor": {
             "kind": "plain_ray_task_actor",
             "dag_policy": "sequential_topological_order",
+            "worker_max_calls": RAY_TASK_MAX_CALLS,
             "uses_ascend_maze_controller": False,
             "uses_ascend_maze_scheduler": False,
             "uses_ascend_maze_runtime_client": False,
         },
         "data_root": str(args.data_root),
         "output_dir": str(output_dir),
+        "inference_backend": str(args.inference_backend),
         "samples_per_workflow": int(args.samples_per_workflow),
         "sample_offset": int(args.sample_offset),
         "samples": [sample.manifest() for sample in samples],
@@ -1105,8 +1375,16 @@ def _run_preflight(
     if "vision" in families_present:
         model_artifacts.append(qwen_smoke.validate_model_artifact(args.vision_model_path))
 
-    current_modules = qwen_smoke.check_current_python_modules()
-    service_modules = qwen_smoke.check_service_python_modules(args.python_executable)
+    module_set = (
+        tuple((*qwen_smoke.TRANSFORMERS_LOCAL_MODULES, "ray"))
+        if args.inference_backend == "transformers"
+        else qwen_smoke.VLLM_MODULES
+    )
+    current_modules = qwen_smoke.check_current_python_modules(module_set)
+    service_modules = qwen_smoke.check_service_python_modules(
+        args.python_executable,
+        module_set,
+    )
 
     from ascend_maze.ascend.discovery import (
         discover_aicpu_runtime_library_paths,
@@ -1120,11 +1398,11 @@ def _run_preflight(
     environment = discover_ascend_environment(device_adapter)
     preloads = dict(discover_atb_runtime_library_preloads())
     runtime_paths = discover_aicpu_runtime_library_paths()
-    if not preloads:
+    if args.inference_backend == "vllm" and not preloads:
         raise qwen_smoke.SmokePreflightError(
             "ATB runtime preload libmki.so was not found"
         )
-    if not runtime_paths:
+    if args.inference_backend == "vllm" and not runtime_paths:
         raise qwen_smoke.SmokePreflightError(
             "AICPU runtime library paths were not found"
         )
@@ -1187,6 +1465,39 @@ def _family_service_config(
     }
 
 
+def _family_transformers_config(
+    *,
+    args: argparse.Namespace,
+    family: str,
+    preflight: Mapping[str, object],
+) -> dict[str, object]:
+    is_vision = family == "vision"
+    model_id = qwen_smoke.VISION_MODEL_ID if is_vision else qwen_smoke.TEXT_MODEL_ID
+    model_path = args.vision_model_path if is_vision else args.text_model_path
+    config: dict[str, object] = {
+        "family": family,
+        "model_id": model_id,
+        "model_path": str(model_path),
+        "tokenizer_path": str(model_path),
+        "device_id": str(args.device_id),
+        "dtype": str(args.vision_dtype if is_vision else args.text_dtype),
+        "generation_method": "manual_greedy",
+        "model_kind": "vision_language" if is_vision else "text",
+        "max_model_len": int(
+            args.vision_max_model_len if is_vision else args.text_max_model_len
+        ),
+        "trust_remote_code": bool(
+            args.vision_trust_remote_code if is_vision else args.text_trust_remote_code
+        ),
+        "enable_thinking": False,
+        "request_timeout_ms": int(args.request_timeout_ms),
+        "runtime_library_paths": tuple(preflight["runtime_library_paths"]),  # type: ignore[arg-type]
+    }
+    if is_vision:
+        config["qwen2_5_vl_cpu_unique_consecutive_workaround"] = True
+    return config
+
+
 def _run_family_ray(
     *,
     args: argparse.Namespace,
@@ -1203,24 +1514,37 @@ def _run_family_ray(
     target_model_id = qwen_smoke.VISION_MODEL_ID if family == "vision" else qwen_smoke.TEXT_MODEL_ID
     records_path = output_dir / f"{family}_records.jsonl"
     failures_path = output_dir / f"{family}_failures.jsonl"
-    service_config = _family_service_config(
-        args=args,
-        output_dir=output_dir,
-        family=family,
-        port=port,
-        preflight=preflight,
+    service_config = (
+        _family_service_config(
+            args=args,
+            output_dir=output_dir,
+            family=family,
+            port=port,
+            preflight=preflight,
+        )
+        if args.inference_backend == "vllm"
+        else None
+    )
+    transformers_config = (
+        _family_transformers_config(args=args, family=family, preflight=preflight)
+        if args.inference_backend == "transformers"
+        else None
     )
     summary: dict[str, object] = {
         "family": family,
+        "inference_backend": str(args.inference_backend),
         "target_model_id": target_model_id,
         "sample_count": len(samples),
         "records_path": str(records_path),
         "failures_path": str(failures_path),
-        "service_config": {
+        "service_config": None
+        if service_config is None
+        else {
             key: value
             for key, value in service_config.items()
             if key not in {"runtime_preloads", "runtime_library_paths"}
         },
+        "transformers_config": transformers_config,
         "status": "not_started",
     }
     service_actor = None
@@ -1228,17 +1552,21 @@ def _run_family_ray(
     failed = 0
     cleanup_errors: list[str] = []
     try:
-        service_actor = service_actor_cls.remote(service_config)
-        start_info = ray.get(
-            service_actor.start.remote(),
-            timeout=int(args.startup_timeout_ms / 1_000) + 60,
-        )
-        summary["service_start"] = start_info
-        emit("RAY_SERVICE_START_JSON", start_info)
+        if args.inference_backend == "vllm":
+            assert service_config is not None
+            service_actor = service_actor_cls.remote(service_config)
+            start_info = ray.get(
+                service_actor.start.remote(),
+                timeout=int(args.startup_timeout_ms / 1_000) + 60,
+            )
+            summary["service_start"] = start_info
+            emit("RAY_SERVICE_START_JSON", start_info)
         for sample in samples:
             record = _run_one_sample_ray(
                 ray_task=ray_task,
                 service_actor=service_actor,
+                inference_backend=str(args.inference_backend),
+                transformers_config=transformers_config,
                 sample=sample,
                 target_model_id=target_model_id,
                 run_timeout_seconds=float(args.run_timeout_seconds),
@@ -1369,6 +1697,12 @@ def run_baseline(args: argparse.Namespace) -> int:
         emit("RAY_BASELINE_RESULT", "check_only_succeeded")
         return 0
 
+    if args.inference_backend == "transformers":
+        qwen_smoke._prepend_env_paths(  # noqa: SLF001
+            "LD_LIBRARY_PATH",
+            tuple(preflight["runtime_library_paths"]),  # type: ignore[arg-type]
+        )
+
     import ray
 
     summaries: list[dict[str, object]] = []
@@ -1389,11 +1723,19 @@ def run_baseline(args: argparse.Namespace) -> int:
             runtime_env={
                 "env_vars": {
                     "PYTHONPATH": os.environ["PYTHONPATH"],
+                    "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
                 }
             },
         )
-        service_actor_cls = ray.remote(num_cpus=0)(_VllmServiceActor)
-        ray_task = ray.remote(num_cpus=float(args.ray_task_num_cpus))(
+        service_actor_cls = (
+            ray.remote(num_cpus=0)(_VllmServiceActor)
+            if args.inference_backend == "vllm"
+            else None
+        )
+        ray_task = ray.remote(
+            num_cpus=float(args.ray_task_num_cpus),
+            max_calls=RAY_TASK_MAX_CALLS,
+        )(
             _execute_workflow_task_remote
         )
         port_by_family = {"text": int(args.first_port), "vision": int(args.first_port) + 1}
@@ -1407,6 +1749,7 @@ def run_baseline(args: argparse.Namespace) -> int:
                 "RAY_FAMILY_START_JSON",
                 {
                     "family": family,
+                    "inference_backend": str(args.inference_backend),
                     "sample_count": len(family_samples),
                     "model_path": str(
                         args.vision_model_path
@@ -1436,9 +1779,16 @@ def run_baseline(args: argparse.Namespace) -> int:
         except Exception as exc:
             cleanup_errors.append(f"ray_shutdown:{type(exc).__name__}:{exc}")
 
+    owned_process_group_ids = tuple(
+        int(service_start["pid"])
+        for summary in summaries
+        if isinstance((service_start := summary.get("service_start")), dict)
+        and service_start.get("pid") is not None
+    )
     residual = qwen_smoke._residual_vllm_processes(  # noqa: SLF001
         required_model_paths,
         tuple(range(int(args.first_port), int(args.last_port) + 1)),
+        owned_process_group_ids=owned_process_group_ids,
     )
     emit("RAY_FINAL_RESIDUAL_VLLM_PROCESSES_JSON", residual)
     total_failed = sum(int(summary.get("failed", 0)) for summary in summaries)

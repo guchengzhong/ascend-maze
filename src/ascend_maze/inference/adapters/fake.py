@@ -109,7 +109,9 @@ class FakeInferenceEngineAdapter:
         spec: ModelSpec,
         *,
         instance_placement_lease_id: str,
+        npu_device_id: str,
     ) -> InferenceWorkerConfig:
+        del npu_device_id
         plan = self._plan(spec.model_id)
         prefix = spec.launch_options.get("response_prefix", spec.model_id)
         assert isinstance(prefix, str)

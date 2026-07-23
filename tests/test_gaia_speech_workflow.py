@@ -28,20 +28,15 @@ def test_gaia_speech_workflow_runs_with_fake_inference(tmp_path) -> None:
             "question": "What color does the speaker mention?",
             "answer": "blue",
             "supplementary_files": {"clip.wav": _tiny_wav_bytes()},
-            "metadata": {
-                "transcript_override": "The speaker says blue.",
-                "qwen_output_override": "FINAL ANSWER: blue",
-                "deepseek_output_override": "FINAL ANSWER: blue",
-                "fuse_output_override": "FINAL ANSWER: blue",
-            },
+            "metadata": {},
         },
     )
 
     prepared = results["task1_speech_process"]
     assert prepared["audio_features"]["sample_rate"] == 16_000  # type: ignore[index]
     transcribed = results["task2_speech_process"]
-    assert transcribed["processed_content"] == "The speaker says blue."
+    assert str(transcribed["processed_content"]).startswith("whisper-large-v3:")
     final = results["task5_llm_fuse_answer"]
-    assert final["final_answer"] == "FINAL ANSWER: blue"
+    assert str(final["final_answer"]).startswith("qwen3-32b:")
     assert invoke_count == 4
     assert request_count == 4

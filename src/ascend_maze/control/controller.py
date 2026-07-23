@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import hashlib
+from time import perf_counter
 from typing import cast
 
 from ascend_maze.compiler.ir import CompiledWorkflow
@@ -168,6 +169,7 @@ class InMemoryController:
         self.config_fingerprint = config_fingerprint
         self.environment_fingerprint = environment_fingerprint
         self.build_revision = build_revision
+        self.last_submit_trace: dict[str, object] = {}
         self.cluster_id = cluster_id
         self.controller_generation = controller_generation or new_id("controller")
         self.clock = clock or SystemClock()
@@ -719,32 +721,49 @@ class InMemoryController:
         *,
         lose_response_after_commit: bool = False,
     ) -> SubmissionOutcome:
+        trace_started = perf_counter()
+        trace: dict[str, object] = {
+            "submission_id": request.contract.submission_id,
+            "state": "started",
+        }
         if not self._started:
             raise RuntimeError("controller is not started")
+        stage_started = perf_counter()
         await self._assert_current_generation()
+        trace["assert_generation_before_lock_ms"] = _elapsed_ms(stage_started)
         contract = request.contract
+        stage_started = perf_counter()
         async with self._submit_lock:
+            trace["lock_wait_ms"] = _elapsed_ms(stage_started)
+            stage_started = perf_counter()
             if self._lifecycle_state is not ControllerLifecycleState.READY:
                 raise StateTransitionError(
                     f"controller is {self._lifecycle_state.value}; submissions are closed"
                 )
             await self._assert_current_generation()
+            trace["ready_and_generation_check_ms"] = _elapsed_ms(stage_started)
+            stage_started = perf_counter()
             existing = self._submissions.get(contract.submission_id)
+            trace["existing_lookup_ms"] = _elapsed_ms(stage_started)
             if existing is not None:
                 if existing.payload_hash != contract.submission_payload_hash:
                     raise SubmissionConflictError(
                         "submission_id already exists with a different payload"
                     )
                 if existing.state is SubmissionState.COMMITTED:
-                    return SubmissionOutcome(
+                    outcome = SubmissionOutcome(
                         submission_id=contract.submission_id,
                         state=existing.state,
                         run_id=existing.run_id,
                         submission_payload_hash=existing.payload_hash,
                         replayed=True,
                     )
+                    trace["state"] = "replayed_committed"
+                    trace["total_ms"] = _elapsed_ms(trace_started)
+                    self.last_submit_trace = trace
+                    return outcome
                 if existing.state is SubmissionState.ABORTED:
-                    return SubmissionOutcome(
+                    outcome = SubmissionOutcome(
                         submission_id=contract.submission_id,
                         state=existing.state,
                         run_id=None,
@@ -752,22 +771,35 @@ class InMemoryController:
                         replayed=True,
                         error=existing.error,
                     )
+                    trace["state"] = "replayed_aborted"
+                    trace["total_ms"] = _elapsed_ms(trace_started)
+                    self.last_submit_trace = trace
+                    return outcome
                 raise RuntimeError("submission is unexpectedly still PREPARING")
 
+            stage_started = perf_counter()
             record = _SubmissionRecord(
                 payload_hash=contract.submission_payload_hash,
                 state=SubmissionState.PREPARING,
                 request=request,
             )
             self._submissions[contract.submission_id] = record
+            trace["preparing_record_ms"] = _elapsed_ms(stage_started)
+            stage_started = perf_counter()
             await self._save_checkpoint()
+            trace["preparing_checkpoint_ms"] = _elapsed_ms(stage_started)
             code_handles: tuple[CodeHandle, ...] = ()
             provisional_run_id: str | None = None
             recording_open = False
             try:
+                stage_started = perf_counter()
                 self._validate_request(request)
+                trace["validate_request_ms"] = _elapsed_ms(stage_started)
+                stage_started = perf_counter()
                 code_handles = await self.runtime.prepare(request.code_packages)
+                trace["runtime_prepare_ms"] = _elapsed_ms(stage_started)
                 self._maybe_fail("after_prepare")
+                stage_started = perf_counter()
                 provisional_run_id = new_id("run")
                 recording_context = RunRecordingContext(
                     schema_version=1,
@@ -780,16 +812,22 @@ class InMemoryController:
                     started_wall_time_ms=self.clock.wall_ms(),
                     initial_expected_producer_ids=(self.controller_producer_id,),
                 )
+                trace["recording_context_ms"] = _elapsed_ms(stage_started)
+                stage_started = perf_counter()
                 self.recorder.open_run(recording_context)
                 recording_open = True
+                trace["recording_open_ms"] = _elapsed_ms(stage_started)
                 self._maybe_fail("after_open_run")
                 self._maybe_fail("before_commit")
+                stage_started = perf_counter()
                 submitted_at = self.clock.monotonic_ms()
                 deadline_at = (
                     None
                     if contract.options.run_deadline_ms is None
                     else submitted_at + contract.options.run_deadline_ms
                 )
+                trace["deadline_compute_ms"] = _elapsed_ms(stage_started)
+                stage_started = perf_counter()
                 await self.core.commit_run(
                     run_id=provisional_run_id,
                     submission_id=contract.submission_id,
@@ -801,14 +839,25 @@ class InMemoryController:
                     deadline_at_ms=deadline_at,
                     recording_context=recording_context,
                 )
+                trace["commit_run_ms"] = _elapsed_ms(stage_started)
             except Exception as exc:
                 if code_handles:
+                    stage_started = perf_counter()
                     await self.runtime.release_code(code_handles)
+                    trace["abort_release_code_ms"] = _elapsed_ms(stage_started)
                 if recording_open and provisional_run_id is not None:
+                    stage_started = perf_counter()
                     self.recorder.abort_run(provisional_run_id)
+                    trace["abort_recording_ms"] = _elapsed_ms(stage_started)
                 record.state = SubmissionState.ABORTED
                 record.error = f"{type(exc).__name__}: {exc}"
+                stage_started = perf_counter()
                 await self._save_checkpoint()
+                trace["abort_checkpoint_ms"] = _elapsed_ms(stage_started)
+                trace["state"] = "aborted"
+                trace["error"] = record.error
+                trace["total_ms"] = _elapsed_ms(trace_started)
+                self.last_submit_trace = trace
                 return SubmissionOutcome(
                     submission_id=contract.submission_id,
                     state=SubmissionState.ABORTED,
@@ -819,9 +868,11 @@ class InMemoryController:
                 )
 
             self._maybe_fail("after_commit")
+            stage_started = perf_counter()
             record.state = SubmissionState.COMMITTED
             record.run_id = provisional_run_id
             await self._save_checkpoint()
+            trace["committed_checkpoint_ms"] = _elapsed_ms(stage_started)
             outcome = SubmissionOutcome(
                 submission_id=contract.submission_id,
                 state=SubmissionState.COMMITTED,
@@ -829,6 +880,10 @@ class InMemoryController:
                 submission_payload_hash=contract.submission_payload_hash,
                 replayed=False,
             )
+            trace["state"] = "committed"
+            trace["run_id"] = provisional_run_id
+            trace["total_ms"] = _elapsed_ms(trace_started)
+            self.last_submit_trace = trace
             if lose_response_after_commit:
                 raise ResponseLostError(
                     "submission committed but its response was intentionally lost"
@@ -1472,3 +1527,7 @@ class InMemoryController:
         tasks = tuple(self._checkpoint_tasks)
         if tasks:
             await asyncio.gather(*tasks)
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((perf_counter() - started) * 1_000))

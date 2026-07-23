@@ -213,6 +213,9 @@ def test_protocols_are_runtime_checkable() -> None:
         def put_staged(self, value, owner_generation):
             return DataHandle(owner_generation, "handle")
 
+        def put_staged_for_submission_input(self, value, owner_generation):
+            return DataHandle(owner_generation, "submission-handle")
+
         def get(self, handle):
             return None
 

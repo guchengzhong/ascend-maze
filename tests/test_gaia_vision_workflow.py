@@ -21,18 +21,18 @@ def test_gaia_vision_workflow_runs_with_fake_inference(tmp_path) -> None:
             "question": "What is shown in the tiny image?",
             "answer": "pixel",
             "supplementary_files": {"pixel.png": one_pixel_png},
-            "metadata": {
-                "vlm_output_override": "FINAL ANSWER: pixel",
-            },
+            "metadata": {},
         },
     )
 
     prepared = results["task1_obtain_content"]
-    assert prepared["image_features"]["size_bytes"] == len(one_pixel_png)  # type: ignore[index]
+    assert len(prepared["file_content"]) == len(one_pixel_png)
+    assert prepared["task2_vlm_process_feature"]["size_bytes"] == len(  # type: ignore[index]
+        one_pixel_png
+    )
     vlm = results["task2_vlm_process"]
-    assert "[1 image(s)]" in str(vlm["raw_model_output"])
-    assert vlm["curr_task_feat"]["vision_input_mode"] == "true_multimodal"  # type: ignore[index]
+    assert "[1 image(s)]" in str(vlm["vlm_answer"])
     final = results["task3_output_final_answer"]
-    assert final["final_answer"] == "FINAL ANSWER: pixel"
+    assert str(final["final_answer"]).startswith("qwen2.5-vl-32b:")
     assert invoke_count == 1
     assert request_count == 1

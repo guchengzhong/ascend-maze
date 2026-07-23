@@ -85,7 +85,7 @@ def test_retail_cancel_workflow_runs_with_fake_inference(tmp_path) -> None:
                 outcome.run_id,
                 task_id_by_name["task2_execute_cancel"],
             )
-            order = executed["backend_data"]["orders"]["#ORDER-1"]  # type: ignore[index]
+            order = executed["affected_orders"][0]  # type: ignore[index]
             assert order["status"] == "cancelled"
             assert order["cancel_reason"] == "no longer needed"
             assert order["payment_history"][1] == {
@@ -93,8 +93,8 @@ def test_retail_cancel_workflow_runs_with_fake_inference(tmp_path) -> None:
                 "amount": 12.5,
                 "payment_method_id": "gift_card_1",
             }
-            user = executed["backend_data"]["users"]["user_1"]  # type: ignore[index]
-            assert user["payment_methods"]["gift_card_1"]["balance"] == 17.5
+            payment_methods = executed["affected_user_payment_methods"]["user_1"]  # type: ignore[index]
+            assert payment_methods["gift_card_1"]["balance"] == 17.5
 
             final = controller.result(
                 outcome.run_id,

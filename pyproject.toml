@@ -92,6 +92,12 @@ module = [
     "tomli",
     "tomllib",
     "cloudpickle",
+    "torch",
+    "torch.*",
+    "torch_npu",
+    "torch_npu.*",
+    "transformers",
+    "transformers.*",
 ]
 ignore_missing_imports = true
 

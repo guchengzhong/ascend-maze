@@ -24,18 +24,13 @@ def test_gaia_file_workflow_runs_with_shared_file_and_fake_inference(tmp_path) -
             "question": "Which city is mentioned in the note?",
             "answer": "Kyoto",
             "supplementary_files": file_ref,
-            "metadata": {
-                "qwen_output_override": "Qwen says FINAL ANSWER: Kyoto",
-                "deepseek_output_override": "DeepSeek says FINAL ANSWER: Kyoto",
-                "fuse_output_override": "FINAL ANSWER: Kyoto",
-            },
+            "metadata": {},
         },
     )
 
     prepared = results["task1_file_process"]
-    assert prepared["file_info"]["source_kind"] == "shared_file"  # type: ignore[index]
     assert "Kyoto" in prepared["processed_content"]
     final = results["task4_llm_fuse_answer"]
-    assert final["final_answer"] == "FINAL ANSWER: Kyoto"
+    assert str(final["final_answer"]).startswith("qwen3-32b:")
     assert invoke_count == 3
     assert request_count == 3

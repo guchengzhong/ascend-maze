@@ -87,7 +87,7 @@ def task1_llm_process1(
 
     response = chat(
         [{"role": "user", "content": prompt}],
-        max_tokens=768,
+        max_tokens=4096,
         temperature=0.0,
     )
     override = metadata.get("cancel_extract_output_override")
@@ -110,7 +110,6 @@ def task1_llm_process1(
         "llm_output": llm_output,
         "raw_model_output": response.text,
         "cancel_request": cancel_request,
-        "backend_data": backend_data,
         "metadata": metadata,
         "curr_task_feat": features,
     }
@@ -135,7 +134,6 @@ def task2_get_user_and_reservation_details(
     return {
         "dag_id": dag_id,
         "instruction": instruction,
-        "backend_data": backend_data,
         "metadata": metadata,
         "cancel_request": cancel_request,
         "user_lookup": user_lookup,
@@ -169,7 +167,6 @@ def task3_cancel_reservation(
     return {
         "dag_id": dag_id,
         "instruction": instruction,
-        "backend_data": backend_data,
         "metadata": metadata,
         "cancel_request": cancel_request,
         "user_lookup": user_lookup,
@@ -200,7 +197,6 @@ def task4_search_new_flights(
     return {
         "dag_id": dag_id,
         "instruction": instruction,
-        "backend_data": backend_data,
         "metadata": metadata,
         "cancel_request": cancel_request,
         "user_lookup": user_lookup,
@@ -215,7 +211,6 @@ def task4_search_new_flights(
 @task(task_kind="npu", resources={"cpu_num": 1, "mem": 512}, max_retries=0)
 def task5_llm_process2(
     dag_id: str,
-    backend_data: dict[str, object],
     metadata: dict[str, object],
     cancel_request: dict[str, object],
     user_lookup: dict[str, object],
@@ -228,7 +223,7 @@ def task5_llm_process2(
 
     response = chat(
         [{"role": "user", "content": prompt}],
-        max_tokens=512,
+        max_tokens=4096,
         temperature=0.0,
     )
     override = metadata.get("flight_selection_output_override")
@@ -250,7 +245,6 @@ def task5_llm_process2(
         "dag_id": dag_id,
         "llm_output": llm_output,
         "raw_model_output": response.text,
-        "backend_data": backend_data,
         "cancel_request": cancel_request,
         "cancel_result": cancel_result,
         "selected_flights": selected_flights,
@@ -280,16 +274,25 @@ def task6_book_new_reservation(
         return_flights,
         user_details,
     )
+    affected_user_reservations = []
+    user_id = str(cancel_request.get("user_id", ""))
+    users = backend_data.get("users", {})
+    if isinstance(users, dict):
+        user = users.get(user_id)
+        if isinstance(user, dict):
+            reservations = user.get("reservations", [])
+            if isinstance(reservations, list):
+                affected_user_reservations = reservations
     return {
         "dag_id": dag_id,
         "status": booking_result.get("status", "error"),
-        "backend_data": backend_data,
         "cancel_result": cancel_result,
         "booking_result": booking_result,
         "result": {
             "cancel_result": cancel_result,
             "booking_result": booking_result,
         },
+        "affected_user_reservations": affected_user_reservations,
     }
 
 
@@ -330,7 +333,7 @@ def build() -> Workflow:
         inputs={
             "dag_id": extracted.outputs["dag_id"],
             "instruction": extracted.outputs["instruction"],
-            "backend_data": extracted.outputs["backend_data"],
+            "backend_data": initialized.outputs["backend_data"],
             "metadata": extracted.outputs["metadata"],
             "cancel_request": extracted.outputs["cancel_request"],
         },
@@ -341,7 +344,7 @@ def build() -> Workflow:
         inputs={
             "dag_id": details.outputs["dag_id"],
             "instruction": details.outputs["instruction"],
-            "backend_data": details.outputs["backend_data"],
+            "backend_data": initialized.outputs["backend_data"],
             "metadata": details.outputs["metadata"],
             "cancel_request": details.outputs["cancel_request"],
             "user_lookup": details.outputs["user_lookup"],
@@ -354,7 +357,7 @@ def build() -> Workflow:
         inputs={
             "dag_id": cancelled.outputs["dag_id"],
             "instruction": cancelled.outputs["instruction"],
-            "backend_data": cancelled.outputs["backend_data"],
+            "backend_data": initialized.outputs["backend_data"],
             "metadata": cancelled.outputs["metadata"],
             "cancel_request": cancelled.outputs["cancel_request"],
             "user_lookup": cancelled.outputs["user_lookup"],
@@ -367,7 +370,6 @@ def build() -> Workflow:
         model_anchor={"model": "qwen3-32b", "mode": "service"},
         inputs={
             "dag_id": searched.outputs["dag_id"],
-            "backend_data": searched.outputs["backend_data"],
             "metadata": searched.outputs["metadata"],
             "cancel_request": searched.outputs["cancel_request"],
             "user_lookup": searched.outputs["user_lookup"],
@@ -382,7 +384,7 @@ def build() -> Workflow:
         task_name="task6_book_new_reservation",
         inputs={
             "dag_id": selected.outputs["dag_id"],
-            "backend_data": selected.outputs["backend_data"],
+            "backend_data": initialized.outputs["backend_data"],
             "cancel_request": selected.outputs["cancel_request"],
             "cancel_result": selected.outputs["cancel_result"],
             "selected_flights": selected.outputs["selected_flights"],

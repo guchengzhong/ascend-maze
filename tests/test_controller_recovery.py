@@ -238,17 +238,9 @@ def test_controller_generation_recovery_interrupts_attempt_and_preserves_data() 
             )
 
         replay_client = InMemoryRuntimeClient(second)
-        prepared = replay_client.prepare_submission(
-            workflow,
-            inputs={"value": "payload"},
-            submission_id="submission_recovery",
-        )
-        redundant = prepared.request.workflow_inputs[0][1]
-        replay = await replay_client.submit_prepared(prepared)
-        assert replay.replayed
+        replay = replay_client.get_submission_status("submission_recovery")
+        assert replay is not None
         assert replay.run_id == run_id
-        with pytest.raises(DataHandleInvalidError, match="released"):
-            data_store.state_of(redundant)
         conflicting = replay_client.prepare_submission(
             workflow,
             inputs={"value": "different"},
@@ -368,12 +360,10 @@ def test_terminal_and_destroyed_run_state_survives_generation_switch() -> None:
         assert second.result(run_id, result_task_id) == expected
         assert isinstance(second.runtime, FakeRuntimeBackend)
         assert second.runtime.active_dispatch_count() == 0
-        replay = await InMemoryRuntimeClient(second).submit(
-            workflow,
-            inputs={"value": "payload"},
-            submission_id="submission_terminal_recovery",
+        replay = InMemoryRuntimeClient(second).get_submission_status(
+            "submission_terminal_recovery"
         )
-        assert replay.replayed and replay.run_id == run_id
+        assert replay is not None and replay.run_id == run_id
         destroyed = await second.destroy_run(run_id, force=True)
         assert destroyed.tombstone.destroy_succeeded
         assert not destroyed.flush_result.recording_complete

@@ -25,13 +25,13 @@ GAIA_FINAL_ANSWER_RULES = (
     "ANSWER: [YOUR FINAL ANSWER].\n"
     "YOUR FINAL ANSWER should be a number OR as few words as possible OR a "
     "comma separated list of numbers and/or strings.\n"
-    "If you are asked for a number, do not use comma to write your number and "
-    "do not use units such as $ or percent sign unless specified otherwise.\n"
-    "If you are asked for a string, do not use articles, neither abbreviations "
+    "If you are asked for a number, don’t use comma to write your number neither "
+    "use units such as $ or percent sign unless specified otherwise.\n"
+    "If you are asked for a string, don’t use articles, neither abbreviations "
     "(e.g. for cities), and write the digits in plain text unless specified "
     "otherwise.\n"
-    "If you are asked for a comma separated list, apply the above rules "
-    "depending on whether each element is a number or a string."
+    "If you are asked for a comma separated list, apply the above rules depending "
+    "of whether the element to be put in the list is a number or a string."
 )
 
 
@@ -58,6 +58,26 @@ def text_features(text: str, *, reason: int | None = None) -> dict[str, object]:
     if reason is not None:
         features["reason"] = reason
     return features
+
+
+def empty_time_record() -> dict[str, object]:
+    return {
+        "get_time": 0.0,
+        "put_size_bytes": 0,
+        "get_size_bytes": 0,
+    }
+
+
+def model_runtime_inputs(api_parameter: str) -> dict[str, object]:
+    return {
+        "use_online_model": False,
+        "model_folder": "",
+        "temperature": 0.0,
+        "max_tokens": 4096,
+        "top_p": 0.9,
+        "repetition_penalty": 1.1,
+        api_parameter: "",
+    }
 
 
 def inference_features(
@@ -219,6 +239,10 @@ def summarize_image_file(supplementary_files: object) -> dict[str, object]:
     }
 
 
+def gaia_initial_prompt(question: str) -> str:
+    return f"{GAIA_FINAL_ANSWER_RULES}\nQuestion: {question}"
+
+
 def gaia_question_prompt(question: str, extracted_label: str, extracted_text: str) -> str:
     prompt = (
         "#Background#\n"
@@ -237,12 +261,20 @@ def gaia_deepseek_prompt(
 ) -> str:
     prompt = (
         "#Background#\n"
-        "You are a general AI assistant. I will ask you a question. Report "
-        "your concise thinking thoughts and do not think too complicated, and "
-        "finish your answer with the following template: FINAL ANSWER: [YOUR "
-        "FINAL ANSWER].\n"
+        "You are a general AI assistant. I will ask you a question. Report your "
+        "concise thinking thoughts and don't think too complicated, and finish "
+        "your answer with the following template: FINAL ANSWER: [YOUR FINAL "
+        "ANSWER].\n"
         "YOUR FINAL ANSWER should be a number OR as few words as possible OR a "
         "comma separated list of numbers and/or strings.\n"
+        "If you are asked for a number, don’t use comma to write your number "
+        "neither use units such as $ or percent sign unless specified otherwise.\n"
+        "If you are asked for a string, don’t use articles, neither abbreviations "
+        "(e.g. for cities), and write the digits in plain text unless specified "
+        "otherwise.\n"
+        "If you are asked for a comma separated list, apply the above rules "
+        "depending of whether the element to be put in the list is a number or a "
+        "string.\n"
         f"#Question#\n{question}\n"
     )
     if extracted_label:
@@ -281,15 +313,8 @@ def speech_transcription_prompt(
 
 
 def vision_prompt(question: str, image_features: dict[str, object]) -> str:
-    return (
-        "#Background#\n"
-        f"{GAIA_FINAL_ANSWER_RULES}\n"
-        "The user supplied an explicit supplementary image. Inspect the "
-        "attached image directly; the metadata below is only diagnostic "
-        "context and must not replace visual reasoning.\n"
-        f"#Question#\n{question}\n"
-        f"#Image metadata#\n{json.dumps(image_features, sort_keys=True)}"
-    )
+    del image_features
+    return gaia_question_prompt(question, "", "")
 
 
 def vision_content_parts(

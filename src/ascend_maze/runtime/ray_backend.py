@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import inspect
-from typing import Any
+from typing import Any, cast
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -28,6 +28,7 @@ from ascend_maze.contracts.runtime import (
 )
 from ascend_maze.contracts.worker import WorkerLease
 from ascend_maze.core.errors import ContractValidationError
+from ascend_maze.core.canonical import FrozenMap
 from ascend_maze.core.identifiers import stable_id
 from ascend_maze.core.time import monotonic_time_ms
 from ascend_maze.data.ray_store import RayDataStore
@@ -35,10 +36,15 @@ from ascend_maze.runtime.events import RuntimeEvent, RuntimeEventKind
 from ascend_maze.runtime.code_loader import load_code_package
 from ascend_maze.runtime.ray_node_registry import RayNodeRegistry
 from ascend_maze.runtime.ray_cluster import validate_ray_version
-from ascend_maze.runtime.ray_worker import RAY_ONE_SHOT_WORKER, RayWorkerOutcome
+from ascend_maze.runtime.ray_worker import (
+    RAY_ONE_SHOT_WORKER,
+    RayWorkerOutcome,
+    ray_data_argument_keyword,
+)
 from ascend_maze.runtime.worker_broker import ColdWorkerBroker
 from ascend_maze.runtime.worker_pool import StandbyWorkerBroker
 from ascend_maze.inference.coordinator import InferenceCoordinator
+from ascend_maze.inference.contracts import InferenceWorkerConfig
 
 from ascend_maze.control.node_rpc import (
     NodeAgentIdentity,
@@ -62,9 +68,12 @@ class _DispatchRecord:
     binding: RuntimeNodeBinding
     worker_lease: WorkerLease
     handle: DispatchHandle
+    dispatch_started_at_ms: int
+    ray_submitted_at_ms: int | None
     object_ref: Any | None
     monitor: asyncio.Task[None] | None
     worker_started_event: RuntimeEvent | None = None
+    worker_started_received_at_ms: int | None = None
     cancel_requested: bool = False
     invalidated: bool = False
     terminal: bool = False
@@ -72,6 +81,35 @@ class _DispatchRecord:
     node_terminal_event: RuntimeEvent | None = None
     node_terminal_received: asyncio.Event = field(default_factory=asyncio.Event)
     inference_protocol_error: str | None = None
+
+
+def _bind_transformers_local_worker(
+    config: InferenceWorkerConfig,
+    binding: RuntimeNodeBinding,
+    *,
+    physical_device_id: str,
+) -> tuple[InferenceWorkerConfig, DeviceBinding]:
+    mapping = binding.device_mapping(physical_device_id)
+    device_binding = DeviceBinding(
+        lease_id=config.instance_placement_lease_id,
+        node_id=binding.node_id,
+        boot_id=binding.boot_id,
+        runtime_generation=binding.runtime_generation,
+        physical_device_id=physical_device_id,
+        runtime_visible_device_id=mapping.runtime_visible_device_id,
+        visible_device_index=mapping.visible_device_index,
+        environment_variables=FrozenMap(
+            (
+                (
+                    "ASCEND_RT_VISIBLE_DEVICES",
+                    mapping.runtime_visible_device_id,
+                ),
+            )
+        ),
+    )
+    options = dict(config.adapter_options.items_tuple())
+    options["device_id"] = mapping.runtime_visible_device_id
+    return replace(config, adapter_options=options), device_binding
 
 
 class RayRuntimeBackend:
@@ -136,6 +174,7 @@ class RayRuntimeBackend:
         ):
             if record.worker_started_event is None:
                 record.worker_started_event = event
+                record.worker_started_received_at_ms = monotonic_time_ms()
             self._emit(event)
             return
         if (
@@ -182,7 +221,9 @@ class RayRuntimeBackend:
                 await asyncio.to_thread(load_code_package, package)
                 code_handle = self._code_handle_for_package(package)
                 package_handle = await asyncio.to_thread(
-                    self.data_store.put_staged, package, self.owner_generation
+                    self.data_store.put_staged_for_code_package,
+                    package,
+                    self.owner_generation,
                 )
                 staged.append(package_handle)
                 prepared.append((package, code_handle, package_handle))
@@ -237,6 +278,7 @@ class RayRuntimeBackend:
             raise ContractValidationError("PlacementLease does not match request")
         if request.environment_fingerprint != self.environment_fingerprint:
             raise ContractValidationError("execution environment mismatch")
+        dispatch_started_at_ms = monotonic_time_ms()
         inference_config = None
         if request.execution_target is ExecutionTarget.MODEL_SERVICE:
             if self.inference is None or request.model_route is None:
@@ -252,6 +294,24 @@ class RayRuntimeBackend:
         code = self._code.get(request.code_handle.definition_id)
         if code is None or code.handle != request.code_handle:
             raise ContractValidationError("CodeHandle is not prepared")
+        data_arguments = tuple(
+            (index, argument)
+            for index, argument in enumerate(request.arguments)
+            if argument.kind == "data_handle"
+        )
+        resolved_refs = await asyncio.to_thread(
+            self.data_store.resolve_refs,
+            (
+                code.package_handle,
+                *(
+                    argument.data_handle
+                    for _, argument in data_arguments
+                    if argument.data_handle is not None
+                ),
+            ),
+        )
+        if len(resolved_refs) != len(data_arguments) + 1:
+            raise RuntimeError("Ray input resolution returned an invalid reference count")
         binding = self.node_registry.resolve_lease(lease)
         worker_lease = await self._maybe_await(
             self.worker_broker.acquire(
@@ -262,7 +322,39 @@ class RayRuntimeBackend:
             )
         )
         device_binding: DeviceBinding | None = None
-        if (
+        transformers_local_service = (
+            request.execution_target is ExecutionTarget.MODEL_SERVICE
+            and inference_config is not None
+            and inference_config.adapter_name == "transformers_local"
+        )
+        if transformers_local_service:
+            assert self.inference is not None
+            assert request.model_route is not None
+            instance = self.inference.instances.snapshot(
+                request.model_route.instance_id
+            )
+            if (
+                instance.generation != request.model_route.instance_generation
+                or instance.node_id != binding.node_id
+                or instance.boot_id != binding.boot_id
+                or instance.npu_device_id is None
+                or instance.placement_lease_id
+                != inference_config.instance_placement_lease_id
+            ):
+                await self._maybe_await(
+                    self.worker_broker.release(
+                        worker_lease.worker_lease_id, disposition="discard"
+                    )
+                )
+                raise ContractValidationError(
+                    "transformers_local model placement does not match Task node"
+                )
+            inference_config, device_binding = _bind_transformers_local_worker(
+                inference_config,
+                binding,
+                physical_device_id=instance.npu_device_id,
+            )
+        elif (
             request.execution_target is ExecutionTarget.LOCAL_WORKER
             and request.task_kind == "npu"
         ):
@@ -314,6 +406,8 @@ class RayRuntimeBackend:
             binding=binding,
             worker_lease=worker_lease,
             handle=handle,
+            dispatch_started_at_ms=dispatch_started_at_ms,
+            ray_submitted_at_ms=None,
             object_ref=None,
             monitor=None,
         )
@@ -328,11 +422,18 @@ class RayRuntimeBackend:
                 agent_identity=identity,
                 controller_generation=self.controller_generation,
                 data_store_descriptor=self.data_store.descriptor,
-                code_package_handle=code.package_handle,
+                code_package=resolved_refs[0],
                 event_timeout_seconds=self.event_timeout_seconds,
                 device_binding=device_binding,
                 inference_config=inference_config,
             )
+            for resolved_index, (argument_index, _) in enumerate(
+                data_arguments, start=1
+            ):
+                worker_kwargs[ray_data_argument_keyword(argument_index)] = (
+                    resolved_refs[resolved_index]
+                )
+            record.ray_submitted_at_ms = monotonic_time_ms()
             if isinstance(self.worker_broker, StandbyWorkerBroker):
                 record.object_ref = self.worker_broker.submit(
                     worker_lease.worker_lease_id,
@@ -608,6 +709,53 @@ class RayRuntimeBackend:
     def worker_started_event(self, dispatch_id: str) -> RuntimeEvent | None:
         record = self._dispatches.get(dispatch_id)
         return None if record is None else record.worker_started_event
+
+    def task_timing_records(
+        self,
+        run_id: str | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        records: list[dict[str, object]] = []
+        for dispatch in self._dispatches.values():
+            if run_id is not None and dispatch.request.run_id != run_id:
+                continue
+            outcome = dispatch.outcome
+            if outcome is None or outcome.task_timing is None:
+                continue
+            item = outcome.task_timing.as_dict()
+            submitted_at_ms = dispatch.ray_submitted_at_ms
+            started_received_at_ms = dispatch.worker_started_received_at_ms
+            item["dispatch_prepare_ms"] = (
+                0
+                if submitted_at_ms is None
+                else max(0, submitted_at_ms - dispatch.dispatch_started_at_ms)
+            )
+            item["worker_startup_ms"] = (
+                0
+                if submitted_at_ms is None or started_received_at_ms is None
+                else max(0, started_received_at_ms - submitted_at_ms)
+            )
+            item["worker_startup_scope"] = (
+                "ray_schedule_input_materialization_and_worker_started_delivery"
+            )
+            item["dispatch_wait_ms"] = (
+                0
+                if started_received_at_ms is None
+                else max(
+                    0,
+                    started_received_at_ms - dispatch.dispatch_started_at_ms,
+                )
+            )
+            records.append(item)
+        return tuple(
+            sorted(
+                records,
+                key=lambda item: (
+                    cast(int, item["started_at_ms"]),
+                    str(item["task_id"]),
+                    cast(int, item["attempt"]),
+                ),
+            )
+        )
 
     async def _monitor(self, record: _DispatchRecord) -> None:
         terminal_to_publish: RuntimeEvent | None = None

@@ -23,6 +23,7 @@ from ascend_maze.lifecycle import RunStatus
 from ascend_maze.placement import NodeCapacity
 from ascend_maze.recording import InMemoryRecorder
 from ascend_maze.runtime.ray_node_registry import RuntimeNodeStatus
+from ascend_maze.runtime.ray_worker import _RayStandbyWorker
 from tests_ray_host.standby_task_fixtures import (
     drain_slow_cpu_task,
     leak_file_descriptor,
@@ -71,6 +72,19 @@ def _pool_config() -> WorkerPoolConfig:
         ),
         reconcile_interval_ms=25,
     )
+
+
+def test_one_shot_worker_skips_reuse_only_sanitization(monkeypatch) -> None:
+    worker = object.__new__(_RayStandbyWorker)
+    worker._baseline_children = frozenset()  # noqa: SLF001
+    worker._tasks_completed = 1  # noqa: SLF001
+    worker.max_tasks_per_worker = 1
+    monkeypatch.setattr(
+        "ascend_maze.runtime.ray_worker._child_process_ids",
+        lambda: frozenset(),
+    )
+
+    assert worker._sanitize() == "task_limit_reached"  # noqa: SLF001
 
 
 def test_control_socket_opens_only_after_worker_broker_is_ready(
@@ -183,6 +197,7 @@ def test_ray_standby_actor_reuses_pid_and_common_execution_path(
             assert outcome.run_id is not None
             terminal = await controller.wait_run(outcome.run_id, timeout_seconds=30)
             assert terminal.status is RunStatus.SUCCEEDED
+            assert controller.ray_data_store.local_get_count == 0
             assert controller.result(outcome.run_id, finished.task_id) == {
                 "result": "payload:first:second"
             }

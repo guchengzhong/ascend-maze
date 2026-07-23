@@ -13,7 +13,6 @@ import argparse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import hashlib
-import json
 import os
 from pathlib import Path
 import random
@@ -412,6 +411,8 @@ def _run_workload_items(
         record = smoke._run_one_sample_ray(  # noqa: SLF001
             ray_task=ray_task,
             service_actor=service_actor,
+            inference_backend="vllm",
+            transformers_config=None,
             sample=sample,
             target_model_id=target_model_id,
             run_timeout_seconds=run_timeout_seconds,
@@ -523,8 +524,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--samples-per-workflow", type=int, default=1)
     parser.add_argument("--sample-offset", type=int, default=0)
     parser.add_argument("--max-inline-file-bytes", type=int, default=64 * 1024 * 1024)
-    parser.add_argument("--text-max-model-len", type=int, default=4096)
-    parser.add_argument("--vision-max-model-len", type=int, default=4096)
+    parser.add_argument("--text-max-model-len", type=int, default=10240)
+    parser.add_argument("--vision-max-model-len", type=int, default=12288)
     parser.add_argument("--text-dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--vision-dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--text-gpu-memory-utilization", type=float, default=0.5)
@@ -674,6 +675,7 @@ def _build_plan(
         "executor": {
             "kind": "plain_ray_task_actor",
             "dag_policy": "per_workflow_sequential_topological_order",
+            "worker_max_calls": smoke.RAY_TASK_MAX_CALLS,
             "workflow_concurrency": int(args.concurrency),
             "model_actor_concurrency": int(args.model_actor_concurrency),
             "target_qps": float(args.target_qps),
@@ -992,7 +994,10 @@ def run_performance(args: argparse.Namespace) -> int:
             num_cpus=0,
             max_concurrency=int(args.model_actor_concurrency),
         )(smoke._VllmServiceActor)  # noqa: SLF001
-        ray_task = ray.remote(num_cpus=float(args.ray_task_num_cpus))(
+        ray_task = ray.remote(
+            num_cpus=float(args.ray_task_num_cpus),
+            max_calls=smoke.RAY_TASK_MAX_CALLS,
+        )(
             smoke._execute_workflow_task_remote  # noqa: SLF001
         )
         port_by_family = {"text": int(args.first_port), "vision": int(args.first_port) + 1}

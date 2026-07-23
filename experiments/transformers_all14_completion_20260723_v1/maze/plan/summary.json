@@ -1,0 +1,7 @@
+{
+  "discovery_failure_count": 0,
+  "output_dir": "/home/user2/workplace/Ascend-Maze/experiments/transformers_all14_completion_20260723_v1/maze/plan",
+  "result": "plan_only_succeeded",
+  "sample_count": 2,
+  "schema_version": 1
+}

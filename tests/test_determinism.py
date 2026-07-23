@@ -50,13 +50,18 @@ def test_public_import_does_not_load_runtime_heavy_dependencies() -> None:
 
 def test_common_modules_do_not_import_runtime_heavy_dependencies() -> None:
     forbidden = {"ray", "torch_npu", "vllm"}
-    allowed_ray_modules = {
-        "src/ascend_maze/data/ray_store.py",
-        "src/ascend_maze/runtime/ray_backend.py",
-        "src/ascend_maze/runtime/ray_cluster.py",
-        "src/ascend_maze/runtime/ray_node_registry.py",
-        "src/ascend_maze/runtime/ray_worker.py",
-        "src/ascend_maze/runtime/ray_worker_pool.py",
+    allowed_runtime_modules = {
+        "ray": {
+            "src/ascend_maze/data/ray_store.py",
+            "src/ascend_maze/runtime/ray_backend.py",
+            "src/ascend_maze/runtime/ray_cluster.py",
+            "src/ascend_maze/runtime/ray_node_registry.py",
+            "src/ascend_maze/runtime/ray_worker.py",
+            "src/ascend_maze/runtime/ray_worker_pool.py",
+        },
+        "torch_npu": {
+            "src/ascend_maze/inference/adapters/transformers_local.py",
+        },
     }
     violations: list[tuple[str, str]] = []
     for path in (ROOT / "src" / "ascend_maze").rglob("*.py"):
@@ -70,8 +75,8 @@ def test_common_modules_do_not_import_runtime_heavy_dependencies() -> None:
             else:
                 continue
             for name in names:
-                if name in forbidden and not (
-                    name == "ray" and relative_path in allowed_ray_modules
+                if name in forbidden and relative_path not in allowed_runtime_modules.get(
+                    name, set()
                 ):
                     violations.append((relative_path, name))
     assert violations == []

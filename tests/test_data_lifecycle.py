@@ -10,7 +10,13 @@ from ascend_maze.core.errors import (
     DataOwnershipError,
     RunDataIndexError,
 )
-from ascend_maze.data import InMemoryDataStore, RunDataIndexRegistry, RunDataState
+from ascend_maze.data import (
+    DagContext,
+    InMemoryDataStore,
+    RunDataIndex,
+    RunDataIndexRegistry,
+    RunDataState,
+)
 
 
 def test_in_memory_data_store_adopt_is_atomic_and_release_is_idempotent() -> None:
@@ -36,6 +42,108 @@ def test_in_memory_data_store_adopt_is_atomic_and_release_is_idempotent() -> Non
     store.release(first)
     with pytest.raises(DataHandleInvalidError, match="released"):
         store.get(first)
+
+
+def test_submission_input_uses_handle_identity_without_content_digest() -> None:
+    store = InMemoryDataStore()
+    value = {"items": [{"id": 1}, {"id": 2}]}
+
+    handle = store.put_staged_for_submission_input(value, "controller_1")
+
+    assert handle.stable_digest is None
+    assert handle.size_bytes is None
+    assert handle.submission_identity() == (
+        "handle",
+        "controller_1",
+        handle.staged_handle_id,
+    )
+    assert store.get(handle) == value
+    store.release(handle)
+
+
+def test_registry_owns_one_internal_dag_context_per_run() -> None:
+    store = InMemoryDataStore()
+    registry = RunDataIndexRegistry(
+        controller_generation="controller_1",
+        data_store=store,
+    )
+    handle = store.put_staged("input", "controller_1")
+
+    context = registry.create_and_adopt(
+        run_id="run_1",
+        workflow_inputs={"value": handle},
+    )
+
+    assert isinstance(context, DagContext)
+    assert isinstance(context, RunDataIndex)
+    assert registry.dag_context("run_1") is context
+    assert registry.get("run_1") is context
+
+
+def test_in_memory_data_store_metrics_and_large_value_fast_path() -> None:
+    store = InMemoryDataStore(large_value_stable_digest_threshold_bytes=128)
+    large_value = {
+        "items": [
+            {
+                "index": index,
+                "payload": "x" * 32,
+            }
+            for index in range(16)
+        ]
+    }
+
+    first = store.put_staged(large_value, "controller_1")
+    second = store.put_staged(large_value, "controller_1")
+
+    assert first.stable_digest is None
+    assert second.stable_digest is None
+    assert first.size_bytes is not None
+    assert first.metadata["stable_digest_policy"] == "skipped_large_value"
+
+    snapshot = store.metrics_snapshot()
+    assert snapshot["put_calls"] == 2
+    assert snapshot["put_stable_digest_skipped_count"] == 2
+    assert snapshot["put_dedup_hit_count"] == 1
+    assert snapshot["put_deepcopy_ms"] >= 0
+    assert snapshot["put_digest_ms"] >= 0
+    assert snapshot["put_bytes_ms"] >= 0
+
+    assert store.get(first) == large_value
+    assert store.metrics_snapshot()["get_deepcopy_ms"] >= 0
+
+    store.release(first)
+    assert store.metrics_snapshot()["dedup_value_count"] == 1
+    store.release(second)
+    assert store.metrics_snapshot()["dedup_value_count"] == 0
+
+
+def test_in_memory_data_store_unsafe_large_value_no_deepcopy_is_opt_in() -> None:
+    value = {
+        "items": [
+            {
+                "index": index,
+                "payload": "x" * 32,
+            }
+            for index in range(16)
+        ]
+    }
+    default_store = InMemoryDataStore(large_value_stable_digest_threshold_bytes=128)
+    default_handle = default_store.put_staged(value, "controller_1")
+    assert default_store.get(default_handle) is not value
+    default_metrics = default_store.metrics_snapshot()
+    assert default_metrics["put_large_no_deepcopy_count"] == 0
+    assert default_metrics["get_large_no_deepcopy_count"] == 0
+
+    unsafe_store = InMemoryDataStore(
+        large_value_stable_digest_threshold_bytes=128,
+        unsafe_no_deepcopy_for_large_values=True,
+    )
+    unsafe_handle = unsafe_store.put_staged(value, "controller_1")
+    assert unsafe_store.get(unsafe_handle) is value
+    unsafe_metrics = unsafe_store.metrics_snapshot()
+    assert unsafe_metrics["put_large_no_deepcopy_count"] == 1
+    assert unsafe_metrics["get_large_no_deepcopy_count"] == 1
+    assert unsafe_metrics["unsafe_no_deepcopy_for_large_values"] == 1
 
 
 def test_run_data_index_publishes_atomically_and_destroy_keeps_tombstone() -> None:

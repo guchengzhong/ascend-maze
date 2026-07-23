@@ -688,6 +688,59 @@ def test_starting_is_not_ready_or_duplicated_and_stop_barrier_keeps_lease(
     asyncio.run(scenario())
 
 
+def test_stop_accepts_cleanup_completed_by_concurrent_owner(tmp_path, monkeypatch) -> None:
+    async def scenario() -> None:
+        spec = make_spec(tmp_path / "model")
+        inference, placement, adapter = make_inference(spec)
+        placement.register_node(make_node())
+        requested = inference.instances.create_requested(spec.model_id)
+        ready = await inference.instances.start_instance(requested.instance_id)
+        assert ready.state is ModelInstanceState.READY
+        assert inference.instances.begin_drain(ready.instance_id, ready.generation)
+
+        original_stop = adapter.stop
+
+        async def stop_after_concurrent_cleanup(handle, *, timeout_ms):
+            await original_stop(handle, timeout_ms=timeout_ms)
+            manager = inference.instances
+            with manager._lock:
+                record = manager._require_generation(ready.instance_id, ready.generation)
+                port_lease = record.port_lease
+                placement_lease = record.placement_lease
+            assert port_lease is not None
+            assert placement_lease is not None
+            assert await manager.port_leases.release(port_lease)
+            assert placement.release_lease(
+                placement_lease.lease_id,
+                now_ms=manager.clock.monotonic_ms(),
+                reason="concurrent_cleanup_test",
+            )
+            with manager._lock:
+                record = manager._require_generation(ready.instance_id, ready.generation)
+                record.port_lease = None
+                record.placement_lease = None
+                record.service_handle = None
+                record.cleanup_deadline_at_ms = None
+                manager._transition(record, ModelInstanceState.STOPPED)
+            raise RuntimeError("concurrent cleanup completed before stop returned")
+
+        monkeypatch.setattr(adapter, "stop", stop_after_concurrent_cleanup)
+        stopped = await inference.instances.stop_if_drained(
+            ready.instance_id, ready.generation
+        )
+
+        assert stopped.state is ModelInstanceState.STOPPED
+        assert stopped.placement_lease_id is None
+        assert placement.active_lease_count() == 0
+        assert inference.instances.port_leases.active_count() == 0
+        assert not any(
+            event.event_type == "model_resource_release_blocked"
+            for event in inference.events()
+        )
+
+    asyncio.run(scenario())
+
+
 def test_startup_timeout_cancels_fake_launch_and_releases_instance_lease(
     tmp_path,
 ) -> None:

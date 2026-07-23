@@ -311,7 +311,9 @@ class VllmAscendInferenceEngineAdapter:
         spec: ModelSpec,
         *,
         instance_placement_lease_id: str,
+        npu_device_id: str,
     ) -> InferenceWorkerConfig:
+        del npu_device_id
         self.validate_model_spec(spec)
         return InferenceWorkerConfig(
             adapter_name=self.name,

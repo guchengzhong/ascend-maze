@@ -124,7 +124,7 @@ def task3a_extract_blip_captions(
         enhanced_images,
         metadata,
         "blip_caption_overrides",
-        max_tokens=128,
+        max_tokens=4096,
     )
     blip_captions = [
         {"file_name": image["file_name"], "caption": captions[index]}
@@ -154,7 +154,7 @@ def task3b_extract_ocr_text(
         enhanced_images,
         metadata,
         "ocr_text_overrides",
-        max_tokens=128,
+        max_tokens=4096,
     )
     ocr_results_list = [
         {"file_name": image["file_name"], "text": ocr_texts[index], "raw_results": ()}

@@ -50,8 +50,13 @@ class RunDataIndexCheckpoint:
             raise RunDataIndexError("active checkpoint cannot contain a tombstone")
 
 
-class RunDataIndex:
-    """Map logical workflow names to handles while keeping values in DataStore."""
+class DagContext:
+    """Internal Run-scoped mapping from logical bindings to DataStore handles.
+
+    User Task callables never receive this object. The scheduler resolves their
+    declared arguments through it and publishes staged outputs only after every
+    declared output has been stored successfully.
+    """
 
     def __init__(
         self,
@@ -284,6 +289,10 @@ class RunDataIndex:
             return tombstone
 
 
+# Compatibility name retained for existing control-plane callers.
+RunDataIndex = DagContext
+
+
 class RunDataIndexRegistry:
     def __init__(
         self,
@@ -297,7 +306,7 @@ class RunDataIndexRegistry:
         self.controller_generation = controller_generation
         self.data_owner_generation = data_owner_generation or controller_generation
         self.data_store = data_store
-        self._indexes: dict[str, RunDataIndex] = {}
+        self._indexes: dict[str, DagContext] = {}
         self._next_generation: dict[str, int] = {}
         self._lock = RLock()
 
@@ -306,7 +315,7 @@ class RunDataIndexRegistry:
         *,
         run_id: str,
         workflow_inputs: Mapping[str, DataHandle],
-    ) -> RunDataIndex:
+    ) -> DagContext:
         with self._lock:
             existing = self._indexes.get(run_id)
             if existing is not None and existing.state is not RunDataState.DESTROYED:
@@ -324,7 +333,7 @@ class RunDataIndexRegistry:
                 owner_generation=self.data_owner_generation,
             )
             self.data_store.adopt(handles, owner)
-            index = RunDataIndex(
+            index = DagContext(
                 reference=reference,
                 data_store=self.data_store,
                 data_owner_generation=self.data_owner_generation,
@@ -334,7 +343,7 @@ class RunDataIndexRegistry:
             self._next_generation[run_id] = generation
             return index
 
-    def restore(self, checkpoint: RunDataIndexCheckpoint) -> RunDataIndex:
+    def restore(self, checkpoint: RunDataIndexCheckpoint) -> DagContext:
         """Rebind a persisted index to this Controller without re-adopting data."""
 
         with self._lock:
@@ -350,7 +359,7 @@ class RunDataIndexRegistry:
                 controller_generation=self.controller_generation,
                 index_generation=generation,
             )
-            index = RunDataIndex(
+            index = DagContext(
                 reference=reference,
                 data_store=self.data_store,
                 data_owner_generation=self.data_owner_generation,
@@ -375,12 +384,17 @@ class RunDataIndexRegistry:
             self._next_generation[run_id] = generation
             return index
 
-    def get(self, run_id: str) -> RunDataIndex:
+    def get(self, run_id: str) -> DagContext:
         with self._lock:
             try:
                 return self._indexes[run_id]
             except KeyError as exc:
                 raise RunDataIndexError(f"unknown run data index: {run_id}") from exc
+
+    def dag_context(self, run_id: str) -> DagContext:
+        """Return the single internal data context owned by ``run_id``."""
+
+        return self.get(run_id)
 
     def destroy(self, run_id: str, *, completed_at_ms: int) -> RunDataTombstone:
         index = self.get(run_id)

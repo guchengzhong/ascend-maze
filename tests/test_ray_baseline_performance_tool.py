@@ -62,6 +62,7 @@ def test_ray_performance_builds_fixed_workload_plan() -> None:
 
     assert not failures
     assert plan["objective"] == "ray_performance_baseline"
+    assert plan["executor"]["worker_max_calls"] == 1
     assert plan["executor"]["workflow_concurrency"] == 3
     assert plan["executor"]["model_actor_concurrency"] == 3
     assert plan["executor"]["target_qps"] == 0.5

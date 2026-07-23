@@ -1,18 +1,19 @@
-"""Ascend-Maze-native GAIA vision workflow."""
+"""Ascend-Maze port of the Maze GAIA vision workflow."""
 
 from __future__ import annotations
+
+import time
 
 from ascend_maze import Workflow, task
 
 from workflows._common import WorkflowSpec, edges, nodes, spec_inputs
 from workflows.gaia._common import (
-    inference_features,
-    metadata_dict,
-    response_or_override,
+    empty_time_record,
+    gaia_question_prompt,
+    model_runtime_inputs,
     summarize_image_file,
     text_features,
     vision_content_parts,
-    vision_prompt,
 )
 
 SPEC = WorkflowSpec(
@@ -41,25 +42,30 @@ INPUTS = spec_inputs()
 def task1_obtain_content(
     dag_id: str,
     question: str,
-    answer: str = "",
-    supplementary_files: object = None,
-    metadata: object = None,
+    supplementary_files: object,
 ) -> dict[str, object]:
-    if not question:
-        raise ValueError(f"task {dag_id} missing Question")
-    normalized_metadata = metadata_dict(metadata)
+    start_time = time.time()
     image_summary = summarize_image_file(supplementary_files)
-    prompt = vision_prompt(question, image_summary["image_features"])
-    features = text_features(prompt)
+    file_content = image_summary["image_bytes"]
+    image_features = dict(image_summary["image_features"])
+    prompt = gaia_question_prompt(question, "", "")
+    prompt_features = text_features(prompt)
+    task2_vlm_process_feature = {
+        **image_features,
+        "prompt_length": prompt_features["text_length"],
+        "prompt_token_count": prompt_features["token_count"],
+    }
     return {
+        "file_content": file_content,
+        "task2_vlm_process_feature": task2_vlm_process_feature,
         "dag_id": dag_id,
-        "question": question,
-        "answer": answer,
-        "metadata": normalized_metadata,
-        "file_name": image_summary["file_name"],
-        "image_bytes": image_summary["image_bytes"],
-        "image_features": image_summary["image_features"],
-        "succ_task_feat": {"task2_vlm_process": features},
+        "succ_task_feat": {
+            "task2_vlm_process": task2_vlm_process_feature,
+        },
+        "curr_task_feat": None,
+        "start_time": start_time,
+        "end_time": time.time(),
+        "time_record": empty_time_record(),
     }
 
 
@@ -67,36 +73,49 @@ def task1_obtain_content(
 def task2_vlm_process(
     dag_id: str,
     question: str,
-    image_bytes: bytes,
-    image_features: dict[str, object],
-    metadata: dict[str, object],
+    file_content: bytes,
+    task2_vlm_process_feature: dict[str, object],
+    use_online_model: bool,
+    model_folder: str,
+    temperature: float,
+    max_tokens: int,
+    top_p: float,
+    repetition_penalty: float,
+    task2_vlm_process_request_api_url: str,
 ) -> dict[str, object]:
     from ascend_maze.inference import chat
 
-    prompt = vision_prompt(question, image_features)
+    start_time = time.time()
+    del (
+        use_online_model,
+        model_folder,
+        top_p,
+        repetition_penalty,
+        task2_vlm_process_request_api_url,
+    )
+    if not question:
+        raise ValueError(f"task {dag_id} missing Question")
     response = chat(
         [
             {
                 "role": "user",
                 "content": vision_content_parts(
                     question,
-                    image_bytes,
-                    image_features,
+                    file_content,
+                    task2_vlm_process_feature,
                 ),
             }
         ],
-        max_tokens=1024,
-        temperature=0.0,
+        max_tokens=max_tokens,
+        temperature=temperature,
     )
-    vlm_answer = response_or_override(metadata, "vlm_output_override", response)
     return {
-        "dag_id": dag_id,
-        "vlm_answer": vlm_answer,
-        "raw_model_output": response.text,
-        "curr_task_feat": {
-            **inference_features(prompt, response),
-            "vision_input_mode": "true_multimodal" if image_bytes else "text_only",
-        },
+        "vlm_answer": response.text,
+        "task_id": dag_id,
+        "curr_task_feat": task2_vlm_process_feature,
+        "start_time": start_time,
+        "end_time": time.time(),
+        "time_record": empty_time_record(),
     }
 
 
@@ -105,9 +124,13 @@ def task3_output_final_answer(
     dag_id: str,
     vlm_answer: str,
 ) -> dict[str, object]:
+    start_time = time.time()
     return {
         "dag_id": dag_id,
         "final_answer": vlm_answer,
+        "start_time": start_time,
+        "end_time": time.time(),
+        "time_record": empty_time_record(),
     }
 
 
@@ -115,9 +138,9 @@ def build() -> Workflow:
     workflow = Workflow(SPEC.name)
     dag_id = workflow.input("dag_id")
     question = workflow.input("question")
-    answer = workflow.input("answer")
+    workflow.input("answer")
     supplementary_files = workflow.input("supplementary_files")
-    metadata = workflow.input("metadata")
+    workflow.input("metadata")
 
     prepared = workflow.add_task(
         task1_obtain_content,
@@ -125,9 +148,7 @@ def build() -> Workflow:
         inputs={
             "dag_id": dag_id,
             "question": question,
-            "answer": answer,
             "supplementary_files": supplementary_files,
-            "metadata": metadata,
         },
     )
     answered = workflow.add_task(
@@ -135,18 +156,20 @@ def build() -> Workflow:
         task_name="task2_vlm_process",
         model_anchor={"model": "qwen2.5-vl-32b", "mode": "service"},
         inputs={
-            "dag_id": prepared.outputs["dag_id"],
-            "question": prepared.outputs["question"],
-            "image_bytes": prepared.outputs["image_bytes"],
-            "image_features": prepared.outputs["image_features"],
-            "metadata": prepared.outputs["metadata"],
+            "dag_id": dag_id,
+            "question": question,
+            "file_content": prepared.outputs["file_content"],
+            "task2_vlm_process_feature": prepared.outputs[
+                "task2_vlm_process_feature"
+            ],
+            **model_runtime_inputs("task2_vlm_process_request_api_url"),
         },
     )
     workflow.add_task(
         task3_output_final_answer,
         task_name="task3_output_final_answer",
         inputs={
-            "dag_id": answered.outputs["dag_id"],
+            "dag_id": dag_id,
             "vlm_answer": answered.outputs["vlm_answer"],
         },
     )

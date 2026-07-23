@@ -7,7 +7,7 @@ from enum import Enum
 from threading import RLock
 
 from ascend_maze.contracts.resources import PlacementLease
-from ascend_maze.contracts.runtime import RuntimeNodeBinding
+from ascend_maze.contracts.runtime import RuntimeDeviceMapping, RuntimeNodeBinding
 from ascend_maze.core.errors import StateTransitionError
 
 
@@ -43,6 +43,7 @@ class RayNodeRegistry:
         agent_endpoint: str,
         producer_id: str,
         records_locally: bool = False,
+        device_mappings: tuple[RuntimeDeviceMapping, ...] = (),
         status: RuntimeNodeStatus = RuntimeNodeStatus.HEALTHY,
     ) -> tuple[RuntimeNodeBinding, RuntimeNodeBinding | None]:
         with self._lock:
@@ -51,6 +52,13 @@ class RayNodeRegistry:
                 previous.binding.boot_id == boot_id
                 and previous.binding.ray_node_id == ray_node_id
                 and previous.binding.agent_generation == agent_generation
+                and previous.binding.device_mappings
+                == tuple(
+                    sorted(
+                        device_mappings,
+                        key=lambda item: item.physical_device_id,
+                    )
+                )
             ):
                 if not (
                     previous.status
@@ -69,6 +77,7 @@ class RayNodeRegistry:
                 agent_endpoint=agent_endpoint,
                 producer_id=producer_id,
                 records_locally=records_locally,
+                device_mappings=device_mappings,
             )
             self._records[node_id] = _BindingRecord(
                 binding=binding,
