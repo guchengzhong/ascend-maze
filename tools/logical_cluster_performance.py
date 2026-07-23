@@ -1172,6 +1172,7 @@ def _render_report(summary: Mapping[str, object]) -> str:
         "- 生成参数：`max_tokens=4096`、`temperature=0`、`max_model_len=10240`",
         "- 模型加载：计入每个请求 E2E；模型 Task 进程一次性使用",
         "- Ray：每个 Task 请求逻辑节点全部 20 CPU，保证每节点同时至多一个 Task；`max_calls=1`",
+        "- Maze：performance 配置启用 HACS、static anchor、Standby 和多副本；当前全局 Worker 复用上限仍为 1",
         "- E2E：客户端开始准备并提交请求，到终态结果返回；`DestroyRun` 不计入",
         "",
         "## 汇总",

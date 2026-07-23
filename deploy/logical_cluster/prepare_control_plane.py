@@ -38,7 +38,10 @@ def _controller_config(profile: str = "correctness") -> str:
         anchor_strategy = "static"
         task_slots_total = 2
         allow_colocation = "true"
-        max_tasks_per_worker = 8
+        # The current C10 contract has one global reuse limit. Colocated NPU
+        # workers require one Attempt per process, so CPU/I/O-only reuse cannot
+        # be enabled independently yet.
+        max_tasks_per_worker = 1
         standby_min_idle = 1
         standby_max_idle = 2
     else:

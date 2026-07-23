@@ -130,7 +130,7 @@ def test_performance_profile_enables_scheduler_pool_and_replicas() -> None:
     assert 'policy = "hacs_no_tp"' in controller
     assert 'anchor_strategy = "static"' in controller
     assert "standby_min_idle = 1" in controller
-    assert "max_tasks_per_worker = 8" in controller
+    assert "max_tasks_per_worker = 1" in controller
     assert catalog.count("max_replicas = 8") == 2
     assert catalog.count("max_parallel_starts = 8") == 2
 
