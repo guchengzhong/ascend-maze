@@ -34,6 +34,7 @@ for _path in (str(TOOLS_ROOT), str(SRC_ROOT), str(REPO_ROOT)):
         sys.path.insert(0, _path)
 
 import logical_cluster_e2e as logical_e2e  # noqa: E402
+import logical_cluster_figures as logical_figures  # noqa: E402
 import qwen_benchmark_smoke as qwen_smoke  # noqa: E402
 import ray_baseline_smoke as ray_smoke  # noqa: E402
 
@@ -492,6 +493,7 @@ class HostResourceMonitor:
         if self._thread is not None:
             raise RuntimeError("resource monitor is already started")
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.output_path.write_text("", encoding="utf-8")
         self._sample()
         self._thread = threading.Thread(
             target=self._run,
@@ -506,10 +508,12 @@ class HostResourceMonitor:
         if thread is not None:
             thread.join(timeout=max(5.0, self.interval_seconds * 2))
         self._sample()
-        with self.output_path.open("w", encoding="utf-8") as handle:
-            for sample in self.samples:
-                handle.write(json.dumps(_jsonable(sample), sort_keys=True) + "\n")
         return tuple(self.samples)
+
+    def _record_sample(self, sample: dict[str, object]) -> None:
+        self.samples.append(sample)
+        with self.output_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_jsonable(sample), sort_keys=True) + "\n")
 
     def wait_for_hbm_recovery(
         self,
@@ -623,7 +627,7 @@ class HostResourceMonitor:
             for item in npu_samples
             if isinstance(item.get("utilization_pct"), (int, float))
         ]
-        self.samples.append(
+        self._record_sample(
             {
                 "timestamp_ms": timestamp_ms,
                 "monotonic_ns": monotonic_ns,
@@ -2089,6 +2093,10 @@ def _fmt(value: object, digits: int = 2) -> str:
     return f"{float(value):.{digits}f}"
 
 
+def _mapping_or_empty(value: object) -> Mapping[str, object]:
+    return value if isinstance(value, Mapping) else {}
+
+
 def _render_report(summary: Mapping[str, object]) -> str:
     contract = summary.get("contract")
     contract = contract if isinstance(contract, Mapping) else {}
@@ -2116,6 +2124,26 @@ def _render_report(summary: Mapping[str, object]) -> str:
         "| Case | 执行器 | 成功/总数 | E2E P95 (ms) | 吞吐 (req/s) | CPU 均值 (%) | CPU 增量 (%) | NPU 八卡均值 (%) | 单卡 NPU 峰值 (%) | HBM 增量峰值 (MB) | 单卡最大 NPU 进程数 |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
+    partial_evidence = summary.get("partial_evidence")
+    if isinstance(partial_evidence, Mapping):
+        evidence_labels = {
+            "latency_timing": "延迟、吞吐和阶段时间",
+            "host_cpu_npu_hbm": "宿主侧 CPU/NPU/HBM 时序",
+            "ray_physical_recovery_timeline": "Ray 物理资源回落时序",
+        }
+        evidence_lines = ["## 当前证据范围", ""]
+        for key, label in evidence_labels.items():
+            if key in partial_evidence:
+                evidence_lines.append(f"- {label}：{partial_evidence[key]}")
+        evidence_lines.extend(
+            (
+                "",
+                "> 资源图不对缺失的 Ray 采样做推断或补齐；空白即表示证据不可用。",
+                "",
+            )
+        )
+        summary_index = lines.index("## 汇总")
+        lines[summary_index:summary_index] = evidence_lines
     results = summary.get("results", [])
     if isinstance(results, list):
         for result in results:
@@ -2164,6 +2192,27 @@ def _render_report(summary: Mapping[str, object]) -> str:
                 )
                 + " |"
             )
+    figures = summary.get("figures")
+    if isinstance(figures, list) and figures:
+        lines.extend(("", "## 图表", ""))
+        for figure in figures:
+            if not isinstance(figure, Mapping):
+                continue
+            title = str(figure.get("title", figure.get("id", "figure")))
+            description = str(figure.get("description", ""))
+            path = str(figure.get("path", ""))
+            if not path:
+                continue
+            lines.extend(
+                (
+                    f"### {title}",
+                    "",
+                    description,
+                    "",
+                    f"![{title}]({path})",
+                    "",
+                )
+            )
     lines.extend(
         (
             "",
@@ -2210,10 +2259,65 @@ def _render_report(summary: Mapping[str, object]) -> str:
     lines.extend(
         (
             "",
+            "## 阶段时间",
+            "",
+            "> 各行是独立统计，部分阶段存在包含关系，不能把表中所有均值直接相加。",
+            "",
+            "| 执行器 | 分组 | 阶段 | 样本数 | 均值 (ms) | P95 (ms) | 最大值 (ms) |",
+            "|---|---|---|---:|---:|---:|---:|",
+        )
+    )
+    timing_labels = {
+        "queue_to_dispatch_ms": "queue -> dispatch",
+        "dispatch_prepare_ms": "dispatch prepare",
+        "dispatch_to_running_ms": "dispatch -> running",
+        "worker_startup_ms": "worker startup",
+        "model_load_ms": "model load",
+        "generate_ms": "generation",
+        "output_put_ms": "output put",
+        "total_duration_ms": "inference total",
+        "ray_roundtrip_ms": "Ray task roundtrip",
+    }
+    if isinstance(results, list):
+        for result in results:
+            if not isinstance(result, Mapping):
+                continue
+            breakdowns = _mapping_or_empty(result.get("breakdowns"))
+            timing_groups = {
+                "overall": breakdowns.get("overall"),
+                "text": _mapping_or_empty(breakdowns.get("families")).get("text"),
+                "vision": _mapping_or_empty(breakdowns.get("families")).get(
+                    "vision"
+                ),
+            }
+            for group_name, group in timing_groups.items():
+                timings = _mapping_or_empty(_mapping_or_empty(group).get("timings"))
+                for metric, label in timing_labels.items():
+                    stats = _mapping_or_empty(timings.get(metric))
+                    if not stats:
+                        continue
+                    lines.append(
+                        "| "
+                        + " | ".join(
+                            (
+                                str(result.get("executor")),
+                                group_name,
+                                label,
+                                str(stats.get("count", 0)),
+                                _fmt(stats.get("mean")),
+                                _fmt(stats.get("p95")),
+                                _fmt(stats.get("max")),
+                            )
+                        )
+                        + " |"
+                    )
+    lines.extend(
+        (
+            "",
             "## 回收审计",
             "",
-            "| 执行器 | 控制面回收 | 物理 HBM 回落 | HBM 等待 (ms) |",
-            "|---|---:|---:|---:|",
+            "| 执行器 | 控制面回收 | 非终态 Run | Active Worker Lease | Run-owned Placement | Standby Placement | Active Model | Route 占用 | 推理中请求 | 物理 HBM 回落 | HBM 等待 (ms) |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         )
     )
     if isinstance(results, list):
@@ -2222,6 +2326,20 @@ def _render_report(summary: Mapping[str, object]) -> str:
                 continue
             control = result.get("control_recovery")
             physical = result.get("physical_hbm_recovery")
+            control_map = _mapping_or_empty(control)
+            run_owned = control_map.get("run_owned_placement_leases")
+            run_owned_count = (
+                sum(len(value) for value in run_owned.values() if isinstance(value, list))
+                if isinstance(run_owned, Mapping)
+                else None
+            )
+            active_models = control_map.get("active_model_instances")
+            active_model_count = (
+                len(active_models) if isinstance(active_models, list) else None
+            )
+            placement_counts = _mapping_or_empty(
+                control_map.get("active_placement_lease_counts")
+            )
             lines.append(
                 "| "
                 + " | ".join(
@@ -2232,6 +2350,13 @@ def _render_report(summary: Mapping[str, object]) -> str:
                             if isinstance(control, Mapping)
                             else "n/a"
                         ),
+                        _fmt(control_map.get("nonterminal_run_count"), 0),
+                        _fmt(control_map.get("active_worker_lease_count"), 0),
+                        _fmt(run_owned_count, 0),
+                        _fmt(placement_counts.get("standby_worker"), 0),
+                        _fmt(active_model_count, 0),
+                        _fmt(control_map.get("route_occupancy"), 0),
+                        _fmt(control_map.get("actual_request_inflight"), 0),
                         (
                             str(physical.get("recovered"))
                             if isinstance(physical, Mapping)
@@ -2249,6 +2374,9 @@ def _render_report(summary: Mapping[str, object]) -> str:
             )
     lines.extend(
         (
+            "",
+            "Maze 的全局 Standby Placement 在 Run 结束后应恢复到 24，而不是清零；"
+            "Run/Attempt 拥有的 PlacementLease、WorkerLease、RouteLease 和模型实例必须清零。",
             "",
             "本次仅运行一轮，P95 和吞吐量用于 Pilot 对比，不宣称统计显著性。",
             "",
@@ -2488,6 +2616,7 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
         "resume": resume,
         "results": results,
     }
+    summary["figures"] = logical_figures.write_figures(summary, output_dir)
     _write_json(output_dir / "summary.json", summary)
     (output_dir / "report.md").write_text(_render_report(summary), encoding="utf-8")
     print(

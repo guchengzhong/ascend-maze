@@ -487,6 +487,11 @@ def test_maze_request_hard_timeout_returns_a_failed_record() -> None:
 def test_report_states_pilot_boundaries() -> None:
     report = performance._render_report(  # noqa: SLF001
         {
+            "partial_evidence": {
+                "latency_timing": "Maze + Ray",
+                "host_cpu_npu_hbm": "Maze only; Ray unavailable",
+                "ray_physical_recovery_timeline": "unavailable",
+            },
             "results": [
                 {
                     "executor": "maze",
@@ -505,6 +510,9 @@ def test_report_states_pilot_boundaries() -> None:
     assert "batch-1" in report
     assert "P95 和吞吐量用于 Pilot 对比" in report
     assert "不代表真实跨机网络性能" in report
+    assert "当前证据范围" in report
+    assert "Maze only; Ray unavailable" in report
+    assert "资源图不对缺失的 Ray 采样做推断" in report
 
 
 def _resume_fixture(tmp_path: Path) -> tuple[Path, argparse.Namespace]:
