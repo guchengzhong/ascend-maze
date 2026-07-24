@@ -633,8 +633,14 @@ def _dispatch_lifecycle(
     watch_batches: Sequence[Mapping[str, object]],
     task_names: Mapping[str, str],
 ) -> list[dict[str, object]]:
-    lifecycle_types = {"task_dispatched", "dispatch_prepared", "worker_started"}
+    lifecycle_types = {
+        "task_queued",
+        "task_dispatched",
+        "dispatch_prepared",
+        "worker_started",
+    }
     attempts: dict[tuple[str, int], dict[str, Mapping[str, object]]] = {}
+    queued_by_task: dict[str, list[Mapping[str, object]]] = {}
     for batch in watch_batches:
         events = batch.get("events")
         if not isinstance(events, list):
@@ -645,12 +651,12 @@ def _dispatch_lifecycle(
             event_type = event.get("event_type")
             task_id = event.get("task_id")
             attempt = event.get("attempt")
-            if (
-                event_type not in lifecycle_types
-                or not isinstance(task_id, str)
-                or not isinstance(attempt, int)
-                or isinstance(attempt, bool)
-            ):
+            if event_type not in lifecycle_types or not isinstance(task_id, str):
+                continue
+            if event_type == "task_queued":
+                queued_by_task.setdefault(task_id, []).append(event)
+                continue
+            if not isinstance(attempt, int) or isinstance(attempt, bool):
                 continue
             attempts.setdefault((task_id, attempt), {})[str(event_type)] = event
 
@@ -666,10 +672,16 @@ def _dispatch_lifecycle(
         return max(0, finish - start)
 
     records: list[dict[str, object]] = []
+    queue_index_by_task: dict[str, int] = {}
     for (task_id, attempt), events in sorted(attempts.items()):
+        queue_index = queue_index_by_task.get(task_id, 0)
+        queued_events = queued_by_task.get(task_id, [])
+        queued = queued_events[queue_index] if queue_index < len(queued_events) else None
+        queue_index_by_task[task_id] = queue_index + 1
         dispatched = events.get("task_dispatched")
         prepared = events.get("dispatch_prepared")
         running = events.get("worker_started")
+        queued_at = timestamp(queued)
         dispatched_at = timestamp(dispatched)
         prepared_at = timestamp(prepared)
         running_at = timestamp(running)
@@ -699,6 +711,9 @@ def _dispatch_lifecycle(
                 "dispatch_id": dispatch_payload.get("dispatch_id"),
                 "node_id": dispatch_payload.get("node_id"),
                 "worker_pid": running_payload.get("worker_pid"),
+                "task_queued_sequence": (
+                    None if queued is None else queued.get("sequence")
+                ),
                 "task_dispatched_sequence": (
                     None if dispatched is None else dispatched.get("sequence")
                 ),
@@ -708,10 +723,12 @@ def _dispatch_lifecycle(
                 "running_sequence": (
                     None if running is None else running.get("sequence")
                 ),
+                "task_queued_at_ms": queued_at,
                 "task_dispatched_at_ms": dispatched_at,
                 "dispatch_prepared_at_ms": prepared_at,
                 "running_at_ms": running_at,
                 "dispatch_prepare_ms": prepared_payload.get("dispatch_prepare_ms"),
+                "queue_to_dispatch_ms": elapsed(queued_at, dispatched_at),
                 "dispatch_to_prepared_ms": elapsed(dispatched_at, prepared_at),
                 "prepared_to_running_ms": elapsed(prepared_at, running_at),
                 "dispatch_to_running_ms": elapsed(dispatched_at, running_at),
@@ -722,7 +739,9 @@ def _dispatch_lifecycle(
 
 async def _wait_maze_terminal(
     client: Any, run_id: str, timeout_seconds: float
-) -> tuple[dict[str, object], list[dict[str, object]]]:
+) -> tuple[
+    dict[str, object], list[dict[str, object]], list[dict[str, object]]
+]:
     watch_batches: list[dict[str, object]] = []
     async for batch in client.watch_run(run_id, timeout_seconds=timeout_seconds):
         watch_batches.append(batch)
@@ -734,7 +753,13 @@ async def _wait_maze_terminal(
         raise PerformancePilotError("GetRun returned no terminal Run")
     if str(run.get("status")) not in TERMINAL_STATES:
         raise PerformancePilotError("WatchRun ended before a terminal state")
-    return run, watch_batches
+    raw_timings = shown.get("runtime_task_timings")
+    runtime_task_timings = (
+        [dict(item) for item in raw_timings if isinstance(item, Mapping)]
+        if isinstance(raw_timings, list)
+        else []
+    )
+    return run, watch_batches, runtime_task_timings
 
 
 async def _run_maze_request(
@@ -781,11 +806,22 @@ async def _run_maze_request(
             raise PerformancePilotError(f"submission did not commit: {outcome}")
         run_id = value
         record["run_id"] = run_id
-        terminal, watch_batches = await _wait_maze_terminal(
+        terminal, watch_batches, runtime_task_timings = await _wait_maze_terminal(
             client, run_id, timeout_seconds
         )
         record["terminal_status"] = terminal.get("status")
         record["watch_batch_count"] = len(watch_batches)
+        record["runtime_task_timings"] = runtime_task_timings
+        record["transformers_local_records"] = [
+            dict(item)
+            for timing in runtime_task_timings
+            for item in (
+                timing.get("inference_metrics")
+                if isinstance(timing.get("inference_metrics"), list)
+                else []
+            )
+            if isinstance(item, Mapping)
+        ]
         record["dispatch_lifecycle"] = _dispatch_lifecycle(
             watch_batches, task_names
         )

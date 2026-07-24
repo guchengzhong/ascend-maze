@@ -7,7 +7,7 @@ from ascend_maze import task
 
 @task(
     task_kind="cpu",
-    resources={"cpu_num": 19, "mem": 64},
+    resources={"cpu_num": 17, "mem": 64},
     max_retries=0,
 )
 def cold_dispatch_probe(probe_id: str, hold_seconds: float):

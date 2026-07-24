@@ -135,7 +135,7 @@ class StandbyWorkerBroker:
         self._invalidated_worker_leases: set[str] = set()
         self._wake = asyncio.Event()
         self._reconciler: asyncio.Task[None] | None = None
-        self._retire_tasks: set[asyncio.Task[None]] = set()
+        self._retire_tasks: set[asyncio.Task[bool]] = set()
         self._closed = False
         self._close_complete = False
         self._standby_hits = 0
@@ -229,28 +229,42 @@ class StandbyWorkerBroker:
         if worker_id is not None:
             with self._lock:
                 worker = self._workers.get(worker_id)  # type: ignore[assignment]
-                valid = (
-                    worker is not None
-                    and worker.descriptor.state is StandbyWorkerState.IDLE
-                    and worker.descriptor.node_id == placement_lease.node_id
-                    and worker.descriptor.boot_id == placement_lease.boot_id
-                    and worker.descriptor.profile is profile
-                    and worker.endpoint is not None
-                )
-                if valid:
-                    worker.descriptor = replace(
-                        worker.descriptor,
-                        state=StandbyWorkerState.ACQUIRED,
-                        standby_lease_id=None,
-                        idle_since_ms=None,
-                    )
-                    self._standby_hits += 1
+            valid = False
+            if worker is not None:
+                async with worker.retire_lock:
+                    with self._lock:
+                        current = self._workers.get(worker_id)
+                        valid = (
+                            current is worker
+                            and worker.descriptor.state is StandbyWorkerState.IDLE
+                            and worker.descriptor.node_id == placement_lease.node_id
+                            and worker.descriptor.boot_id == placement_lease.boot_id
+                            and worker.descriptor.profile is profile
+                            and worker.endpoint is not None
+                        )
+                        if valid:
+                            try:
+                                reservation = self.placement.standby_snapshot(worker_id)
+                            except KeyError:
+                                valid = False
+                            else:
+                                valid = (
+                                    reservation.status
+                                    is StandbyReservationStatus.CONVERTED
+                                    and reservation.converted_task_lease_id
+                                    == placement_lease.lease_id
+                                    and reservation.worker_generation
+                                    == worker.descriptor.worker_generation
+                                )
+                        if valid:
+                            worker.descriptor = replace(
+                                worker.descriptor,
+                                state=StandbyWorkerState.ACQUIRED,
+                                standby_lease_id=None,
+                                idle_since_ms=None,
+                            )
+                            self._standby_hits += 1
             if not valid:
-                self.placement.retire_standby(
-                    worker_id,
-                    now_ms=now_ms,
-                    reason="standby_endpoint_missing",
-                )
                 self.notify_changed()
                 raise StateTransitionError("converted Standby Worker is unavailable")
         else:
@@ -632,16 +646,28 @@ class StandbyWorkerBroker:
         with self._lock:
             workers = tuple(self._workers.values())
         now_ms = monotonic_time_ms()
-        retire: list[tuple[str, str]] = []
+        retire: list[tuple[str, str, frozenset[StandbyWorkerState]]] = []
         for worker in workers:
             descriptor = worker.descriptor
             if descriptor.state is StandbyWorkerState.DEAD:
                 continue
             if descriptor.state is StandbyWorkerState.RETIRING:
-                retire.append((descriptor.worker_id, "retry_termination"))
+                retire.append(
+                    (
+                        descriptor.worker_id,
+                        "retry_termination",
+                        frozenset({descriptor.state}),
+                    )
+                )
                 continue
             if descriptor.config_generation != self.config.config_generation:
-                retire.append((descriptor.worker_id, "pool_config_replaced"))
+                retire.append(
+                    (
+                        descriptor.worker_id,
+                        "pool_config_replaced",
+                        frozenset({descriptor.state}),
+                    )
+                )
                 continue
             if (descriptor.node_id, descriptor.boot_id) not in bindings:
                 try:
@@ -654,7 +680,13 @@ class StandbyWorkerBroker:
                     and descriptor.state is StandbyWorkerState.ACQUIRED
                 ):
                     continue
-                retire.append((descriptor.worker_id, "node_not_healthy"))
+                retire.append(
+                    (
+                        descriptor.worker_id,
+                        "node_not_healthy",
+                        frozenset({descriptor.state}),
+                    )
+                )
                 continue
             if descriptor.state is StandbyWorkerState.IDLE:
                 try:
@@ -662,10 +694,24 @@ class StandbyWorkerBroker:
                         descriptor.worker_id
                     )
                 except KeyError:
-                    retire.append((descriptor.worker_id, "standby_reservation_missing"))
+                    retire.append(
+                        (
+                            descriptor.worker_id,
+                            "standby_reservation_missing",
+                            frozenset({StandbyWorkerState.IDLE}),
+                        )
+                    )
+                    continue
+                if reservation.status is StandbyReservationStatus.CONVERTED:
                     continue
                 if reservation.status is not StandbyReservationStatus.READY:
-                    retire.append((descriptor.worker_id, "standby_reservation_inactive"))
+                    retire.append(
+                        (
+                            descriptor.worker_id,
+                            "standby_reservation_inactive",
+                            frozenset({StandbyWorkerState.IDLE}),
+                        )
+                    )
                     continue
         idle_groups: dict[
             tuple[str, str, WorkerProfile], list[StandbyWorkerDescriptor]
@@ -689,10 +735,19 @@ class StandbyWorkerBroker:
                 key=lambda item: (item.idle_since_ms or 0, item.worker_id),
             )
             retire.extend(
-                (item.worker_id, "idle_ttl") for item in eligible[:excess]
+                (
+                    item.worker_id,
+                    "idle_ttl",
+                    frozenset({StandbyWorkerState.IDLE}),
+                )
+                for item in eligible[:excess]
             )
-        for worker_id, reason in retire:
-            await self._retire_worker(worker_id, reason)
+        for worker_id, reason, expected_states in retire:
+            await self._retire_worker(
+                worker_id,
+                reason,
+                expected_states=expected_states,
+            )
 
         if self.config.mode != "zero_hbm_standby":
             self._purge_dead_workers()
@@ -891,15 +946,56 @@ class StandbyWorkerBroker:
         reason: str,
         *,
         force: bool = False,
-    ) -> None:
+        expected_states: frozenset[StandbyWorkerState] | None = None,
+    ) -> bool:
         with self._lock:
             worker = self._workers.get(worker_id)
         if worker is None:
-            return
+            return False
         async with worker.retire_lock:
             with self._lock:
                 if worker.descriptor.state is StandbyWorkerState.DEAD:
-                    return
+                    return False
+                if (
+                    expected_states is not None
+                    and worker.descriptor.state not in expected_states
+                ):
+                    return False
+                task_lease_id = next(
+                    (
+                        record.placement_lease.lease_id
+                        for record in self._leases.values()
+                        if not record.released
+                        and record.lease.worker_id == worker_id
+                        and record.placement_lease.standby_worker_id == worker_id
+                    ),
+                    None,
+                )
+            reservation_known = False
+            try:
+                reservation = self.placement.standby_snapshot(worker_id)
+            except KeyError:
+                pass
+            else:
+                reservation_known = True
+                if (
+                    reservation.status is StandbyReservationStatus.CONVERTED
+                    and task_lease_id is None
+                ):
+                    if not force:
+                        return False
+                    task_lease_id = reservation.converted_task_lease_id
+                fenced = self.placement.begin_standby_retirement(
+                    worker_id,
+                    converted_task_lease_id=task_lease_id,
+                )
+                if not fenced:
+                    latest = self.placement.standby_snapshot(worker_id)
+                    if latest.status is not StandbyReservationStatus.RETIRED:
+                        return False
+            with self._lock:
+                if worker.descriptor.state is StandbyWorkerState.DEAD:
+                    return False
                 worker.descriptor = replace(
                     worker.descriptor, state=StandbyWorkerState.RETIRING
                 )
@@ -923,11 +1019,12 @@ class StandbyWorkerBroker:
                         "worker_termination_failed", worker.descriptor, str(exc)
                     )
                     raise
-            self.placement.retire_standby(
-                worker_id,
-                now_ms=monotonic_time_ms(),
-                reason=reason,
-            )
+            if reservation_known:
+                self.placement.complete_standby_retirement(
+                    worker_id,
+                    now_ms=monotonic_time_ms(),
+                    reason=reason,
+                )
             with self._lock:
                 worker.endpoint = None
                 worker.descriptor = replace(
@@ -942,6 +1039,7 @@ class StandbyWorkerBroker:
                 self.placement.purge_retired_standby(worker_id)
             except KeyError:
                 pass
+            return True
 
     def _schedule_retire(self, worker_id: str, reason: str) -> None:
         try:
@@ -956,7 +1054,7 @@ class StandbyWorkerBroker:
         task.add_done_callback(self._consume_retire_result)
 
     @staticmethod
-    def _consume_retire_result(task: asyncio.Task[None]) -> None:
+    def _consume_retire_result(task: asyncio.Task[bool]) -> None:
         if not task.cancelled():
             task.exception()
 

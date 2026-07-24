@@ -22,7 +22,12 @@ from ascend_maze.contracts.worker import (
 )
 from ascend_maze.core.time import monotonic_time_ms
 from ascend_maze.core.errors import ContractValidationError, StateTransitionError
-from ascend_maze.placement import NodeCapacity, NpuCapacity, PlacementManager
+from ascend_maze.placement import (
+    NodeCapacity,
+    NpuCapacity,
+    PlacementManager,
+    StandbyReservationStatus,
+)
 from ascend_maze.resources import ResourceAnchor
 from ascend_maze.runtime.ray_node_registry import RayNodeRegistry
 from ascend_maze.runtime.worker_pool import StandbyWorkerBroker
@@ -291,6 +296,169 @@ def test_standby_hit_and_sanitized_cpu_reuse_keep_one_reservation() -> None:
         assert placement.active_lease_count() == 1
         await broker.close()
         assert factory.started[0].terminated
+        assert placement.active_lease_count() == 0
+
+    asyncio.run(scenario())
+
+
+def test_converted_standby_survives_reconcile_before_worker_acquire() -> None:
+    async def scenario() -> None:
+        placement, _, factory, broker = _components(WorkerProfile.CPU)
+        await broker.reconcile_once()
+        idle = broker.snapshot().workers[0]
+        result = placement.try_reserve(
+            run_id="run_reconcile_gap",
+            task_id="task_reconcile_gap",
+            attempt=1,
+            anchor=_anchor(WorkerProfile.CPU),
+            now_ms=monotonic_time_ms(),
+            dispatch_deadline_ms=monotonic_time_ms() + 1_000,
+        )
+        assert result.lease is not None
+        assert result.standby_worker_id == idle.worker_id
+
+        await broker.reconcile_once()
+
+        assert broker.snapshot().workers[0].state is StandbyWorkerState.IDLE
+        worker_lease = await broker.acquire(
+            placement_lease=result.lease,
+            task_kind="cpu",
+            execution_target=ExecutionTarget.LOCAL_WORKER,
+            now_ms=monotonic_time_ms(),
+        )
+        assert worker_lease.source == "standby"
+        assert worker_lease.worker_id == idle.worker_id
+        assert broker.snapshot().standby_hits == 1
+        assert len(factory.started) == 1
+
+        await broker.release(worker_lease.worker_lease_id, disposition="discard")
+        placement.release_lease(result.lease.lease_id, now_ms=monotonic_time_ms())
+        await broker.close()
+
+    asyncio.run(scenario())
+
+
+def test_queued_idle_retirement_loses_to_standby_conversion() -> None:
+    async def scenario() -> None:
+        placement, _, factory, broker = _components(WorkerProfile.CPU)
+        await broker.reconcile_once()
+        idle = broker.snapshot().workers[0]
+        pooled = broker._workers[idle.worker_id]
+        await pooled.retire_lock.acquire()
+        retirement = asyncio.create_task(
+            broker._retire_worker(
+                idle.worker_id,
+                "idle_ttl",
+                expected_states=frozenset({StandbyWorkerState.IDLE}),
+            )
+        )
+        await asyncio.sleep(0)
+        result = placement.try_reserve(
+            run_id="run_retirement_race",
+            task_id="task_retirement_race",
+            attempt=1,
+            anchor=_anchor(WorkerProfile.CPU),
+            now_ms=monotonic_time_ms(),
+            dispatch_deadline_ms=monotonic_time_ms() + 1_000,
+        )
+        assert result.lease is not None
+        pooled.retire_lock.release()
+
+        assert not await retirement
+        worker_lease = await broker.acquire(
+            placement_lease=result.lease,
+            task_kind="cpu",
+            execution_target=ExecutionTarget.LOCAL_WORKER,
+            now_ms=monotonic_time_ms(),
+        )
+        assert worker_lease.worker_id == idle.worker_id
+        assert not factory.started[0].terminated
+
+        await broker.release(worker_lease.worker_lease_id, disposition="discard")
+        placement.release_lease(result.lease.lease_id, now_ms=monotonic_time_ms())
+        await broker.close()
+
+    asyncio.run(scenario())
+
+
+def test_batch_conversion_replenish_and_cancel_keep_attempt_one_ownership() -> None:
+    async def scenario() -> None:
+        placement, registry, factory, _ = _components(WorkerProfile.CPU, cpu=6)
+        profile = replace(
+            _pool_config(WorkerProfile.CPU).profiles[0],
+            min_idle=2,
+            max_idle=2,
+            max_total=4,
+            replenish_concurrency=2,
+        )
+        broker = StandbyWorkerBroker(
+            node_registry=registry,
+            placement=placement,
+            environment_fingerprint="e" * 64,
+            config=WorkerPoolConfig(
+                mode="zero_hbm_standby",
+                profiles=(profile,),
+            ),
+            endpoint_factory=factory,
+        )
+        await broker.reconcile_once()
+        assert len(broker.snapshot().workers) == 2
+        results = tuple(
+            placement.try_reserve(
+                run_id=f"run_batch_{index}",
+                task_id=f"task_batch_{index}",
+                attempt=1,
+                anchor=_anchor(WorkerProfile.CPU),
+                now_ms=monotonic_time_ms(),
+                dispatch_deadline_ms=monotonic_time_ms() + 1_000,
+            )
+            for index in range(2)
+        )
+        assert all(result.lease is not None for result in results)
+        task_leases = tuple(result.lease for result in results if result.lease is not None)
+        assert all(lease.attempt == 1 for lease in task_leases)
+
+        worker_leases = await asyncio.gather(
+            *(
+                broker.acquire(
+                    placement_lease=lease,
+                    task_kind="cpu",
+                    execution_target=ExecutionTarget.LOCAL_WORKER,
+                    now_ms=monotonic_time_ms(),
+                )
+                for lease in task_leases
+            )
+        )
+        assert len({lease.worker_id for lease in worker_leases}) == 2
+        assert all(lease.source == "standby" for lease in worker_leases)
+
+        await broker.reconcile_once()
+        snapshot = broker.snapshot()
+        assert sum(
+            worker.state is StandbyWorkerState.IDLE for worker in snapshot.workers
+        ) == 2
+        assert snapshot.active_worker_lease_count == 2
+        assert placement.active_lease_count() == 4
+
+        await broker.cancel(worker_leases[0].worker_lease_id)
+        assert await broker.release(
+            worker_leases[0].worker_lease_id,
+            disposition="discard",
+        )
+        assert await broker.release(
+            worker_leases[1].worker_lease_id,
+            disposition="discard",
+        )
+        assert broker.snapshot().active_worker_lease_count == 0
+        for lease in task_leases:
+            assert placement.release_lease(
+                lease.lease_id,
+                now_ms=monotonic_time_ms(),
+            )
+        assert placement.active_lease_count() == 2
+        assert placement.ready_standby_count(profile="cpu") == 2
+
+        await broker.close()
         assert placement.active_lease_count() == 0
 
     asyncio.run(scenario())
@@ -666,6 +834,11 @@ def test_failed_process_exit_keeps_reservation_and_close_can_retry() -> None:
             await broker.close()
         assert placement.active_lease_count() == 1
         assert broker.snapshot().termination_failures == 1
+        worker_id = broker.snapshot().workers[0].worker_id
+        assert (
+            placement.standby_snapshot(worker_id).status
+            is StandbyReservationStatus.RETIRING
+        )
         await broker.close()
         assert factory.started[0].terminated
         assert placement.active_lease_count() == 0

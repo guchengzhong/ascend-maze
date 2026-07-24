@@ -50,6 +50,7 @@ class StandbyReservationStatus(str, Enum):
     STARTING = "starting"
     READY = "ready"
     CONVERTED = "converted"
+    RETIRING = "retiring"
     RETIRED = "retired"
 
 
@@ -495,10 +496,63 @@ class PlacementManager:
         now_ms: int,
         reason: str,
     ) -> bool:
+        """Retire an unclaimed Standby whose process is already absent or dead."""
+
+        if not self.begin_standby_retirement(
+            worker_id,
+            converted_task_lease_id=None,
+        ):
+            return False
+        return self.complete_standby_retirement(
+            worker_id,
+            now_ms=now_ms,
+            reason=reason,
+        )
+
+    def begin_standby_retirement(
+        self,
+        worker_id: str,
+        *,
+        converted_task_lease_id: str | None,
+    ) -> bool:
+        """Fence placement before the owning Worker process is terminated."""
+
         with self._lock:
             standby = self._standby.get(worker_id)
             if standby is None or standby.status is StandbyReservationStatus.RETIRED:
                 return False
+            if standby.status is StandbyReservationStatus.RETIRING:
+                return True
+            if converted_task_lease_id is None:
+                if standby.status not in {
+                    StandbyReservationStatus.STARTING,
+                    StandbyReservationStatus.READY,
+                }:
+                    return False
+            elif (
+                standby.status is not StandbyReservationStatus.CONVERTED
+                or standby.converted_task_lease_id != converted_task_lease_id
+            ):
+                return False
+            standby.status = StandbyReservationStatus.RETIRING
+            self._snapshot_version += 1
+            return True
+
+    def complete_standby_retirement(
+        self,
+        worker_id: str,
+        *,
+        now_ms: int,
+        reason: str,
+    ) -> bool:
+        """Release a fenced Standby reservation after process-exit confirmation."""
+
+        with self._lock:
+            standby = self._standby.get(worker_id)
+            if standby is None or standby.status is StandbyReservationStatus.RETIRED:
+                return False
+            if standby.status is not StandbyReservationStatus.RETIRING:
+                raise StateTransitionError("Standby Worker retirement is not fenced")
             lease_record = self._require_lease(standby.lease_id)
             if lease_record.status in ACTIVE_LEASE_STATUSES:
                 lease_record.status = LeaseStatus.RELEASED

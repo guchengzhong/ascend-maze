@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.util
 from pathlib import Path
 import sys
@@ -143,6 +144,14 @@ def test_dispatch_lifecycle_records_starting_to_running_timeline() -> None:
             {
                 "events": [
                     {
+                        "event_type": "task_queued",
+                        "task_id": "task_1",
+                        "attempt": None,
+                        "sequence": 9,
+                        "monotonic_time_ms": 990,
+                        "payload": {},
+                    },
+                    {
                         "event_type": "task_dispatched",
                         "task_id": "task_1",
                         "attempt": 1,
@@ -182,18 +191,51 @@ def test_dispatch_lifecycle_records_starting_to_running_timeline() -> None:
             "dispatch_id": "dispatch_1",
             "node_id": "node-1",
             "worker_pid": 42,
+            "task_queued_sequence": 9,
             "task_dispatched_sequence": 10,
             "dispatch_prepared_sequence": 14,
             "running_sequence": 15,
+            "task_queued_at_ms": 990,
             "task_dispatched_at_ms": 1_000,
             "dispatch_prepared_at_ms": 1_650,
             "running_at_ms": 1_680,
             "dispatch_prepare_ms": 649.5,
+            "queue_to_dispatch_ms": 10,
             "dispatch_to_prepared_ms": 650,
             "prepared_to_running_ms": 30,
             "dispatch_to_running_ms": 680,
         }
     ]
+
+
+def test_wait_maze_terminal_returns_runtime_task_timings() -> None:
+    class Client:
+        async def watch_run(self, run_id: str, **kwargs: object):
+            del run_id, kwargs
+            yield {"events": [{"event_type": "run_succeeded"}]}
+
+        async def query(self, operation: str, **kwargs: object):
+            del operation, kwargs
+            return {
+                "run": {"run_id": "run_1", "status": "succeeded"},
+                "runtime_task_timings": [
+                    {
+                        "task_id": "task_1",
+                        "worker_startup_ms": 12,
+                        "inference_metrics": [
+                            {"model_load_ms": 4, "generate_ms": 7}
+                        ],
+                    }
+                ],
+            }
+
+    run, batches, timings = asyncio.run(
+        performance._wait_maze_terminal(Client(), "run_1", 10.0)  # noqa: SLF001
+    )
+    assert run["status"] == "succeeded"
+    assert len(batches) == 1
+    assert timings[0]["worker_startup_ms"] == 12
+    assert timings[0]["inference_metrics"][0]["model_load_ms"] == 4
 
 
 def test_report_states_pilot_boundaries() -> None:

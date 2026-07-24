@@ -454,12 +454,19 @@ class _LocalControlServicer:
                 for item in api.placement.lease_snapshots()
                 if item.lease.run_id == run.run_id
             )
+            task_timing_snapshot = getattr(api.runtime, "task_timing_records", None)
+            runtime_task_timings = (
+                task_timing_snapshot(run.run_id)
+                if callable(task_timing_snapshot)
+                else ()
+            )
             payload = {
                 "meta": api.snapshot_meta(
                     snapshot_version=api.control_events.latest_sequence
                 ),
                 "run": run,
                 "placements": leases,
+                "runtime_task_timings": runtime_task_timings,
                 "recording_complete": (
                     None if recording is None else recording.recording_complete
                 ),

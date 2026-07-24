@@ -139,6 +139,53 @@ def test_failed_conversion_preserves_ready_standby_and_its_reservation() -> None
     assert placement.snapshot().nodes[0].reserved == ReservationVector(1, 64, 0, 0, 0)
 
 
+def test_converted_standby_retirement_requires_task_lease_ownership() -> None:
+    placement = PlacementManager()
+    placement.register_node(_node(cpu=1, memory=64))
+    _ready_standby(placement)
+    result = placement.try_reserve(
+        run_id="run_owner",
+        task_id="task_owner",
+        attempt=1,
+        anchor=_anchor(),
+        now_ms=3,
+        dispatch_deadline_ms=100,
+    )
+    assert result.lease is not None
+
+    assert not placement.begin_standby_retirement(
+        "worker_1",
+        converted_task_lease_id=None,
+    )
+    assert not placement.begin_standby_retirement(
+        "worker_1",
+        converted_task_lease_id="lease_wrong_owner",
+    )
+    assert (
+        placement.standby_snapshot("worker_1").status
+        is StandbyReservationStatus.CONVERTED
+    )
+
+    assert placement.begin_standby_retirement(
+        "worker_1",
+        converted_task_lease_id=result.lease.lease_id,
+    )
+    assert (
+        placement.standby_snapshot("worker_1").status
+        is StandbyReservationStatus.RETIRING
+    )
+    assert placement.active_lease_count() == 1
+    assert placement.complete_standby_retirement(
+        "worker_1",
+        now_ms=4,
+        reason="owner_confirmed_process_exit",
+    )
+    assert placement.purge_retired_standby("worker_1")
+    assert placement.active_lease_count() == 1
+    assert placement.release_lease(result.lease.lease_id, now_ms=5)
+    assert placement.active_lease_count() == 0
+
+
 def test_sanitized_cpu_task_can_atomically_return_to_standby() -> None:
     placement = PlacementManager()
     placement.register_node(_node(cpu=1, memory=64))

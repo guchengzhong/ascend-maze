@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove cold Worker dispatch concurrency through a live Ray Host Controller."""
+"""Prove concurrent Worker dispatch ownership through a live Ray Controller."""
 
 from __future__ import annotations
 
@@ -74,6 +74,92 @@ def _live_workers(snapshot: Mapping[str, object]) -> list[object]:
     ]
 
 
+def _worker_pool(snapshot: Mapping[str, object]) -> dict[str, object]:
+    pool = snapshot.get("worker_pool")
+    return dict(pool) if isinstance(pool, dict) else {}
+
+
+def _live_worker_signature(snapshot: Mapping[str, object]) -> list[str]:
+    return sorted(
+        json.dumps(
+            {
+                "node_id": item.get("node_id"),
+                "boot_id": item.get("boot_id"),
+                "profile": item.get("profile"),
+                "state": item.get("state"),
+            },
+            sort_keys=True,
+        )
+        for item in _live_workers(snapshot)
+        if isinstance(item, dict)
+    )
+
+
+def _global_lease_signature(snapshot: Mapping[str, object]) -> list[str]:
+    cluster = snapshot.get("cluster")
+    if not isinstance(cluster, dict):
+        return []
+    leases = cluster.get("active_leases")
+    if not isinstance(leases, list):
+        return []
+    return sorted(
+        json.dumps(
+            {
+                "reservation_kind": lease.get("reservation_kind"),
+                "node_id": lease.get("node_id"),
+                "boot_id": lease.get("boot_id"),
+                "npu_device_id": lease.get("npu_device_id"),
+                "resources": lease.get("resources"),
+            },
+            sort_keys=True,
+        )
+        for item in leases
+        if isinstance(item, dict)
+        for lease in [item.get("lease")]
+        if isinstance(lease, dict) and lease.get("run_id") is None
+    )
+
+
+def _hbm_free_by_device(snapshot: Mapping[str, object]) -> dict[str, int]:
+    cluster = snapshot.get("cluster")
+    if not isinstance(cluster, dict):
+        return {}
+    nodes = cluster.get("nodes")
+    if not isinstance(nodes, list):
+        return {}
+    result: dict[str, int] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        capacity = node.get("capacity")
+        if not isinstance(capacity, dict):
+            continue
+        node_id = capacity.get("node_id")
+        npus = capacity.get("npus")
+        if not isinstance(node_id, str) or not isinstance(npus, list):
+            continue
+        for npu in npus:
+            if not isinstance(npu, dict):
+                continue
+            device_id = npu.get("device_id")
+            free_hbm = npu.get("observed_free_hbm_mb")
+            if isinstance(device_id, str) and isinstance(free_hbm, int):
+                result[f"{node_id}:{device_id}"] = free_hbm
+    return result
+
+
+def _pool_failure_counters(snapshot: Mapping[str, object]) -> dict[str, int]:
+    pool = _worker_pool(snapshot)
+    return {
+        name: int(pool.get(name, 0))
+        for name in (
+            "replenish_failures",
+            "sanitize_failures",
+            "termination_failures",
+        )
+    }
+
+
 def _run_leases(snapshot: Mapping[str, object], run_ids: set[str]) -> list[object]:
     cluster = snapshot.get("cluster")
     if not isinstance(cluster, dict):
@@ -89,6 +175,38 @@ def _run_leases(snapshot: Mapping[str, object], run_ids: set[str]) -> list[objec
         if isinstance(lease, dict) and lease.get("run_id") in run_ids:
             result.append(item)
     return result
+
+
+def _attempt_violations(runs: Sequence[object]) -> list[dict[str, object]]:
+    violations: list[dict[str, object]] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            violations.append({"reason": "run_snapshot_missing"})
+            continue
+        for task in run.get("task_states", []):
+            if not isinstance(task, dict):
+                continue
+            attempts = task.get("attempts")
+            valid_attempts = attempts if isinstance(attempts, list) else []
+            valid = (
+                task.get("status") == "succeeded"
+                and task.get("attempt_count") == 1
+                and len(valid_attempts) == 1
+                and isinstance(valid_attempts[0], dict)
+                and valid_attempts[0].get("attempt") == 1
+                and valid_attempts[0].get("status") == "succeeded"
+            )
+            if not valid:
+                violations.append(
+                    {
+                        "run_id": run.get("run_id"),
+                        "task_id": task.get("task_id"),
+                        "status": task.get("status"),
+                        "attempt_count": task.get("attempt_count"),
+                        "attempts": valid_attempts,
+                    }
+                )
+    return violations
 
 
 async def _watch(
@@ -110,10 +228,17 @@ async def _watch(
 async def _wait_cleanup(
     client: UdsRuntimeClient,
     run_ids: set[str],
+    baseline_workers: Mapping[str, object],
+    baseline_cluster: Mapping[str, object],
     timeout_seconds: float,
+    hbm_tolerance_mb: int = 512,
 ) -> dict[str, object]:
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     last: dict[str, object] = {}
+    baseline_live_workers = _live_worker_signature(baseline_workers)
+    baseline_global_leases = _global_lease_signature(baseline_cluster)
+    baseline_hbm = _hbm_free_by_device(baseline_cluster)
+    baseline_failures = _pool_failure_counters(baseline_workers)
     while asyncio.get_running_loop().time() < deadline:
         workers, cluster = await asyncio.gather(
             client.query("GetWorkerPools", timeout_seconds=10),
@@ -123,21 +248,85 @@ async def _wait_cleanup(
                 timeout_seconds=10,
             ),
         )
-        last = {"workers": workers, "cluster": cluster}
+        current_live_workers = _live_worker_signature(workers)
+        current_global_leases = _global_lease_signature(cluster)
+        current_hbm = _hbm_free_by_device(cluster)
+        current_failures = _pool_failure_counters(workers)
+        hbm_recovered = all(
+            current_hbm.get(device_id, -1) >= free_hbm - hbm_tolerance_mb
+            for device_id, free_hbm in baseline_hbm.items()
+        )
+        last = {
+            "workers": workers,
+            "cluster": cluster,
+            "baseline_live_worker_signature": baseline_live_workers,
+            "current_live_worker_signature": current_live_workers,
+            "baseline_global_lease_signature": baseline_global_leases,
+            "current_global_lease_signature": current_global_leases,
+            "baseline_hbm_free_mb": baseline_hbm,
+            "current_hbm_free_mb": current_hbm,
+            "hbm_tolerance_mb": hbm_tolerance_mb,
+            "hbm_recovered": hbm_recovered,
+            "baseline_pool_failure_counters": baseline_failures,
+            "current_pool_failure_counters": current_failures,
+        }
         if (
             not _active_worker_leases(workers)
-            and not _live_workers(workers)
             and not _run_leases(cluster, run_ids)
+            and current_live_workers == baseline_live_workers
+            and current_global_leases == baseline_global_leases
+            and current_failures == baseline_failures
+            and hbm_recovered
         ):
+            last["recovered"] = True
             return last
         await asyncio.sleep(0.1)
-    raise TimeoutError(f"cold dispatch resources did not recover: {last}")
+    raise TimeoutError(f"Worker dispatch resources did not recover: {last}")
+
+
+async def _wait_initial_baseline(
+    client: UdsRuntimeClient,
+    *,
+    timeout_seconds: float,
+) -> tuple[dict[str, object], dict[str, object]]:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    last: tuple[dict[str, object], dict[str, object]] | None = None
+    while asyncio.get_running_loop().time() < deadline:
+        workers, cluster = await asyncio.gather(
+            client.query("GetWorkerPools", timeout_seconds=10),
+            client.query(
+                "GetClusterSnapshot",
+                filter="resources",
+                timeout_seconds=10,
+            ),
+        )
+        last = (workers, cluster)
+        pool = _worker_pool(workers)
+        mode = pool.get("mode")
+        live_workers = _live_workers(workers)
+        all_idle = all(
+            isinstance(worker, dict) and worker.get("state") == "idle"
+            for worker in live_workers
+        )
+        expected_count = 0 if mode == "cold_start" else 24
+        if (
+            mode in {"cold_start", "zero_hbm_standby"}
+            and not _active_worker_leases(workers)
+            and len(live_workers) == expected_count
+            and all_idle
+        ):
+            return workers, cluster
+        await asyncio.sleep(0.1)
+    raise TimeoutError(f"Worker Pool did not reach its idle baseline: {last}")
 
 
 async def _run_batch(
     client: UdsRuntimeClient,
     *,
     batch_size: int,
+    worker_pool_mode: str,
+    baseline_workers: Mapping[str, object],
+    baseline_cluster: Mapping[str, object],
     timeout_seconds: float,
 ) -> dict[str, object]:
     workflow, task_id = _build_workflow()
@@ -187,6 +376,9 @@ async def _run_batch(
         for run in runs
     ):
         raise RuntimeError(f"one or more probe Runs failed: {runs}")
+    attempt_violations = _attempt_violations(runs)
+    if attempt_violations:
+        raise RuntimeError(f"successful Tasks did not stay on Attempt 1: {attempt_violations}")
 
     results = await asyncio.gather(
         *(client.materialize_task_result(run_id, task_id) for run_id in sorted(run_ids))
@@ -203,6 +395,11 @@ async def _run_batch(
     worker_started = [
         item for item in events if item.get("event_type") == "worker_started"
     ]
+    dispatch_start_failed = [
+        item for item in events if item.get("event_type") == "dispatch_start_failed"
+    ]
+    if dispatch_start_failed:
+        raise RuntimeError(f"dispatch startup failed internally: {dispatch_start_failed}")
     if not (
         len(requested) == len(prepared_events) == len(worker_started) == batch_size
     ):
@@ -216,7 +413,7 @@ async def _run_batch(
     all_requested_before_first_prepared = (
         max(requested_sequences) < min(prepared_sequences)
     )
-    if not all_requested_before_first_prepared:
+    if worker_pool_mode == "cold_start" and not all_requested_before_first_prepared:
         raise RuntimeError(
             "cold dispatch startups did not overlap: "
             f"requested={requested_sequences}, prepared={prepared_sequences}"
@@ -249,7 +446,13 @@ async def _run_batch(
             for run_id in sorted(run_ids)
         )
     )
-    cleanup = await _wait_cleanup(client, run_ids, timeout_seconds=30)
+    cleanup = await _wait_cleanup(
+        client,
+        run_ids,
+        baseline_workers,
+        baseline_cluster,
+        timeout_seconds=30,
+    )
     return {
         "batch_size": batch_size,
         "run_ids": sorted(run_ids),
@@ -260,6 +463,9 @@ async def _run_batch(
         "prepared_sequences": prepared_sequences,
         "worker_started_sequences": [int(item["sequence"]) for item in worker_started],
         "all_requested_before_first_prepared": all_requested_before_first_prepared,
+        "worker_pool_mode": worker_pool_mode,
+        "dispatch_start_failed_count": len(dispatch_start_failed),
+        "attempt_violations": attempt_violations,
         "results": results,
         "runs": runs,
         "events": sorted(events, key=lambda item: int(item["sequence"])),
@@ -278,17 +484,17 @@ async def run(args: argparse.Namespace) -> int:
             raise RuntimeError(
                 f"expected eight healthy logical nodes, found {status.healthy_node_count}"
             )
-        workers = await client.query("GetWorkerPools", timeout_seconds=10)
-        pool = workers.get("worker_pool")
-        if not isinstance(pool, dict) or pool.get("mode") != "cold_start":
-            raise RuntimeError(f"acceptance requires a cold_start Worker Pool: {pool}")
-        if _active_worker_leases(workers) or _live_workers(workers):
-            raise RuntimeError("Worker Pool is not idle before acceptance")
+        workers, cluster = await _wait_initial_baseline(client, timeout_seconds=30)
+        pool = _worker_pool(workers)
+        worker_pool_mode = str(pool.get("mode"))
         await client._ensure_data_store()  # noqa: SLF001
         results = [
             await _run_batch(
                 client,
                 batch_size=size,
+                worker_pool_mode=worker_pool_mode,
+                baseline_workers=workers,
+                baseline_cluster=cluster,
                 timeout_seconds=args.timeout_seconds,
             )
             for size in args.batch_size
@@ -303,6 +509,7 @@ async def run(args: argparse.Namespace) -> int:
                 "healthy_node_count": status.healthy_node_count,
             },
             "initial_worker_pool": workers,
+            "initial_cluster": cluster,
             "results": results,
             "succeeded": all(bool(item.get("succeeded")) for item in results),
         }
