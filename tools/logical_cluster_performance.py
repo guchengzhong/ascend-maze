@@ -1641,8 +1641,7 @@ async def _run_ray_worker(
         ray.shutdown()
 
 
-def _case_from_file(path: Path) -> WorkloadCase:
-    payload = _read_json(path)
+def _case_from_payload(payload: Mapping[str, object]) -> WorkloadCase:
     return WorkloadCase(
         case_id=str(payload["case_id"]),
         mode=str(payload["mode"]),
@@ -1672,6 +1671,10 @@ def _case_from_file(path: Path) -> WorkloadCase:
             else float(payload["admission_window_seconds"])
         ),
     )
+
+
+def _case_from_file(path: Path) -> WorkloadCase:
+    return _case_from_payload(_read_json(path))
 
 
 def _run_internal_worker(args: argparse.Namespace) -> int:
@@ -1758,6 +1761,176 @@ def _control_environment(state_root: Path) -> dict[str, object]:
         "model_catalog_sha256": _sha256(catalog_path),
         "model_catalog": catalog,
     }
+
+
+def _load_resume_state(
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> tuple[
+    dict[str, object],
+    tuple[WorkloadCase, ...],
+    tuple[tuple[WorkloadCase, str, int], ...],
+]:
+    plan_path = output_dir / "plan.json"
+    manifest_path = output_dir / "workload_manifest.json"
+    if not plan_path.is_file():
+        raise PerformancePilotError(f"resume plan is missing: {plan_path}")
+    plan = _read_json(plan_path)
+    if plan.get("objective") != OBJECTIVE or plan.get("schema_version") != SCHEMA_VERSION:
+        raise PerformancePilotError("resume plan has an incompatible objective or schema")
+
+    raw_cases = plan.get("cases")
+    if not isinstance(raw_cases, list) or not raw_cases:
+        raise PerformancePilotError("resume plan contains no workload cases")
+    cases = tuple(
+        _case_from_payload(item)
+        for item in raw_cases
+        if isinstance(item, Mapping)
+    )
+    if len(cases) != len(raw_cases):
+        raise PerformancePilotError("resume plan contains an invalid workload case")
+
+    executor = str(plan.get("executor", ""))
+    if executor not in {"paired", "maze", "ray"}:
+        raise PerformancePilotError(f"resume plan has an invalid executor: {executor}")
+    args.executor = executor
+    order = _execution_order(cases, executor)
+    expected_order = [
+        (case.case_id, item_executor, pair_position)
+        for case, item_executor, pair_position in order
+    ]
+    raw_order = plan.get("execution_order")
+    if not isinstance(raw_order, list):
+        raise PerformancePilotError("resume plan contains no execution order")
+    frozen_order = [
+        (
+            str(item.get("case_id")),
+            str(item.get("executor")),
+            int(item.get("pair_position", 0)),
+        )
+        for item in raw_order
+        if isinstance(item, Mapping)
+    ]
+    if frozen_order != expected_order:
+        raise PerformancePilotError("resume execution order does not match frozen cases")
+
+    contract = plan.get("contract")
+    if not isinstance(contract, Mapping):
+        raise PerformancePilotError("resume plan contains no experiment contract")
+    frozen_manifest = contract.get("workload_manifest")
+    if frozen_manifest is not None:
+        if not manifest_path.is_file():
+            raise PerformancePilotError(f"resume manifest is missing: {manifest_path}")
+        manifest = _read_json(manifest_path)
+        if manifest != frozen_manifest:
+            raise PerformancePilotError("resume manifest differs from the frozen plan")
+        args.workload_manifest = manifest_path
+    else:
+        args.workload_manifest = None
+
+    for argument, contract_key in (
+        ("text_model_path", "text_model_path"),
+        ("vision_model_path", "vision_model_path"),
+    ):
+        value = contract.get(contract_key)
+        if not isinstance(value, str) or not value:
+            raise PerformancePilotError(
+                f"resume contract is missing {contract_key}"
+            )
+        setattr(args, argument, Path(value).expanduser().resolve())
+    for argument, contract_key in (
+        ("request_timeout_seconds", "request_timeout_seconds"),
+        ("case_timeout_seconds", "case_timeout_seconds"),
+        ("ray_task_num_cpus", "ray_task_num_cpus"),
+    ):
+        value = contract.get(contract_key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise PerformancePilotError(
+                f"resume contract is missing {contract_key}"
+            )
+        setattr(args, argument, float(value))
+
+    frozen_control = plan.get("control_environment")
+    current_control = _control_environment(args.state_root)
+    if not isinstance(frozen_control, Mapping):
+        raise PerformancePilotError("resume plan contains no control environment")
+    for key in ("profile", "controller_config_sha256", "model_catalog_sha256"):
+        if frozen_control.get(key) != current_control.get(key):
+            raise PerformancePilotError(
+                f"resume control environment changed: {key}"
+            )
+    if current_control.get("profile") != "performance":
+        raise PerformancePilotError(
+            "resume requires the frozen performance control profile"
+        )
+    return plan, cases, order
+
+
+def _completed_case_result(
+    output_dir: Path,
+    case: WorkloadCase,
+    executor: str,
+) -> dict[str, object] | None:
+    result_path = output_dir / "cases" / case.case_id / executor / "result.json"
+    if not result_path.is_file():
+        return None
+    result = _read_json(result_path)
+    frozen_case = result.get("case")
+    process = result.get("process")
+    aggregate = result.get("aggregate")
+    resources = result.get("resources")
+    physical = result.get("physical_hbm_recovery")
+    resource_path = result.get("resource_samples_path")
+    complete = (
+        result.get("executor") == executor
+        and isinstance(frozen_case, Mapping)
+        and frozen_case.get("case_id") == case.case_id
+        and isinstance(process, Mapping)
+        and process.get("exit_code") == 0
+        and isinstance(aggregate, Mapping)
+        and isinstance(resources, Mapping)
+        and isinstance(resources.get("sample_count"), int)
+        and int(resources["sample_count"]) > 0
+        and isinstance(physical, Mapping)
+        and isinstance(physical.get("recovered"), bool)
+        and isinstance(resource_path, str)
+        and Path(resource_path).is_file()
+    )
+    if executor == "maze":
+        control = result.get("control_recovery")
+        complete = (
+            complete
+            and isinstance(control, Mapping)
+            and isinstance(control.get("recovered"), bool)
+        )
+    return result if complete else None
+
+
+def _archive_incomplete_case(
+    output_dir: Path,
+    case: WorkloadCase,
+    executor: str,
+) -> Path | None:
+    case_dir = output_dir / "cases" / case.case_id / executor
+    if not case_dir.is_dir():
+        return None
+    candidates = [
+        path
+        for path in case_dir.iterdir()
+        if path.name != "incomplete_attempts"
+    ]
+    if not candidates:
+        return None
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    archive = case_dir / "incomplete_attempts" / timestamp
+    suffix = 1
+    while archive.exists():
+        archive = case_dir / "incomplete_attempts" / f"{timestamp}-{suffix}"
+        suffix += 1
+    archive.mkdir(parents=True)
+    for path in candidates:
+        path.replace(archive / path.name)
+    return archive
 
 
 def _worker_command(
@@ -1917,6 +2090,8 @@ def _fmt(value: object, digits: int = 2) -> str:
 
 
 def _render_report(summary: Mapping[str, object]) -> str:
+    contract = summary.get("contract")
+    contract = contract if isinstance(contract, Mapping) else {}
     lines = [
         "# Ascend-Maze / Ray 八逻辑节点性能 Pilot",
         "",
@@ -1932,6 +2107,9 @@ def _render_report(summary: Mapping[str, object]) -> str:
         "- Maze：按 CPU、I/O、NPU slot 和实测 HBM 预算共卡；文本/视觉实例预算为 13824/11776 MB",
         "- 页缓存：两个执行器测量前均读取两套模型文件；每个 Task 仍创建新进程并把权重搬到 NPU",
         "- E2E：客户端开始准备并提交请求，到终态结果返回；`DestroyRun` 不计入",
+        "- 硬截止：请求 "
+        f"{_fmt(contract.get('request_timeout_seconds'), 0)} 秒；Case "
+        f"{_fmt(contract.get('case_timeout_seconds'), 0)} 秒",
         "",
         "## 汇总",
         "",
@@ -2103,59 +2281,90 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
         else (DEFAULT_OUTPUT_ROOT / f"pilot-{timestamp}").resolve()
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    if args.mixed_batch20:
-        manifest = _build_fixed_batch20_manifest(
-            _discover_mixed_candidates(args.data_root)
-        )
-        args.workload_manifest = output_dir / "workload_manifest.json"
-        _write_json(args.workload_manifest, manifest)
-    elif args.workload_manifest is not None:
-        manifest = _read_json(args.workload_manifest)
-        copied_manifest_path = output_dir / "workload_manifest.json"
-        _write_json(copied_manifest_path, manifest)
-        args.workload_manifest = copied_manifest_path
+    resume: dict[str, object] | None = None
+    if args.resume:
+        plan, cases, order = _load_resume_state(args, output_dir)
+        contract = plan.get("contract")
+        assert isinstance(contract, Mapping)
+        frozen_manifest = contract.get("workload_manifest")
+        manifest = dict(frozen_manifest) if isinstance(frozen_manifest, Mapping) else None
+        control_environment = _control_environment(args.state_root)
+        resume = {
+            "resumed_at_ms": int(time.time() * 1_000),
+            "command": sys.argv,
+            "git": _git_environment(),
+            "reused_results": [],
+            "rerun_results": [],
+            "archived_incomplete_attempts": [],
+        }
     else:
-        manifest = None
-    cases = _build_cases(args)
-    order = _execution_order(cases, str(args.executor))
-    control_environment = _control_environment(args.state_root)
-    plan = {
-        "schema_version": SCHEMA_VERSION,
-        "objective": OBJECTIVE,
-        "created_at_ms": int(time.time() * 1_000),
-        "executor": args.executor,
-        "cases": [case.payload() for case in cases],
-        "execution_order": [
-            {
-                "ordinal": ordinal,
-                "case_id": case.case_id,
-                "executor": executor,
-                "pair_position": pair_position,
-            }
-            for ordinal, (case, executor, pair_position) in enumerate(order, start=1)
-        ],
-        "contract": {
-            "workload_manifest": manifest,
-            "text_model_id": TEXT_MODEL_ID,
-            "text_model_path": str(args.text_model_path),
-            "vision_model_id": VISION_MODEL_ID,
-            "vision_model_path": str(args.vision_model_path),
-            "inference_backend": "transformers",
-            "generation_method": "manual_greedy",
-            "max_tokens": 4096,
-            "temperature": 0.0,
-            "max_model_len": 10240,
-            "model_load_in_request_e2e": True,
-            "destroy_in_request_e2e": False,
-            "ray_worker_max_calls": ray_smoke.RAY_TASK_MAX_CALLS,
-            "ray_task_num_cpus": float(args.ray_task_num_cpus),
-        },
-        "control_environment": control_environment,
-        "git": _git_environment(),
-        "command": sys.argv,
-        "output_dir": str(output_dir),
-    }
-    _write_json(output_dir / "plan.json", plan)
+        if args.mixed_batch20:
+            manifest = _build_fixed_batch20_manifest(
+                _discover_mixed_candidates(args.data_root)
+            )
+            args.workload_manifest = output_dir / "workload_manifest.json"
+            _write_json(args.workload_manifest, manifest)
+        elif args.workload_manifest is not None:
+            manifest = _read_json(args.workload_manifest)
+            copied_manifest_path = output_dir / "workload_manifest.json"
+            _write_json(copied_manifest_path, manifest)
+            args.workload_manifest = copied_manifest_path
+        else:
+            manifest = None
+        cases = _build_cases(args)
+        order = _execution_order(cases, str(args.executor))
+        control_environment = _control_environment(args.state_root)
+        plan = {
+            "schema_version": SCHEMA_VERSION,
+            "objective": OBJECTIVE,
+            "created_at_ms": int(time.time() * 1_000),
+            "executor": args.executor,
+            "cases": [case.payload() for case in cases],
+            "execution_order": [
+                {
+                    "ordinal": ordinal,
+                    "case_id": case.case_id,
+                    "executor": executor,
+                    "pair_position": pair_position,
+                }
+                for ordinal, (case, executor, pair_position) in enumerate(
+                    order, start=1
+                )
+            ],
+            "contract": {
+                "workload_manifest": manifest,
+                "text_model_id": TEXT_MODEL_ID,
+                "text_model_path": str(args.text_model_path),
+                "vision_model_id": VISION_MODEL_ID,
+                "vision_model_path": str(args.vision_model_path),
+                "inference_backend": "transformers",
+                "generation_method": "manual_greedy",
+                "max_tokens": 4096,
+                "temperature": 0.0,
+                "max_model_len_by_family": {"text": 10240, "vision": 12288},
+                "request_timeout_seconds": float(args.request_timeout_seconds),
+                "case_timeout_seconds": float(args.case_timeout_seconds),
+                "resource_sample_interval_seconds": float(
+                    args.resource_sample_interval_seconds
+                ),
+                "resource_baseline_seconds": float(args.resource_baseline_seconds),
+                "resource_recovery_timeout_seconds": float(
+                    args.resource_recovery_timeout_seconds
+                ),
+                "hbm_recovery_tolerance_mb": int(
+                    args.hbm_recovery_tolerance_mb
+                ),
+                "model_load_in_request_e2e": True,
+                "destroy_in_request_e2e": False,
+                "ray_worker_max_calls": ray_smoke.RAY_TASK_MAX_CALLS,
+                "ray_task_num_cpus": float(args.ray_task_num_cpus),
+            },
+            "control_environment": control_environment,
+            "git": _git_environment(),
+            "command": sys.argv,
+            "output_dir": str(output_dir),
+        }
+        _write_json(output_dir / "plan.json", plan)
     if args.plan_only:
         summary = {
             **plan,
@@ -2184,28 +2393,61 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
     container_output_dir = _container_output_path(output_dir, args.state_root)
     results: list[dict[str, object]] = []
     for ordinal, (case, executor, pair_position) in enumerate(order, start=1):
-        print(
-            json.dumps(
-                {
-                    "event": "case_start",
-                    "ordinal": ordinal,
-                    "case_id": case.case_id,
-                    "executor": executor,
-                }
-            ),
-            flush=True,
+        reused = (
+            _completed_case_result(output_dir, case, executor)
+            if args.resume
+            else None
         )
-        result = _run_container_worker(
-            args=args,
-            executor=executor,
-            case=case,
-            output_dir=output_dir,
-            container_output_dir=container_output_dir,
-        )
-        result["execution_ordinal"] = ordinal
-        result["pair_position"] = pair_position
-        results.append(result)
-        _write_json(output_dir / "partial_summary.json", {**plan, "results": results})
+        if reused is not None:
+            assert resume is not None
+            resume["reused_results"].append(  # type: ignore[union-attr]
+                {"case_id": case.case_id, "executor": executor}
+            )
+            result = reused
+            print(
+                json.dumps(
+                    {
+                        "event": "case_reused",
+                        "ordinal": ordinal,
+                        "case_id": case.case_id,
+                        "executor": executor,
+                    }
+                ),
+                flush=True,
+            )
+        else:
+            if args.resume:
+                assert resume is not None
+                archive = _archive_incomplete_case(output_dir, case, executor)
+                if archive is not None:
+                    resume["archived_incomplete_attempts"].append(  # type: ignore[union-attr]
+                        {
+                            "case_id": case.case_id,
+                            "executor": executor,
+                            "path": str(archive),
+                        }
+                    )
+                resume["rerun_results"].append(  # type: ignore[union-attr]
+                    {"case_id": case.case_id, "executor": executor}
+                )
+            print(
+                json.dumps(
+                    {
+                        "event": "case_start",
+                        "ordinal": ordinal,
+                        "case_id": case.case_id,
+                        "executor": executor,
+                    }
+                ),
+                flush=True,
+            )
+            result = _run_container_worker(
+                args=args,
+                executor=executor,
+                case=case,
+                output_dir=output_dir,
+                container_output_dir=container_output_dir,
+            )
         print(
             json.dumps(
                 {
@@ -2217,6 +2459,13 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
                 }
             ),
             flush=True,
+        )
+        result["execution_ordinal"] = ordinal
+        result["pair_position"] = pair_position
+        results.append(result)
+        _write_json(
+            output_dir / "partial_summary.json",
+            {**plan, "resume": resume, "results": results},
         )
     failed = [
         result
@@ -2236,6 +2485,7 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
         "result": "succeeded" if not failed else "failed",
         "result_count": len(results),
         "failed_result_count": len(failed),
+        "resume": resume,
         "results": results,
     }
     _write_json(output_dir / "summary.json", summary)
@@ -2294,6 +2544,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "resume a frozen output directory, reuse complete case results, and "
+            "rerun only cases missing host resource evidence"
+        ),
+    )
+    parser.add_argument(
         "--internal-worker",
         choices=("maze", "ray"),
         default=None,
@@ -2310,6 +2568,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     args = parser.parse_args(argv)
+    if args.resume and args.output_dir is None:
+        parser.error("--resume requires --output-dir")
+    if args.resume and args.plan_only:
+        parser.error("--resume cannot be combined with --plan-only")
+    if args.resume and args.internal_worker is not None:
+        parser.error("--resume is only valid for the host orchestrator")
     if args.mode is None:
         args.mode = ["batch", "arrival"]
     if args.batch_size is None:

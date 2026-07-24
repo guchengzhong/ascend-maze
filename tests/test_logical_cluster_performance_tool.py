@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.util
+import json
 from pathlib import Path
 import sys
+
+import pytest
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -502,3 +505,160 @@ def test_report_states_pilot_boundaries() -> None:
     assert "batch-1" in report
     assert "P95 和吞吐量用于 Pilot 对比" in report
     assert "不代表真实跨机网络性能" in report
+
+
+def _resume_fixture(tmp_path: Path) -> tuple[Path, argparse.Namespace]:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    text_model = tmp_path / "text-model"
+    vision_model = tmp_path / "vision-model"
+    text_model.mkdir()
+    vision_model.mkdir()
+    case = performance.WorkloadCase(
+        case_id="batch-20",
+        mode="batch",
+        request_count=20,
+        launch_offsets_ms=(0,) * 20,
+        batch_size=20,
+    )
+    manifest = {
+        "schema_version": 1,
+        "request_count": 20,
+        "entries": [],
+    }
+    control = {
+        "profile": "performance",
+        "controller_config_sha256": "controller-sha",
+        "model_catalog_sha256": "catalog-sha",
+    }
+    plan = {
+        "schema_version": performance.SCHEMA_VERSION,
+        "objective": performance.OBJECTIVE,
+        "executor": "paired",
+        "cases": [case.payload()],
+        "execution_order": [
+            {
+                "ordinal": 1,
+                "case_id": "batch-20",
+                "executor": "maze",
+                "pair_position": 1,
+            },
+            {
+                "ordinal": 2,
+                "case_id": "batch-20",
+                "executor": "ray",
+                "pair_position": 2,
+            },
+        ],
+        "contract": {
+            "workload_manifest": manifest,
+            "text_model_path": str(text_model),
+            "vision_model_path": str(vision_model),
+            "request_timeout_seconds": 3600.0,
+            "case_timeout_seconds": 4500.0,
+            "ray_task_num_cpus": 20.0,
+        },
+        "control_environment": control,
+    }
+    (output_dir / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    (output_dir / "workload_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    args = argparse.Namespace(
+        state_root=tmp_path,
+        executor="paired",
+        workload_manifest=None,
+        text_model_path=Path("unused-text"),
+        vision_model_path=Path("unused-vision"),
+        request_timeout_seconds=1.0,
+        case_timeout_seconds=1.0,
+        ray_task_num_cpus=1.0,
+    )
+    return output_dir, args
+
+
+def test_resume_loads_frozen_plan_and_rejects_manifest_drift(tmp_path: Path) -> None:
+    output_dir, args = _resume_fixture(tmp_path)
+    original = performance._control_environment  # noqa: SLF001
+    performance._control_environment = lambda _state_root: {  # type: ignore[assignment]  # noqa: SLF001,E501
+        "profile": "performance",
+        "controller_config_sha256": "controller-sha",
+        "model_catalog_sha256": "catalog-sha",
+    }
+    try:
+        plan, cases, order = performance._load_resume_state(  # noqa: SLF001
+            args, output_dir
+        )
+        assert plan["executor"] == "paired"
+        assert [item.case_id for item in cases] == ["batch-20"]
+        assert [item[1] for item in order] == ["maze", "ray"]
+        assert args.request_timeout_seconds == 3600.0
+        assert args.case_timeout_seconds == 4500.0
+        assert args.workload_manifest == output_dir / "workload_manifest.json"
+
+        (output_dir / "workload_manifest.json").write_text(
+            json.dumps({"request_count": 19}), encoding="utf-8"
+        )
+        with pytest.raises(
+            performance.PerformancePilotError,
+            match="manifest differs",
+        ):
+            performance._load_resume_state(args, output_dir)  # noqa: SLF001
+    finally:
+        performance._control_environment = original  # type: ignore[assignment]  # noqa: SLF001
+
+
+def test_resume_reuses_only_complete_resource_evidence_and_archives_partial(
+    tmp_path: Path,
+) -> None:
+    output_dir, _args = _resume_fixture(tmp_path)
+    case = performance.WorkloadCase(
+        case_id="batch-20",
+        mode="batch",
+        request_count=20,
+        launch_offsets_ms=(0,) * 20,
+        batch_size=20,
+    )
+    maze_dir = output_dir / "cases" / "batch-20" / "maze"
+    maze_dir.mkdir(parents=True)
+    resources = maze_dir / "resource_samples.jsonl"
+    resources.write_text("{}\n", encoding="utf-8")
+    result = {
+        "executor": "maze",
+        "case": case.payload(),
+        "process": {"exit_code": 0},
+        "aggregate": {"failed": 0},
+        "resources": {"sample_count": 1},
+        "resource_samples_path": str(resources),
+        "physical_hbm_recovery": {"recovered": True},
+        "control_recovery": {"recovered": True},
+    }
+    (maze_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    reused = performance._completed_case_result(  # noqa: SLF001
+        output_dir, case, "maze"
+    )
+    assert reused is not None
+
+    result["resources"] = {"sample_count": 0}
+    (maze_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    assert (
+        performance._completed_case_result(output_dir, case, "maze")  # noqa: SLF001
+        is None
+    )
+
+    ray_dir = output_dir / "cases" / "batch-20" / "ray"
+    ray_dir.mkdir(parents=True)
+    (ray_dir / "runner.json").write_text('{"succeeded": 20}', encoding="utf-8")
+    (ray_dir / "stdout.log").write_text("20/20\n", encoding="utf-8")
+    archive = performance._archive_incomplete_case(  # noqa: SLF001
+        output_dir, case, "ray"
+    )
+    assert archive is not None
+    assert (archive / "runner.json").is_file()
+    assert (archive / "stdout.log").is_file()
+    assert not (ray_dir / "runner.json").exists()
+
+
+def test_resume_cli_requires_an_existing_output_directory_argument() -> None:
+    with pytest.raises(SystemExit):
+        performance.parse_args(["--resume"])
