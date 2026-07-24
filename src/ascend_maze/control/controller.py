@@ -288,6 +288,7 @@ class InMemoryController:
         )
         self._submissions: dict[str, _SubmissionRecord] = {}
         self._submit_lock = asyncio.Lock()
+        self._submission_tasks: set[asyncio.Task[SubmissionOutcome]] = set()
         self._failure_points: set[str] = set()
         self._started = False
         self._checkpoint_sequence = (
@@ -295,6 +296,7 @@ class InMemoryController:
         )
         self._checkpoint_lock = asyncio.Lock()
         self._checkpoint_tasks: set[asyncio.Task[None]] = set()
+        self._checkpoint_schedule_dirty = False
         self._pending_recovery = recovered
         self.shutdown_drain_timeout_ms = shutdown_drain_timeout_ms
         self.shutdown_cleanup_timeout_ms = shutdown_cleanup_timeout_ms
@@ -721,6 +723,23 @@ class InMemoryController:
         *,
         lose_response_after_commit: bool = False,
     ) -> SubmissionOutcome:
+        transaction = asyncio.create_task(
+            self._submit_transaction(
+                request,
+                lose_response_after_commit=lose_response_after_commit,
+            ),
+            name=f"maze-submit:{request.contract.submission_id}",
+        )
+        self._submission_tasks.add(transaction)
+        transaction.add_done_callback(self._submission_task_finished)
+        return await asyncio.shield(transaction)
+
+    async def _submit_transaction(
+        self,
+        request: SubmitRequest,
+        *,
+        lose_response_after_commit: bool = False,
+    ) -> SubmissionOutcome:
         trace_started = perf_counter()
         trace: dict[str, object] = {
             "submission_id": request.contract.submission_id,
@@ -889,6 +908,14 @@ class InMemoryController:
                     "submission committed but its response was intentionally lost"
                 )
             return outcome
+
+    def _submission_task_finished(
+        self,
+        task: asyncio.Task[SubmissionOutcome],
+    ) -> None:
+        self._submission_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
 
     async def wait_run(
         self,
@@ -1519,9 +1546,17 @@ class InMemoryController:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        task = loop.create_task(self._save_checkpoint())
+        self._checkpoint_schedule_dirty = True
+        if any(not task.done() for task in self._checkpoint_tasks):
+            return
+        task = loop.create_task(self._drain_scheduled_checkpoints())
         self._checkpoint_tasks.add(task)
         task.add_done_callback(self._checkpoint_tasks.discard)
+
+    async def _drain_scheduled_checkpoints(self) -> None:
+        while self._checkpoint_schedule_dirty:
+            self._checkpoint_schedule_dirty = False
+            await self._save_checkpoint()
 
     async def _wait_checkpoint_tasks(self) -> None:
         tasks = tuple(self._checkpoint_tasks)

@@ -6,6 +6,14 @@ import importlib.util
 from pathlib import Path
 import sys
 
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover
+    import tomli as tomllib
+
+from ascend_maze.contracts.resources import ReservationVector
+from ascend_maze.placement import NodeCapacity, NpuCapacity, PlacementManager
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = ROOT / "tools" / "logical_cluster_performance.py"
@@ -58,6 +66,60 @@ def test_cases_and_paired_order_alternate_first_executor() -> None:
     ]
 
 
+def test_fixed_mixed_batch20_manifest_is_deterministic_and_covers_all_workflows() -> None:
+    samples = []
+    query_index = 0
+    for dataset, workflow in performance.qwen_smoke.WORKFLOW_MODULES:
+        family = (
+            "vision"
+            if (dataset, workflow) in performance.qwen_smoke.VISION_WORKFLOWS
+            else "text"
+        )
+        for offset in range(2):
+            samples.append(
+                performance.qwen_smoke.SampleSpec(
+                    dataset=dataset,
+                    workflow=workflow,
+                    family=family,
+                    dag_id=f"{dataset}-{workflow}-{offset}",
+                    query_index=query_index,
+                    inputs={},
+                    source_files=(),
+                    expected_answer="",
+                    vision_mode="true_multimodal" if family == "vision" else None,
+                )
+            )
+            query_index += 1
+
+    manifest = performance._build_fixed_batch20_manifest(samples)  # noqa: SLF001
+    entries = manifest["entries"]
+
+    assert manifest["request_count"] == 20
+    assert len(entries) == 20
+    assert len({item["sample_id"] for item in entries}) == 20
+    assert {(item["dataset"], item["workflow"]) for item in entries} == set(
+        performance.qwen_smoke.WORKFLOW_MODULES
+    )
+    assert [item["selection_reason"] for item in entries].count(
+        "first_sample_per_workflow"
+    ) == 14
+    assert [item["selection_reason"] for item in entries].count(
+        "second_sample_visual_workflow"
+    ) == 3
+    assert [item["selection_reason"] for item in entries].count(
+        "second_sample_dataset_text_representative"
+    ) == 3
+    assert sum(item["family"] == "vision" for item in entries) == 6
+    assert sum(item["family"] == "text" for item in entries) == 14
+    assert all(
+        item["target_model_id"]
+        == (
+            performance.VISION_MODEL_ID
+            if item["family"] == "vision"
+            else performance.TEXT_MODEL_ID
+        )
+        for item in entries
+    )
 def test_request_aggregate_uses_client_e2e_and_makespan() -> None:
     aggregate = performance._aggregate_requests(  # noqa: SLF001
         [
@@ -108,6 +170,7 @@ def test_resource_aggregate_keeps_cluster_and_per_device_metrics() -> None:
                     "physical_device_id": "0",
                     "utilization_pct": 80.0,
                     "used_hbm_mb": 1_000,
+                    "processes": [{"pid": 1}, {"pid": 2}],
                 }
             ],
             "errors": [],
@@ -123,12 +186,62 @@ def test_resource_aggregate_keeps_cluster_and_per_device_metrics() -> None:
     assert aggregate["cluster_cpu_utilization_pct"]["mean"] == 20.0
     assert aggregate["incremental_cluster_cpu_utilization_pct"] == 19.0
     assert aggregate["per_device"]["0"]["utilization_pct"]["max"] == 80.0
+    assert aggregate["per_device"]["0"]["npu_process_count"]["max"] == 2.0
+
+
+def test_breakdowns_group_family_workflow_and_task_timings() -> None:
+    records = [
+        {
+            "status": "succeeded",
+            "dataset": "gaia",
+            "workflow": "vision",
+            "family": "vision",
+            "client_e2e_ms": 200,
+            "client_e2e_started_at_ms": 1_000,
+            "client_e2e_finished_at_ms": 1_200,
+            "transformers_local_records": [
+                {"model_load_ms": 50, "generate_ms": 75}
+            ],
+            "task_timings": [{"worker_startup_ms": 10, "output_put_ms": 5}],
+            "dispatch_lifecycle": [{"queue_to_dispatch_ms": 20}],
+        },
+        {
+            "status": "succeeded",
+            "dataset": "tbench",
+            "workflow": "retail_cancel",
+            "family": "text",
+            "client_e2e_ms": 100,
+            "client_e2e_started_at_ms": 1_000,
+            "client_e2e_finished_at_ms": 1_100,
+            "transformers_local_records": [
+                {"model_load_ms": 40, "generate_ms": 60}
+            ],
+        },
+    ]
+
+    aggregate = performance._aggregate_breakdowns(  # noqa: SLF001
+        records,
+        mode="batch",
+        admission_window_seconds=None,
+    )
+
+    assert aggregate["overall"]["requests"]["p95_e2e_ms"] == 195.0
+    assert aggregate["families"]["vision"]["requests"]["request_count"] == 1
+    assert (
+        aggregate["workflows"]["tbench.retail_cancel"]["requests"]["succeeded"]
+        == 1
+    )
+    assert aggregate["overall"]["timings"]["model_load_ms"]["mean"] == 45.0
+    assert aggregate["families"]["vision"]["timings"]["queue_to_dispatch_ms"][
+        "mean"
+    ] == 20.0
 
 
 def test_performance_profile_enables_scheduler_pool_and_replicas() -> None:
     controller = prepare._controller_config("performance")  # noqa: SLF001
     catalog = prepare._model_catalog("performance")  # noqa: SLF001
     assert 'profile = "performance"' in controller
+    assert "controller-transformers-performance-v3.sqlite3" in controller
     assert 'policy = "hacs_no_tp"' in controller
     assert 'anchor_strategy = "static"' in controller
     assert "standby_min_idle = 1" in controller
@@ -136,6 +249,97 @@ def test_performance_profile_enables_scheduler_pool_and_replicas() -> None:
     assert catalog.count("max_replicas = 8") == 2
     assert catalog.count("max_parallel_starts = 8") == 2
     assert catalog.count("scale_cooldown_ms = 0") == 2
+    assert catalog.count("scale_down_idle_ms = 0") == 2
+    assert 'catalog_revision = "logical-performance-v3-' in catalog
+
+
+def _model_reservation(model: dict[str, object]) -> ReservationVector:
+    return ReservationVector(
+        cpu_num=int(model["instance_cpu_num"]),
+        host_mem_mb=int(model["instance_host_mem_mb"]),
+        io_slots=0,
+        npu_hbm_mb=int(model["instance_hbm_mb"]),
+        npu_slots=int(model["npu_slots"]),
+    )
+
+
+def _one_npu_node(*, total_hbm_mb: int) -> NodeCapacity:
+    return NodeCapacity(
+        node_id="node-0",
+        boot_id="boot-0",
+        node_ip="127.0.0.1",
+        cpu_total=20,
+        mem_total_mb=131_072,
+        cpu_system_reserved=0,
+        mem_system_reserved_mb=0,
+        io_slots_total=8,
+        npus=(
+            NpuCapacity(
+                device_id="0",
+                chip_type="910B3",
+                total_hbm_mb=total_hbm_mb,
+                system_reserved_hbm_mb=4_096,
+                task_slots_total=2,
+                observed_free_hbm_mb=total_hbm_mb - 3_210,
+            ),
+        ),
+        observed_free_mem_mb=131_072,
+    )
+
+
+def _reserve_model(
+    placement: PlacementManager,
+    model: dict[str, object],
+    instance_id: str,
+):
+    return placement.reserve_model_instance(
+        instance_id=instance_id,
+        generation=1,
+        resources=_model_reservation(model),
+        allow_colocation=bool(model["allow_colocation"]),
+        now_ms=1,
+        startup_deadline_ms=10_000,
+    )
+
+
+def test_calibrated_text_and_vision_instances_share_only_when_hbm_fits() -> None:
+    document = tomllib.loads(prepare._model_catalog("performance"))  # noqa: SLF001
+    models = {item["model_id"]: item for item in document["models"]}
+    text = models["qwen3-4b-e2e"]
+    vision = models["qwen2_5-vl-3b-e2e"]
+
+    assert (
+        text["weight_hbm_mb"],
+        text["runtime_hbm_mb"],
+        text["kv_cache_hbm_mb"],
+        text["instance_hbm_mb"],
+        text["allow_colocation"],
+    ) == (8_192, 4_096, 1_536, 13_824, True)
+    assert (
+        vision["weight_hbm_mb"],
+        vision["runtime_hbm_mb"],
+        vision["kv_cache_hbm_mb"],
+        vision["instance_hbm_mb"],
+        vision["allow_colocation"],
+    ) == (8_192, 3_072, 512, 11_776, True)
+
+    fitting = PlacementManager(npu_hbm_headroom_mb=1_024)
+    fitting.register_node(_one_npu_node(total_hbm_mb=65_536))
+    first = _reserve_model(fitting, text, "text-1")
+    second = _reserve_model(fitting, vision, "vision-1")
+    assert first.selected and second.selected
+    assert first.lease is not None and second.lease is not None
+    assert first.lease.npu_device_id == second.lease.npu_device_id == "0"
+    assert fitting.snapshot().nodes[0].per_npu_reserved == (
+        ("0", 13_824 + 11_776, 2),
+    )
+
+    insufficient = PlacementManager(npu_hbm_headroom_mb=1_024)
+    insufficient.register_node(_one_npu_node(total_hbm_mb=29_500))
+    assert _reserve_model(insufficient, text, "text-2").selected
+    blocked = _reserve_model(insufficient, vision, "vision-2")
+    assert not blocked.selected
+    assert blocked.rejection_reason == "insufficient_npu_hbm"
 
 
 def test_dispatch_lifecycle_records_starting_to_running_timeline() -> None:
@@ -238,6 +442,45 @@ def test_wait_maze_terminal_returns_runtime_task_timings() -> None:
     assert timings[0]["inference_metrics"][0]["model_load_ms"] == 4
 
 
+def test_maze_request_hard_timeout_returns_a_failed_record() -> None:
+    original = performance._run_maze_request  # noqa: SLF001
+
+    async def never_finishes(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    sample = argparse.Namespace(
+        sample_id="gaia-text-0",
+        dataset="gaia",
+        workflow="text",
+        family="text",
+    )
+    performance._run_maze_request = never_finishes  # type: ignore[assignment]  # noqa: SLF001
+    try:
+        record = asyncio.run(
+            performance._run_maze_request_bounded(  # noqa: SLF001
+                client=object(),
+                workflow=object(),
+                compiled=object(),
+                task_names={},
+                sample=sample,
+                target_model_id=performance.TEXT_MODEL_ID,
+                case_id="batch-20",
+                request_index=1,
+                timeout_seconds=10.0,
+                hard_timeout_seconds=0.01,
+            )
+        )
+    finally:
+        performance._run_maze_request = original  # type: ignore[assignment]  # noqa: SLF001
+
+    assert record["status"] == "failed"
+    assert record["sample_id"] == "gaia-text-0"
+    assert record["hard_timeout_seconds"] == 0.01
+    assert "hard deadline" in str(record["error"])
+
+
 def test_report_states_pilot_boundaries() -> None:
     report = performance._render_report(  # noqa: SLF001
         {
@@ -257,5 +500,5 @@ def test_report_states_pilot_boundaries() -> None:
         }
     )
     assert "batch-1" in report
-    assert "P95 在单请求或双请求 Pilot" in report
+    assert "P95 和吞吐量用于 Pilot 对比" in report
     assert "不代表真实跨机网络性能" in report

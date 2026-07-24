@@ -350,6 +350,7 @@ class SchedulerCore:
         self._dispatches: dict[str, _DispatchRecord] = {}
         self._pending_dispatches: dict[str, _DispatchStartupRecord] = {}
         self._dispatch_startup_generation = 0
+        self._pending_resource_change_keys: set[str | None] = set()
         self._attempt_routes: dict[tuple[str, str, int], ModelRouteLease] = {}
         self._recorded_inference_routes: set[str] = set()
         self._recorded_route_terminals: set[str] = set()
@@ -501,24 +502,24 @@ class SchedulerCore:
                 future,
             )
         )
-        return await future
+        return await asyncio.shield(future)
 
     async def cancel_run(self, run_id: str, *, reason: str) -> RunSnapshot:
         future: asyncio.Future[RunSnapshot] = self._new_future()
         await self._queue.put(
             _CancelCommand(run_id, RunStatus.CANCELLED, reason, future)
         )
-        return await future
+        return await asyncio.shield(future)
 
     async def destroy_run(self, run_id: str, *, force: bool = False) -> DestroyResult:
         future: asyncio.Future[DestroyResult] = self._new_future()
         await self._queue.put(_DestroyCommand(run_id, force, future))
-        return await future
+        return await asyncio.shield(future)
 
     async def wake_deadlines(self) -> None:
         future: asyncio.Future[None] = self._new_future()
         await self._queue.put(_WakeCommand(future))
-        await future
+        await asyncio.shield(future)
 
     def post_resource_changed(
         self,
@@ -532,14 +533,22 @@ class SchedulerCore:
         if self._loop is None or not self._running:
             return False
         event = _ResourceChanged(reason, model_id)
+
+        def enqueue() -> None:
+            key = event.model_id
+            if key in self._pending_resource_change_keys:
+                return
+            self._pending_resource_change_keys.add(key)
+            self._queue.put_nowait(event)
+
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
             current_loop = None
         if current_loop is self._loop:
-            self._queue.put_nowait(event)
+            enqueue()
         else:
-            self._loop.call_soon_threadsafe(self._queue.put_nowait, event)
+            self._loop.call_soon_threadsafe(enqueue)
         return True
 
     def post_model_route_failure(
@@ -606,14 +615,14 @@ class SchedulerCore:
             return
         future: asyncio.Future[None] = self._new_future()
         await self._queue.put(_BeginDrainCommand(future))
-        await future
+        await asyncio.shield(future)
 
     async def shutdown(self, *, terminate_active_runs: bool = True) -> None:
         if not self._running:
             return
         future: asyncio.Future[None] = self._new_future()
         await self._queue.put(_ShutdownCommand(terminate_active_runs, future))
-        await future
+        await asyncio.shield(future)
         assert self._runner is not None
         await self._runner
         self._runner = None
@@ -836,11 +845,14 @@ class SchedulerCore:
             try:
                 if item is not None:
                     await self._process_item(item)
-                await self._process_due_deadlines()
+                processed_deadlines = await self._process_due_deadlines()
+                checkpoint_item = not isinstance(item, _ResourceChanged)
                 if self._running and self._dispatch_enabled:
-                    await self._checkpoint()
+                    if checkpoint_item or processed_deadlines:
+                        await self._checkpoint()
                     await self._dispatch_pass()
-                await self._checkpoint()
+                if checkpoint_item or processed_deadlines:
+                    await self._checkpoint()
             except Exception as exc:
                 await self._interrupt_after_scheduler_failure(exc)
                 if self._checkpoint_sink is not None:
@@ -863,21 +875,22 @@ class SchedulerCore:
             if isinstance(item, _CommitCommand):
                 commit_result = await self._commit(item)
                 await self._checkpoint()
-                item.future.set_result(commit_result)
+                self._complete_future(item.future, commit_result)
                 self._activate_run(item.run_id)
             elif isinstance(item, _CancelCommand):
                 cancel_result = await self._terminate_run(
                     item.run_id, item.target, item.reason
                 )
                 await self._checkpoint()
-                item.future.set_result(cancel_result)
+                self._complete_future(item.future, cancel_result)
             elif isinstance(item, _DestroyCommand):
                 destroy_result = await self._destroy(item.run_id, force=item.force)
                 await self._checkpoint()
-                item.future.set_result(destroy_result)
+                self._complete_future(item.future, destroy_result)
             elif isinstance(item, _WakeCommand):
-                item.future.set_result(None)
+                self._complete_future(item.future, None)
             elif isinstance(item, _ResourceChanged):
+                self._pending_resource_change_keys.discard(item.model_id)
                 if self.inference is not None:
                     self.inference.replicas.wake()
                 affected_run_ids: set[str] = set()
@@ -908,7 +921,7 @@ class SchedulerCore:
                 await self._runtime_binding_invalidated(item)
             elif isinstance(item, _BeginDrainCommand):
                 self._dispatch_enabled = False
-                item.future.set_result(None)
+                self._complete_future(item.future, None)
             elif isinstance(item, _ShutdownCommand):
                 self._dispatch_enabled = False
                 if item.terminate_active_runs:
@@ -922,15 +935,18 @@ class SchedulerCore:
                     self.inference.set_capacity_sink(None)
                     self.inference.set_route_failure_sink(None)
                 self._running = False
-                item.future.set_result(None)
+                self._complete_future(item.future, None)
             elif isinstance(item, RuntimeEvent):
                 await self._handle_runtime_event(item)
             else:
                 raise TypeError(f"unsupported SchedulerCore item: {type(item).__name__}")
         except Exception as exc:
             future = getattr(item, "future", None)
-            if future is not None and not future.done():
-                future.set_exception(exc)
+            if future is not None:
+                if not future.done():
+                    future.set_exception(exc)
+                elif not future.cancelled():
+                    raise
             elif isinstance(item, RuntimeEvent):
                 await self._fail_internal_runtime_event(item, exc)
             else:
@@ -1211,6 +1227,7 @@ class SchedulerCore:
                                 key.task_id,
                                 anchor.effective.npu_mem_mb,
                             )
+                            await self._checkpoint()
                             progress = True
                             break
                         reason = placement.rejection_reason or "placement_unavailable"
@@ -2410,9 +2427,11 @@ class SchedulerCore:
             await self._cleanup_cancelled_attempts(run_id, result.cancelled_attempts)
             await self._on_run_terminal(run_id)
 
-    async def _process_due_deadlines(self) -> None:
-        for event in self.deadlines.pop_due(self.clock.monotonic_ms()):
+    async def _process_due_deadlines(self) -> bool:
+        events = self.deadlines.pop_due(self.clock.monotonic_ms())
+        for event in events:
             await self._handle_deadline(event)
+        return bool(events)
 
     async def _handle_deadline(self, event: DeadlineEvent) -> None:
         if event.kind is DeadlineKind.RUN:
@@ -2746,7 +2765,10 @@ class SchedulerCore:
             return False
         if not pending.task.done():
             pending.task.cancel()
-        handle = await pending.task
+        try:
+            handle = await pending.task
+        except asyncio.CancelledError:
+            handle = None
         if handle is not None:
             await self.runtime.cancel(handle, reason)
         return True
@@ -3348,3 +3370,10 @@ class SchedulerCore:
 
     def _new_future(self) -> asyncio.Future[Any]:
         return asyncio.get_running_loop().create_future()
+
+    @staticmethod
+    def _complete_future(future: asyncio.Future[Any], result: object) -> bool:
+        if future.done():
+            return False
+        future.set_result(result)
+        return True

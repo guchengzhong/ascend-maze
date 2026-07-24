@@ -34,7 +34,7 @@ def _controller_config(profile: str = "correctness") -> str:
     if profile not in {"correctness", "performance"}:
         raise ValueError(f"unsupported logical-cluster profile: {profile}")
     if profile == "performance":
-        recovery_name = "controller-transformers-performance-v2.sqlite3"
+        recovery_name = "controller-transformers-performance-v3.sqlite3"
         scheduler_policy = "hacs_no_tp"
         anchor_strategy = "static"
         task_slots_total = 2
@@ -137,7 +137,8 @@ def _model_catalog(profile: str = "correctness") -> str:
     max_replicas = 8 if profile == "performance" else 1
     max_parallel_starts = max_replicas
     scale_cooldown_ms = 0 if profile == "performance" else 600_000
-    catalog_profile = "performance-v2" if profile == "performance" else profile
+    scale_down_idle_ms = 0 if profile == "performance" else 600_000
+    catalog_profile = "performance-v3" if profile == "performance" else profile
     return f'''schema_version = 1
 catalog_revision = "logical-{catalog_profile}-{text_revision[:12]}-{vision_revision[:12]}"
 
@@ -152,12 +153,12 @@ tensor_parallel_size = 1
 max_model_len = 10240
 instance_cpu_num = 4
 instance_host_mem_mb = 16384
-weight_hbm_mb = 7500
-runtime_hbm_mb = 4000
-kv_cache_hbm_mb = 22000
-instance_hbm_mb = 36000
+weight_hbm_mb = 8192
+runtime_hbm_mb = 4096
+kv_cache_hbm_mb = 1536
+instance_hbm_mb = 13824
 npu_slots = 1
-allow_colocation = false
+allow_colocation = true
 request_capacity = 1
 required_capabilities = ["transformers_local"]
 min_replicas = 0
@@ -165,7 +166,7 @@ max_replicas = {max_replicas}
 target_route_utilization = 1.0
 scale_up_pending_threshold = 1
 scale_up_sustain_ms = 0
-scale_down_idle_ms = 600000
+scale_down_idle_ms = {scale_down_idle_ms}
 scale_cooldown_ms = {scale_cooldown_ms}
 max_parallel_starts = {max_parallel_starts}
 startup_timeout_ms = 600000
@@ -194,12 +195,12 @@ tensor_parallel_size = 1
 max_model_len = 12288
 instance_cpu_num = 4
 instance_host_mem_mb = 16384
-weight_hbm_mb = 18000
-runtime_hbm_mb = 8000
-kv_cache_hbm_mb = 20000
-instance_hbm_mb = 46000
+weight_hbm_mb = 8192
+runtime_hbm_mb = 3072
+kv_cache_hbm_mb = 512
+instance_hbm_mb = 11776
 npu_slots = 1
-allow_colocation = false
+allow_colocation = true
 request_capacity = 1
 required_capabilities = ["transformers_local"]
 min_replicas = 0
@@ -207,7 +208,7 @@ max_replicas = {max_replicas}
 target_route_utilization = 1.0
 scale_up_pending_threshold = 1
 scale_up_sustain_ms = 0
-scale_down_idle_ms = 600000
+scale_down_idle_ms = {scale_down_idle_ms}
 scale_cooldown_ms = {scale_cooldown_ms}
 max_parallel_starts = {max_parallel_starts}
 startup_timeout_ms = 600000

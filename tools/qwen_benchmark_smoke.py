@@ -1873,7 +1873,15 @@ async def _run_family(
         if trust_remote_code:
             launch_options["trust_remote_code"] = True
 
-    if is_vision:
+    calibrated_allow_colocation = args.inference_backend == "transformers"
+    if is_vision and calibrated_allow_colocation:
+        weight_hbm_mb = 8_192
+        runtime_hbm_mb = 3_072
+        kv_cache_hbm_mb = 512
+        instance_hbm_mb = 11_776
+        max_model_len = int(args.vision_max_model_len)
+        dtype = str(args.vision_dtype)
+    elif is_vision:
         if args.inference_backend == "vllm":
             launch_options["generation_config"] = "vllm"
             launch_options["qwen2_5_vl_cpu_unique_consecutive_workaround"] = True
@@ -1883,6 +1891,13 @@ async def _run_family(
         instance_hbm_mb = 46_000
         max_model_len = int(args.vision_max_model_len)
         dtype = str(args.vision_dtype)
+    elif calibrated_allow_colocation:
+        weight_hbm_mb = 8_192
+        runtime_hbm_mb = 4_096
+        kv_cache_hbm_mb = 1_536
+        instance_hbm_mb = 13_824
+        max_model_len = int(args.text_max_model_len)
+        dtype = str(args.text_dtype)
     else:
         weight_hbm_mb = 7_500
         runtime_hbm_mb = 4_000
@@ -1915,7 +1930,7 @@ async def _run_family(
         kv_cache_hbm_mb=kv_cache_hbm_mb,
         instance_hbm_mb=instance_hbm_mb,
         npu_slots=1,
-        allow_colocation=False,
+        allow_colocation=calibrated_allow_colocation,
         request_capacity=1,
         required_capabilities=(backend_name,),
         environment_fingerprint=environment.environment_fingerprint,

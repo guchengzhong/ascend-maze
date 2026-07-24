@@ -324,6 +324,7 @@ async def _run_batch(
     client: UdsRuntimeClient,
     *,
     batch_size: int,
+    healthy_node_count: int,
     worker_pool_mode: str,
     baseline_workers: Mapping[str, object],
     baseline_cluster: Mapping[str, object],
@@ -332,21 +333,34 @@ async def _run_batch(
     workflow, task_id = _build_workflow()
     compiled = workflow.compile()
     nonce = time.time_ns()
-    prepared = []
-    for index in range(batch_size):
+    async def prepare_and_submit(index: int) -> tuple[dict[str, object], dict[str, int]]:
         identity = f"async-dispatch:{batch_size}:{index}:{nonce}"
         submission_id = "async-" + hashlib.sha256(identity.encode()).hexdigest()[:28]
-        prepared.append(
-            await client.prepare_submission(
-                workflow,
-                inputs={"probe_id": identity},
-                submission_id=submission_id,
-                run_deadline_ms=round(timeout_seconds * 1_000),
-            )
+        started = time.perf_counter()
+        prepared = await client.prepare_submission(
+            workflow,
+            inputs={"probe_id": identity},
+            submission_id=submission_id,
+            run_deadline_ms=round(timeout_seconds * 1_000),
         )
-    outcomes = await asyncio.gather(
-        *(client.submit_prepared(item, timeout_seconds=30) for item in prepared)
+        prepared_at = time.perf_counter()
+        outcome = await client.submit_prepared(prepared, timeout_seconds=60)
+        committed_at = time.perf_counter()
+        return outcome, {
+            "request_index": index,
+            "prepare_ms": round((prepared_at - started) * 1_000),
+            "submit_ms": round((committed_at - prepared_at) * 1_000),
+            "prepare_to_commit_ms": round((committed_at - started) * 1_000),
+        }
+
+    commit_gate_started = time.perf_counter()
+    committed = await asyncio.wait_for(
+        asyncio.gather(*(prepare_and_submit(index) for index in range(batch_size))),
+        timeout=60,
     )
+    commit_gate_ms = round((time.perf_counter() - commit_gate_started) * 1_000)
+    outcomes = [item[0] for item in committed]
+    submission_timings = [item[1] for item in committed]
     run_ids = {
         str(outcome["run_id"])
         for outcome in outcomes
@@ -398,8 +412,13 @@ async def _run_batch(
     dispatch_start_failed = [
         item for item in events if item.get("event_type") == "dispatch_start_failed"
     ]
+    scheduler_interrupted = [
+        item for item in events if item.get("event_type") == "scheduler_interrupted"
+    ]
     if dispatch_start_failed:
         raise RuntimeError(f"dispatch startup failed internally: {dispatch_start_failed}")
+    if scheduler_interrupted:
+        raise RuntimeError(f"Scheduler was interrupted internally: {scheduler_interrupted}")
     if not (
         len(requested) == len(prepared_events) == len(worker_started) == batch_size
     ):
@@ -430,9 +449,10 @@ async def _run_batch(
             if isinstance(attempt, dict) and isinstance(attempt.get("node_id"), str)
         }
     )
-    if len(node_ids) != batch_size:
+    expected_node_count = min(batch_size, healthy_node_count)
+    if len(node_ids) != expected_node_count:
         raise RuntimeError(
-            f"expected {batch_size} logical task nodes, observed {node_ids}"
+            f"expected {expected_node_count} logical task nodes, observed {node_ids}"
         )
 
     destroy_results = await asyncio.gather(
@@ -455,6 +475,9 @@ async def _run_batch(
     )
     return {
         "batch_size": batch_size,
+        "commit_gate_deadline_ms": 60_000,
+        "commit_gate_ms": commit_gate_ms,
+        "submission_timings": submission_timings,
         "run_ids": sorted(run_ids),
         "workflow_fingerprint": compiled.workflow_fingerprint,
         "task_id": task_id,
@@ -465,6 +488,7 @@ async def _run_batch(
         "all_requested_before_first_prepared": all_requested_before_first_prepared,
         "worker_pool_mode": worker_pool_mode,
         "dispatch_start_failed_count": len(dispatch_start_failed),
+        "scheduler_interrupted_count": len(scheduler_interrupted),
         "attempt_violations": attempt_violations,
         "results": results,
         "runs": runs,
@@ -492,6 +516,7 @@ async def run(args: argparse.Namespace) -> int:
             await _run_batch(
                 client,
                 batch_size=size,
+                healthy_node_count=status.healthy_node_count,
                 worker_pool_mode=worker_pool_mode,
                 baseline_workers=workers,
                 baseline_cluster=cluster,
@@ -537,8 +562,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.batch_size is None:
         args.batch_size = [2, 4]
-    if any(item < 2 or item > 8 for item in args.batch_size):
-        parser.error("--batch-size must be within 2..8")
+    if any(item < 2 or item > 64 for item in args.batch_size):
+        parser.error("--batch-size must be within 2..64")
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
     return args

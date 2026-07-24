@@ -51,6 +51,17 @@ DEFAULT_OUTPUT_ROOT = (
 )
 TEXT_MODEL_ID = "qwen3-4b-e2e"
 TEXT_MODEL_PATH = Path("/home/user2/workplace/model_weight/model_from_hf/Qwen3-4B")
+VISION_MODEL_ID = "qwen2_5-vl-3b-e2e"
+VISION_MODEL_PATH = Path(
+    "/home/user2/workplace/model_weight/model_from_hf/Qwen2.5-VL-3B-Instruct"
+)
+FIXED_BATCH_SIZE = 20
+REQUEST_CLEANUP_GRACE_SECONDS = 180.0
+FIXED_TEXT_EXTRA_WORKFLOWS = {
+    "gaia": "file",
+    "openagi": "document_qa",
+    "tbench": "airline_book",
+}
 TERMINAL_STATES = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
 
 
@@ -117,6 +128,36 @@ def _read_json(path: Path) -> dict[str, object]:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _warm_model_file_cache(model_paths: Sequence[Path]) -> dict[str, object]:
+    started = time.perf_counter()
+    files = sorted(
+        path
+        for model_path in model_paths
+        for path in model_path.rglob("*")
+        if path.is_file()
+    )
+    buffer = bytearray(16 * 1024 * 1024)
+    total_bytes = 0
+    for path in files:
+        with path.open("rb", buffering=0) as handle:
+            advise = getattr(os, "posix_fadvise", None)
+            will_need = getattr(os, "POSIX_FADV_WILLNEED", None)
+            if callable(advise) and isinstance(will_need, int):
+                advise(handle.fileno(), 0, 0, will_need)
+            while True:
+                size = handle.readinto(buffer)
+                if not size:
+                    break
+                total_bytes += size
+    return {
+        "model_paths": [str(path) for path in model_paths],
+        "file_count": len(files),
+        "bytes_read": total_bytes,
+        "duration_ms": round((time.perf_counter() - started) * 1_000),
+        "included_in_request_e2e": False,
+    }
 
 
 def _stats(values: Sequence[float]) -> dict[str, float | int | None]:
@@ -285,6 +326,83 @@ def _aggregate_requests(
     }
 
 
+TIMING_FIELDS = (
+    "model_load_ms",
+    "generate_ms",
+    "total_duration_ms",
+    "worker_startup_ms",
+    "input_fetch_ms",
+    "callable_ms",
+    "output_put_ms",
+    "task_total_ms",
+    "dispatch_prepare_ms",
+    "ray_roundtrip_ms",
+    "queue_to_dispatch_ms",
+    "dispatch_to_prepared_ms",
+    "prepared_to_running_ms",
+    "dispatch_to_running_ms",
+)
+
+
+def _aggregate_timings(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    values: dict[str, list[float]] = {name: [] for name in TIMING_FIELDS}
+    for record in records:
+        groups = (
+            record.get("transformers_local_records", []),
+            record.get("task_timings", []),
+            record.get("dispatch_lifecycle", []),
+        )
+        for group in groups:
+            if not isinstance(group, list):
+                continue
+            for item in group:
+                if not isinstance(item, Mapping):
+                    continue
+                for name in TIMING_FIELDS:
+                    value = item.get(name)
+                    if (
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(float(value))
+                    ):
+                        values[name].append(float(value))
+    return {name: _stats(items) for name, items in values.items() if items}
+
+
+def _aggregate_breakdowns(
+    records: Sequence[Mapping[str, object]],
+    *,
+    mode: str,
+    admission_window_seconds: float | None,
+) -> dict[str, object]:
+    def aggregate(items: Sequence[Mapping[str, object]]) -> dict[str, object]:
+        return {
+            "requests": _aggregate_requests(
+                items,
+                mode=mode,
+                admission_window_seconds=admission_window_seconds,
+            ),
+            "timings": _aggregate_timings(items),
+        }
+
+    families: dict[str, list[Mapping[str, object]]] = {}
+    workflows: dict[str, list[Mapping[str, object]]] = {}
+    for record in records:
+        family = str(record.get("family", "unknown"))
+        workflow = f"{record.get('dataset', 'unknown')}.{record.get('workflow', 'unknown')}"
+        families.setdefault(family, []).append(record)
+        workflows.setdefault(workflow, []).append(record)
+    return {
+        "overall": aggregate(records),
+        "families": {
+            key: aggregate(items) for key, items in sorted(families.items())
+        },
+        "workflows": {
+            key: aggregate(items) for key, items in sorted(workflows.items())
+        },
+    }
+
+
 class HostResourceMonitor:
     """Sample logical-node cgroups and all physical NPUs outside the containers."""
 
@@ -392,6 +510,54 @@ class HostResourceMonitor:
             for sample in self.samples:
                 handle.write(json.dumps(_jsonable(sample), sort_keys=True) + "\n")
         return tuple(self.samples)
+
+    def wait_for_hbm_recovery(
+        self,
+        *,
+        baseline_hbm_mb: int,
+        timeout_seconds: float,
+        tolerance_mb: int,
+    ) -> dict[str, object]:
+        started = time.monotonic()
+        deadline = started + timeout_seconds
+        stable_samples = 0
+        final_hbm_mb: int | None = None
+        while time.monotonic() < deadline:
+            sample = self.samples[-1] if self.samples else None
+            if isinstance(sample, Mapping):
+                npus = sample.get("npus")
+                errors = sample.get("errors")
+                value = sample.get("cluster_hbm_used_mb")
+                dcmi_error = isinstance(errors, list) and any(
+                    str(item).startswith("dcmi:") for item in errors
+                )
+                if (
+                    isinstance(npus, list)
+                    and len(npus) == 8
+                    and isinstance(value, int)
+                    and not dcmi_error
+                ):
+                    final_hbm_mb = value
+                    if value <= baseline_hbm_mb + tolerance_mb:
+                        stable_samples += 1
+                        if stable_samples >= 2:
+                            return {
+                                "recovered": True,
+                                "baseline_hbm_mb": baseline_hbm_mb,
+                                "final_hbm_mb": final_hbm_mb,
+                                "tolerance_mb": tolerance_mb,
+                                "wait_ms": round((time.monotonic() - started) * 1_000),
+                            }
+                    else:
+                        stable_samples = 0
+            time.sleep(min(1.0, self.interval_seconds))
+        return {
+            "recovered": False,
+            "baseline_hbm_mb": baseline_hbm_mb,
+            "final_hbm_mb": final_hbm_mb,
+            "tolerance_mb": tolerance_mb,
+            "wait_ms": round((time.monotonic() - started) * 1_000),
+        }
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval_seconds):
@@ -555,13 +721,19 @@ def _aggregate_resources(
             if not isinstance(item, Mapping):
                 continue
             device_id = str(item.get("physical_device_id"))
-            target = per_device.setdefault(device_id, {"utilization": [], "hbm": []})
+            target = per_device.setdefault(
+                device_id,
+                {"utilization": [], "hbm": [], "process_count": []},
+            )
             utilization = item.get("utilization_pct")
             hbm = item.get("used_hbm_mb")
             if isinstance(utilization, (int, float)):
                 target["utilization"].append(float(utilization))
             if isinstance(hbm, int):
                 target["hbm"].append(float(hbm))
+            processes = item.get("processes")
+            if isinstance(processes, list):
+                target["process_count"].append(float(len(processes)))
     return {
         "sample_count": len(selected),
         "window_started_at_ms": started_at_ms,
@@ -595,11 +767,32 @@ def _aggregate_resources(
             key: {
                 "utilization_pct": _stats(value["utilization"]),
                 "hbm_used_mb": _stats(value["hbm"]),
+                "npu_process_count": _stats(value["process_count"]),
             }
             for key, value in sorted(per_device.items(), key=lambda item: int(item[0]))
         },
         "monitor_errors": monitor_errors,
     }
+
+
+def _latest_valid_cluster_hbm(
+    samples: Sequence[Mapping[str, object]],
+) -> int | None:
+    for sample in reversed(samples):
+        npus = sample.get("npus")
+        errors = sample.get("errors")
+        value = sample.get("cluster_hbm_used_mb")
+        dcmi_error = isinstance(errors, list) and any(
+            str(item).startswith("dcmi:") for item in errors
+        )
+        if (
+            isinstance(npus, list)
+            and len(npus) == 8
+            and isinstance(value, int)
+            and not dcmi_error
+        ):
+            return value
+    return None
 
 
 def _discover_text_sample(data_root: Path) -> Any:
@@ -621,6 +814,241 @@ def _discover_text_sample(data_root: Path) -> Any:
             f"expected one retail_cancel sample, found {len(samples)}"
         )
     return samples[0]
+
+
+def _discover_mixed_candidates(data_root: Path) -> tuple[Any, ...]:
+    samples, failures = qwen_smoke.discover_samples(
+        data_root=data_root,
+        datasets=set(),
+        workflows=set(),
+        families=set(),
+        samples_per_workflow=2,
+        sample_offset=0,
+        max_inline_file_bytes=64 * 1024 * 1024,
+        tbench_smoke_overrides=True,
+        gaia_file_smoke_summary=True,
+    )
+    if failures:
+        raise PerformancePilotError(f"mixed sample discovery failed: {failures}")
+    expected = set(qwen_smoke.WORKFLOW_MODULES)
+    discovered = {(sample.dataset, sample.workflow) for sample in samples}
+    if discovered != expected:
+        raise PerformancePilotError(
+            "mixed sample discovery did not cover the 14 workflows; "
+            f"missing={sorted(expected - discovered)}, "
+            f"extra={sorted(discovered - expected)}"
+        )
+    return tuple(samples)
+
+
+def _fixed_batch20_selection(samples: Sequence[Any]) -> tuple[tuple[Any, str], ...]:
+    grouped: dict[tuple[str, str], list[Any]] = {}
+    for sample in samples:
+        grouped.setdefault((sample.dataset, sample.workflow), []).append(sample)
+    for items in grouped.values():
+        items.sort(key=lambda item: (int(item.query_index), item.sample_id))
+
+    workflow_order = tuple(qwen_smoke.WORKFLOW_MODULES)
+    if set(grouped) != set(workflow_order):
+        raise PerformancePilotError("fixed Batch=20 candidates do not cover all workflows")
+    if any(len(grouped[key]) < 2 for key in workflow_order):
+        short = sorted(key for key in workflow_order if len(grouped[key]) < 2)
+        raise PerformancePilotError(f"fixed Batch=20 needs two samples per workflow: {short}")
+
+    selected: list[tuple[Any, str]] = [
+        (grouped[key][0], "first_sample_per_workflow") for key in workflow_order
+    ]
+    for key in sorted(qwen_smoke.VISION_WORKFLOWS):
+        selected.append((grouped[key][1], "second_sample_visual_workflow"))
+    for dataset, workflow in FIXED_TEXT_EXTRA_WORKFLOWS.items():
+        selected.append(
+            (grouped[(dataset, workflow)][1], "second_sample_dataset_text_representative")
+        )
+    if len(selected) != FIXED_BATCH_SIZE:
+        raise AssertionError(f"fixed Batch selection produced {len(selected)} requests")
+    sample_ids = [sample.sample_id for sample, _ in selected]
+    if len(set(sample_ids)) != len(sample_ids):
+        raise AssertionError("fixed Batch selection contains duplicate samples")
+    return tuple(selected)
+
+
+def _target_model_id(family: str) -> str:
+    if family == "text":
+        return TEXT_MODEL_ID
+    if family == "vision":
+        return VISION_MODEL_ID
+    raise PerformancePilotError(f"unsupported sample family: {family}")
+
+
+def _build_fixed_batch20_manifest(samples: Sequence[Any]) -> dict[str, object]:
+    selected = _fixed_batch20_selection(samples)
+    entries = []
+    for request_index, (sample, reason) in enumerate(selected, start=1):
+        entries.append(
+            {
+                "request_index": request_index,
+                "selection_reason": reason,
+                "target_model_id": _target_model_id(sample.family),
+                **sample.manifest(),
+            }
+        )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "objective": "fixed_mixed_batch20_manifest",
+        "request_count": FIXED_BATCH_SIZE,
+        "launch_offsets_ms": [0] * FIXED_BATCH_SIZE,
+        "selection_policy": (
+            "first sample of every migrated workflow; second sample of every "
+            "vision workflow; second sample of one stable text workflow per dataset"
+        ),
+        "entries": entries,
+    }
+
+
+def _samples_from_manifest(
+    data_root: Path, manifest_path: Path
+) -> tuple[tuple[Any, str], ...]:
+    manifest = _read_json(manifest_path)
+    entries = manifest.get("entries")
+    if manifest.get("request_count") != FIXED_BATCH_SIZE or not isinstance(entries, list):
+        raise PerformancePilotError("workload manifest is not a fixed Batch=20 manifest")
+    candidates = _discover_mixed_candidates(data_root)
+    by_id = {sample.sample_id: sample for sample in candidates}
+    resolved: list[tuple[Any, str]] = []
+    for expected_index, entry in enumerate(entries, start=1):
+        if not isinstance(entry, Mapping):
+            raise PerformancePilotError("workload manifest entry is not an object")
+        if entry.get("request_index") != expected_index:
+            raise PerformancePilotError("workload manifest request indexes are unstable")
+        sample_id = entry.get("sample_id")
+        sample = by_id.get(str(sample_id))
+        if sample is None:
+            raise PerformancePilotError(f"manifest sample is unavailable: {sample_id}")
+        for name in ("dataset", "workflow", "family"):
+            if entry.get(name) != getattr(sample, name):
+                raise PerformancePilotError(
+                    f"manifest sample metadata changed for {sample_id}: {name}"
+                )
+        target_model_id = str(entry.get("target_model_id", ""))
+        if target_model_id != _target_model_id(sample.family):
+            raise PerformancePilotError(
+                f"manifest model mapping is invalid for {sample_id}"
+            )
+        resolved.append((sample, target_model_id))
+    if len(resolved) != FIXED_BATCH_SIZE:
+        raise PerformancePilotError("workload manifest does not contain 20 entries")
+    return tuple(resolved)
+
+
+def _case_samples(
+    args: argparse.Namespace, case: WorkloadCase
+) -> tuple[tuple[Any, str], ...]:
+    if args.workload_manifest is None:
+        sample = _discover_text_sample(args.data_root)
+        return tuple((sample, TEXT_MODEL_ID) for _ in range(case.request_count))
+    if case.mode != "batch" or case.request_count != FIXED_BATCH_SIZE:
+        raise PerformancePilotError(
+            "fixed workload manifest requires exactly one batch-20 case"
+        )
+    return _samples_from_manifest(args.data_root, args.workload_manifest)
+
+
+def _active_model_instances(payload: Mapping[str, object]) -> list[Mapping[str, object]]:
+    instances = payload.get("instances")
+    if not isinstance(instances, list):
+        return []
+    return [
+        item
+        for item in instances
+        if isinstance(item, Mapping) and item.get("state") != "stopped"
+    ]
+
+
+def _placement_lease_counts(cluster: Mapping[str, object]) -> dict[str, int]:
+    payload = cluster.get("cluster")
+    if not isinstance(payload, Mapping):
+        return {}
+    leases = payload.get("active_leases")
+    if not isinstance(leases, list):
+        return {}
+    counts: dict[str, int] = {}
+    for item in leases:
+        if not isinstance(item, Mapping):
+            continue
+        lease = item.get("lease")
+        if not isinstance(lease, Mapping):
+            continue
+        kind = str(lease.get("reservation_kind", "unknown"))
+        counts[kind] = counts.get(kind, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+async def _wait_maze_control_recovery(
+    client: Any,
+    run_ids: set[str],
+    *,
+    timeout_seconds: float,
+) -> dict[str, object]:
+    started = asyncio.get_running_loop().time()
+    deadline = started + timeout_seconds
+    last: dict[str, object] = {}
+    while True:
+        system, cluster, workers, models = await asyncio.gather(
+            client.query("GetSystemSnapshot", timeout_seconds=10.0),
+            client.query(
+                "GetClusterSnapshot", filter="resources", timeout_seconds=10.0
+            ),
+            client.query("GetWorkerPools", timeout_seconds=10.0),
+            client.query("GetModelInstances", timeout_seconds=10.0),
+        )
+        pool = workers.get("worker_pool")
+        if not isinstance(pool, dict):
+            pool = {}
+        active_workers = logical_e2e._active_worker_leases(pool)  # noqa: SLF001
+        active_models = _active_model_instances(models)
+        run_owned = {
+            run_id: logical_e2e._run_owned_leases(cluster, run_id)  # noqa: SLF001
+            for run_id in sorted(run_ids)
+        }
+        route_occupancy = sum(
+            int(item.get("route_occupancy", 0))
+            for item in active_models
+            if isinstance(item.get("route_occupancy", 0), int)
+        )
+        actual_request_inflight = sum(
+            int(item.get("actual_request_inflight", 0))
+            for item in active_models
+            if isinstance(item.get("actual_request_inflight", 0), int)
+        )
+        recovered = (
+            system.get("nonterminal_run_count") == 0
+            and pool.get("active_worker_lease_count") == 0
+            and not active_workers
+            and not any(run_owned.values())
+            and not active_models
+            and route_occupancy == 0
+            and actual_request_inflight == 0
+        )
+        last = {
+            "recovered": recovered,
+            "wait_ms": round((asyncio.get_running_loop().time() - started) * 1_000),
+            "run_ids": sorted(run_ids),
+            "nonterminal_run_count": system.get("nonterminal_run_count"),
+            "active_worker_lease_count": pool.get("active_worker_lease_count"),
+            "active_worker_leases": active_workers,
+            "run_owned_placement_leases": run_owned,
+            "active_model_instances": active_models,
+            "route_occupancy": route_occupancy,
+            "actual_request_inflight": actual_request_inflight,
+            "active_placement_lease_counts": _placement_lease_counts(cluster),
+            "system": system,
+            "cluster": cluster,
+            "worker_pools": workers,
+            "model_instances": models,
+        }
+        if recovered or asyncio.get_running_loop().time() >= deadline:
+            return last
+        await asyncio.sleep(1.0)
 
 
 def _task_timings(
@@ -769,6 +1197,7 @@ async def _run_maze_request(
     compiled: Any,
     task_names: Mapping[str, str],
     sample: Any,
+    target_model_id: str,
     case_id: str,
     request_index: int,
     timeout_seconds: float,
@@ -781,6 +1210,10 @@ async def _run_maze_request(
         "case_id": case_id,
         "request_index": request_index,
         "sample_id": sample.sample_id,
+        "dataset": sample.dataset,
+        "workflow": sample.workflow,
+        "family": sample.family,
+        "target_model_id": target_model_id,
         "submission_id": submission_id,
         "status": "not_started",
     }
@@ -790,12 +1223,15 @@ async def _run_maze_request(
     record["client_e2e_started_at_ms"] = int(time.time() * 1_000)
     try:
         stage = time.perf_counter()
-        prepared = await client.prepare_submission(
-            workflow,
-            inputs=sample.inputs,
-            submission_id=submission_id,
-            session_key=f"{submission_id}-session",
-            run_deadline_ms=round(timeout_seconds * 1_000),
+        prepared = await asyncio.wait_for(
+            client.prepare_submission(
+                workflow,
+                inputs=sample.inputs,
+                submission_id=submission_id,
+                session_key=f"{submission_id}-session",
+                run_deadline_ms=round(timeout_seconds * 1_000),
+            ),
+            timeout=min(120.0, max(30.0, timeout_seconds)),
         )
         record["prepare_submission_ms"] = round((time.perf_counter() - stage) * 1_000)
         stage = time.perf_counter()
@@ -829,8 +1265,9 @@ async def _run_maze_request(
             raise PerformancePilotError(f"Run terminated as {terminal.get('status')}")
         results = {}
         for task_id in compiled.exit_tasks:
-            results[task_names[task_id]] = await client.materialize_task_result(
-                run_id, task_id
+            results[task_names[task_id]] = await asyncio.wait_for(
+                client.materialize_task_result(run_id, task_id),
+                timeout=min(120.0, max(30.0, timeout_seconds)),
             )
         record["exit_task_results"] = results
         record["status"] = "succeeded"
@@ -878,6 +1315,64 @@ async def _run_maze_request(
     return record
 
 
+async def _run_maze_request_bounded(
+    *,
+    client: Any,
+    workflow: Any,
+    compiled: Any,
+    task_names: Mapping[str, str],
+    sample: Any,
+    target_model_id: str,
+    case_id: str,
+    request_index: int,
+    timeout_seconds: float,
+    hard_timeout_seconds: float | None = None,
+) -> dict[str, object]:
+    started_at_ms = int(time.time() * 1_000)
+    hard_timeout = (
+        timeout_seconds + REQUEST_CLEANUP_GRACE_SECONDS
+        if hard_timeout_seconds is None
+        else hard_timeout_seconds
+    )
+    try:
+        return await asyncio.wait_for(
+            _run_maze_request(
+                client=client,
+                workflow=workflow,
+                compiled=compiled,
+                task_names=task_names,
+                sample=sample,
+                target_model_id=target_model_id,
+                case_id=case_id,
+                request_index=request_index,
+                timeout_seconds=timeout_seconds,
+            ),
+            timeout=hard_timeout,
+        )
+    except asyncio.TimeoutError:
+        finished_at_ms = int(time.time() * 1_000)
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "executor": "maze",
+            "case_id": case_id,
+            "request_index": request_index,
+            "sample_id": sample.sample_id,
+            "dataset": sample.dataset,
+            "workflow": sample.workflow,
+            "family": sample.family,
+            "target_model_id": target_model_id,
+            "status": "failed",
+            "error": (
+                "TimeoutError: request exceeded hard deadline "
+                f"of {hard_timeout:.3f} seconds"
+            ),
+            "client_e2e_started_at_ms": started_at_ms,
+            "client_e2e_finished_at_ms": finished_at_ms,
+            "client_e2e_ms": max(0, finished_at_ms - started_at_ms),
+            "hard_timeout_seconds": hard_timeout,
+        }
+
+
 async def _run_scheduled(
     launch_offsets_ms: Sequence[int], run_one: Any
 ) -> tuple[list[dict[str, object]], int, int]:
@@ -910,14 +1405,26 @@ async def _run_maze_worker(
 ) -> dict[str, object]:
     from ascend_maze.control.local_rpc import UdsRuntimeClient
 
-    sample = _discover_text_sample(args.data_root)
-    workflow, aliases = qwen_smoke._build_workflow(  # noqa: SLF001
-        sample.dataset, sample.workflow, TEXT_MODEL_ID
-    )
-    compiled = workflow.compile()
-    task_names = {
-        task_id: task.task_name for task_id, task in compiled.tasks.items_tuple()
-    }
+    selected = _case_samples(args, case)
+    requests: list[dict[str, object]] = []
+    for sample, target_model_id in selected:
+        workflow, aliases = qwen_smoke._build_workflow(  # noqa: SLF001
+            sample.dataset, sample.workflow, target_model_id
+        )
+        compiled = workflow.compile()
+        requests.append(
+            {
+                "sample": sample,
+                "target_model_id": target_model_id,
+                "workflow": workflow,
+                "compiled": compiled,
+                "aliases": aliases,
+                "task_names": {
+                    task_id: task.task_name
+                    for task_id, task in compiled.tasks.items_tuple()
+                },
+            }
+        )
     client = UdsRuntimeClient(args.control_socket)
     try:
         controller_status = await client.get_controller_status(timeout_seconds=10.0)
@@ -928,12 +1435,14 @@ async def _run_maze_worker(
         await client._ensure_data_store()  # noqa: SLF001
 
         async def run_one(index: int) -> dict[str, object]:
-            return await _run_maze_request(
+            request = requests[index - 1]
+            return await _run_maze_request_bounded(
                 client=client,
-                workflow=workflow,
-                compiled=compiled,
-                task_names=task_names,
-                sample=sample,
+                workflow=request["workflow"],
+                compiled=request["compiled"],
+                task_names=request["task_names"],
+                sample=request["sample"],
+                target_model_id=str(request["target_model_id"]),
                 case_id=case.case_id,
                 request_index=index,
                 timeout_seconds=float(args.request_timeout_seconds),
@@ -942,21 +1451,49 @@ async def _run_maze_worker(
         records, started_at_ms, finished_at_ms = await _run_scheduled(
             case.launch_offsets_ms, run_one
         )
+        run_ids = {
+            str(record["run_id"])
+            for record in records
+            if isinstance(record.get("run_id"), str)
+        }
+        control_recovery = await _wait_maze_control_recovery(
+            client,
+            run_ids,
+            timeout_seconds=float(args.resource_recovery_timeout_seconds),
+        )
         system_after = await client.query("GetSystemSnapshot", timeout_seconds=10.0)
         return {
             "schema_version": SCHEMA_VERSION,
             "objective": OBJECTIVE,
             "executor": "maze",
             "case": case.payload(),
-            "sample": sample.manifest(),
-            "model_aliases": aliases,
-            "workflow_fingerprint": compiled.workflow_fingerprint,
+            "samples": [sample.manifest() for sample, _ in selected],
+            "workload_manifest_path": (
+                None
+                if args.workload_manifest is None
+                else str(args.workload_manifest)
+            ),
+            "workflows": [
+                {
+                    "sample_id": request["sample"].sample_id,
+                    "target_model_id": request["target_model_id"],
+                    "model_aliases": request["aliases"],
+                    "workflow_fingerprint": request["compiled"].workflow_fingerprint,
+                }
+                for request in requests
+            ],
             "controller_status": controller_status,
             "system_after": system_after,
+            "control_recovery": control_recovery,
             "workload_started_at_ms": started_at_ms,
             "workload_finished_at_ms": finished_at_ms,
             "records": records,
             "aggregate": _aggregate_requests(
+                records,
+                mode=case.mode,
+                admission_window_seconds=case.admission_window_seconds,
+            ),
+            "breakdowns": _aggregate_breakdowns(
                 records,
                 mode=case.mode,
                 admission_window_seconds=case.admission_window_seconds,
@@ -966,21 +1503,29 @@ async def _run_maze_worker(
         client.close()
 
 
-def _transformers_config(args: argparse.Namespace) -> dict[str, object]:
+def _transformers_config(
+    args: argparse.Namespace, family: str
+) -> dict[str, object]:
     from ascend_maze.ascend.discovery import discover_aicpu_runtime_library_paths
 
+    is_vision = family == "vision"
+    if family not in {"text", "vision"}:
+        raise PerformancePilotError(f"unsupported Transformers family: {family}")
+    model_id = VISION_MODEL_ID if is_vision else TEXT_MODEL_ID
+    model_path = args.vision_model_path if is_vision else args.text_model_path
     return {
-        "family": "text",
-        "model_id": TEXT_MODEL_ID,
-        "model_path": str(args.text_model_path),
-        "tokenizer_path": str(args.text_model_path),
+        "family": family,
+        "model_id": model_id,
+        "model_path": str(model_path),
+        "tokenizer_path": str(model_path),
         "device_id": "0",
         "dtype": "bfloat16",
         "generation_method": "manual_greedy",
-        "model_kind": "text",
-        "max_model_len": 10240,
-        "trust_remote_code": True,
+        "model_kind": "vision_language" if is_vision else "text",
+        "max_model_len": 12288 if is_vision else 10240,
+        "trust_remote_code": not is_vision,
         "enable_thinking": False,
+        "qwen2_5_vl_cpu_unique_consecutive_workaround": is_vision,
         "request_timeout_ms": round(float(args.request_timeout_seconds) * 1_000),
         "runtime_library_paths": tuple(discover_aicpu_runtime_library_paths()),
     }
@@ -991,7 +1536,7 @@ async def _run_ray_worker(
 ) -> dict[str, object]:
     import ray
 
-    sample = _discover_text_sample(args.data_root)
+    selected = _case_samples(args, case)
     ray.init(
         address="auto",
         namespace=f"ascend-maze-performance-{case.case_id}",
@@ -1003,7 +1548,9 @@ async def _run_ray_worker(
         num_cpus=float(args.ray_task_num_cpus),
         max_calls=ray_smoke.RAY_TASK_MAX_CALLS,
     )(ray_smoke._execute_workflow_task_remote)  # noqa: SLF001
-    transformers_config = _transformers_config(args)
+    transformers_configs = {
+        family: _transformers_config(args, family) for family in ("text", "vision")
+    }
     try:
         alive_nodes = [node for node in ray.nodes() if node.get("Alive")]
         if len(alive_nodes) != 8:
@@ -1012,14 +1559,15 @@ async def _run_ray_worker(
             )
 
         async def run_one(index: int) -> dict[str, object]:
+            sample, target_model_id = selected[index - 1]
             record = await asyncio.to_thread(
                 ray_smoke._run_one_sample_ray,  # noqa: SLF001
                 ray_task=ray_task,
                 service_actor=None,
                 inference_backend="transformers",
-                transformers_config=transformers_config,
+                transformers_config=transformers_configs[sample.family],
                 sample=sample,
-                target_model_id=TEXT_MODEL_ID,
+                target_model_id=target_model_id,
                 run_timeout_seconds=float(args.request_timeout_seconds),
                 run_salt=f"{case.case_id}-{index}",
             )
@@ -1032,6 +1580,10 @@ async def _run_ray_worker(
                 "case_id": case.case_id,
                 "request_index": index,
                 "sample_id": sample.sample_id,
+                "dataset": sample.dataset,
+                "workflow": sample.workflow,
+                "family": sample.family,
+                "target_model_id": target_model_id,
                 "run_id": record.get("run_id"),
                 "status": record.get("status"),
                 "client_e2e_started_at_ms": record.get("client_e2e_started_at_ms"),
@@ -1054,7 +1606,12 @@ async def _run_ray_worker(
             "objective": OBJECTIVE,
             "executor": "ray",
             "case": case.payload(),
-            "sample": sample.manifest(),
+            "samples": [sample.manifest() for sample, _ in selected],
+            "workload_manifest_path": (
+                None
+                if args.workload_manifest is None
+                else str(args.workload_manifest)
+            ),
             "worker_max_calls": ray_smoke.RAY_TASK_MAX_CALLS,
             "ray_task_num_cpus": float(args.ray_task_num_cpus),
             "ray_nodes": [
@@ -1065,11 +1622,16 @@ async def _run_ray_worker(
                 }
                 for node in alive_nodes
             ],
-            "transformers_config": transformers_config,
+            "transformers_configs": transformers_configs,
             "workload_started_at_ms": started_at_ms,
             "workload_finished_at_ms": finished_at_ms,
             "records": records,
             "aggregate": _aggregate_requests(
+                records,
+                mode=case.mode,
+                admission_window_seconds=case.admission_window_seconds,
+            ),
+            "breakdowns": _aggregate_breakdowns(
                 records,
                 mode=case.mode,
                 admission_window_seconds=case.admission_window_seconds,
@@ -1134,7 +1696,12 @@ def _run_internal_worker(args: argparse.Namespace) -> int:
         }
         _write_json(args.result_file, result)
         print(json.dumps({"status": "succeeded", "result_file": str(args.result_file)}))
-        return 0 if result["aggregate"]["failed"] == 0 else 20  # type: ignore[index]
+        requests_succeeded = result["aggregate"]["failed"] == 0  # type: ignore[index]
+        control_recovered = (
+            args.internal_worker != "maze"
+            or result.get("control_recovery", {}).get("recovered") is True  # type: ignore[union-attr]
+        )
+        return 0 if requests_succeeded and control_recovered else 20
     except Exception as exc:
         failure = {
             "schema_version": SCHEMA_VERSION,
@@ -1199,8 +1766,9 @@ def _worker_command(
     executor: str,
     container_case_path: Path,
     container_result_path: Path,
+    container_manifest_path: Path | None,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(
             Path(
@@ -1219,11 +1787,18 @@ def _worker_command(
         str(args.data_root),
         "--text-model-path",
         str(args.text_model_path),
+        "--vision-model-path",
+        str(args.vision_model_path),
         "--request-timeout-seconds",
         str(args.request_timeout_seconds),
+        "--resource-recovery-timeout-seconds",
+        str(args.resource_recovery_timeout_seconds),
         "--ray-task-num-cpus",
         str(args.ray_task_num_cpus),
     ]
+    if container_manifest_path is not None:
+        command.extend(("--workload-manifest", str(container_manifest_path)))
+    return command
 
 
 def _run_container_worker(
@@ -1245,17 +1820,26 @@ def _run_container_worker(
         executor=executor,
         container_case_path=container_case_dir / "case.json",
         container_result_path=container_case_dir / "runner.json",
+        container_manifest_path=(
+            None
+            if args.workload_manifest is None
+            else container_output_dir / "workload_manifest.json"
+        ),
     )
     shell_command = (
         f"source {shlex.quote(str(CONTAINER_ENV))}; exec {shlex.join(worker_argv)}"
     )
     docker_command = ["docker", "exec", CONTAINER_NAME, "bash", "-lc", shell_command]
+    cache_warm = _warm_model_file_cache(
+        (args.text_model_path, args.vision_model_path)
+    )
     monitor = HostResourceMonitor(
         output_path=resource_path,
         interval_seconds=float(args.resource_sample_interval_seconds),
     )
     monitor.start()
     time.sleep(float(args.resource_baseline_seconds))
+    baseline_hbm_mb = _latest_valid_cluster_hbm(monitor.samples)
     started_at_ms = int(time.time() * 1_000)
     case_dir.mkdir(parents=True, exist_ok=True)
     with (
@@ -1275,6 +1859,18 @@ def _run_container_worker(
         except subprocess.TimeoutExpired as exc:
             exit_code = 124
             timeout_error = str(exc)
+    hbm_recovery = (
+        {
+            "recovered": False,
+            "error": "no valid pre-workload DCMI baseline",
+        }
+        if baseline_hbm_mb is None
+        else monitor.wait_for_hbm_recovery(
+            baseline_hbm_mb=baseline_hbm_mb,
+            timeout_seconds=float(args.resource_recovery_timeout_seconds),
+            tolerance_mb=int(args.hbm_recovery_tolerance_mb),
+        )
+    )
     samples = monitor.stop()
     finished_at_ms = int(time.time() * 1_000)
     result = (
@@ -1302,6 +1898,8 @@ def _run_container_worker(
         "stdout_path": str(case_dir / "stdout.log"),
         "stderr_path": str(case_dir / "stderr.log"),
     }
+    result["model_file_cache_warmup"] = cache_warm
+    result["physical_hbm_recovery"] = hbm_recovery
     result["resource_samples_path"] = str(resource_path)
     result["resources"] = _aggregate_resources(
         samples,
@@ -1326,18 +1924,19 @@ def _render_report(summary: Mapping[str, object]) -> str:
         "",
         "## 实验契约",
         "",
-        "- Workflow：`tbench.retail_cancel`",
-        "- 模型：`Qwen3-4B`，Transformers `manual_greedy`",
-        "- 生成参数：`max_tokens=4096`、`temperature=0`、`max_model_len=10240`",
+        "- Workload：固定 Batch=20；14 种 workflow 各一个样本，另按确定性规则补 6 个样本",
+        "- 文本模型：`Qwen3-4B`；视觉模型：`Qwen2.5-VL-3B-Instruct`；均为 Transformers `manual_greedy`",
+        "- 生成参数：`max_tokens=4096`、`temperature=0`；文本/视觉 `max_model_len=10240/12288`",
         "- 模型加载：计入每个请求 E2E；模型 Task 进程一次性使用",
         "- Ray：每个 Task 请求逻辑节点全部 20 CPU，保证每节点同时至多一个 Task；`max_calls=1`",
-        "- Maze：performance 配置启用 HACS、static anchor、Standby 和多副本；当前全局 Worker 复用上限仍为 1",
+        "- Maze：按 CPU、I/O、NPU slot 和实测 HBM 预算共卡；文本/视觉实例预算为 13824/11776 MB",
+        "- 页缓存：两个执行器测量前均读取两套模型文件；每个 Task 仍创建新进程并把权重搬到 NPU",
         "- E2E：客户端开始准备并提交请求，到终态结果返回；`DestroyRun` 不计入",
         "",
         "## 汇总",
         "",
-        "| Case | 执行器 | 成功/总数 | E2E P95 (ms) | 吞吐 (req/s) | CPU 均值 (%) | CPU 增量 (%) | NPU 八卡均值 (%) | 单卡 NPU 峰值 (%) | HBM 增量峰值 (MB) |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Case | 执行器 | 成功/总数 | E2E P95 (ms) | 吞吐 (req/s) | CPU 均值 (%) | CPU 增量 (%) | NPU 八卡均值 (%) | 单卡 NPU 峰值 (%) | HBM 增量峰值 (MB) | 单卡最大 NPU 进程数 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     results = summary.get("results", [])
     if isinstance(results, list):
@@ -1358,6 +1957,16 @@ def _render_report(summary: Mapping[str, object]) -> str:
             max_npu_peak = max_npu.get("max") if isinstance(max_npu, Mapping) else None
             case = result.get("case")
             case_id = case.get("case_id") if isinstance(case, Mapping) else "unknown"
+            per_device = resources.get("per_device")
+            process_peaks = [
+                item.get("npu_process_count", {}).get("max")
+                for item in per_device.values()
+                if isinstance(per_device, Mapping) and isinstance(item, Mapping)
+            ] if isinstance(per_device, Mapping) else []
+            max_processes = max(
+                (float(value) for value in process_peaks if isinstance(value, (int, float))),
+                default=None,
+            )
             lines.append(
                 "| "
                 + " | ".join(
@@ -1372,6 +1981,7 @@ def _render_report(summary: Mapping[str, object]) -> str:
                         _fmt(npu_mean),
                         _fmt(max_npu_peak),
                         _fmt(resources.get("peak_incremental_hbm_mb"), 0),
+                        _fmt(max_processes, 0),
                     )
                 )
                 + " |"
@@ -1379,7 +1989,90 @@ def _render_report(summary: Mapping[str, object]) -> str:
     lines.extend(
         (
             "",
-            "P95 在单请求或双请求 Pilot 中仅用于验证统计链路，不具有稳定分位数意义。正式结论需要增加重复次数和负载点。",
+            "## 文本、视觉与 Workflow",
+            "",
+            "| 执行器 | 分组 | 成功/总数 | E2E 均值 (ms) | E2E P95 (ms) | 吞吐 (req/s) |",
+            "|---|---|---:|---:|---:|---:|",
+        )
+    )
+    if isinstance(results, list):
+        for result in results:
+            if not isinstance(result, Mapping):
+                continue
+            breakdowns = result.get("breakdowns")
+            if not isinstance(breakdowns, Mapping):
+                continue
+            groups: list[tuple[str, object]] = [("overall", breakdowns.get("overall"))]
+            for section in ("families", "workflows"):
+                values = breakdowns.get(section)
+                if isinstance(values, Mapping):
+                    groups.extend((str(key), value) for key, value in values.items())
+            for name, value in groups:
+                if not isinstance(value, Mapping):
+                    continue
+                requests = value.get("requests")
+                if not isinstance(requests, Mapping):
+                    continue
+                latency = requests.get("e2e_latency_ms")
+                mean = latency.get("mean") if isinstance(latency, Mapping) else None
+                lines.append(
+                    "| "
+                    + " | ".join(
+                        (
+                            str(result.get("executor")),
+                            name,
+                            f"{requests.get('succeeded', 0)}/{requests.get('request_count', 0)}",
+                            _fmt(mean),
+                            _fmt(requests.get("p95_e2e_ms")),
+                            _fmt(requests.get("throughput_requests_per_second"), 4),
+                        )
+                    )
+                    + " |"
+                )
+    lines.extend(
+        (
+            "",
+            "## 回收审计",
+            "",
+            "| 执行器 | 控制面回收 | 物理 HBM 回落 | HBM 等待 (ms) |",
+            "|---|---:|---:|---:|",
+        )
+    )
+    if isinstance(results, list):
+        for result in results:
+            if not isinstance(result, Mapping):
+                continue
+            control = result.get("control_recovery")
+            physical = result.get("physical_hbm_recovery")
+            lines.append(
+                "| "
+                + " | ".join(
+                    (
+                        str(result.get("executor")),
+                        (
+                            str(control.get("recovered"))
+                            if isinstance(control, Mapping)
+                            else "n/a"
+                        ),
+                        (
+                            str(physical.get("recovered"))
+                            if isinstance(physical, Mapping)
+                            else "n/a"
+                        ),
+                        _fmt(
+                            physical.get("wait_ms")
+                            if isinstance(physical, Mapping)
+                            else None,
+                            0,
+                        ),
+                    )
+                )
+                + " |"
+            )
+    lines.extend(
+        (
+            "",
+            "本次仅运行一轮，P95 和吞吐量用于 Pilot 对比，不宣称统计显著性。",
             "",
             "## 到达负载",
             "",
@@ -1410,6 +2103,19 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
         else (DEFAULT_OUTPUT_ROOT / f"pilot-{timestamp}").resolve()
     )
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.mixed_batch20:
+        manifest = _build_fixed_batch20_manifest(
+            _discover_mixed_candidates(args.data_root)
+        )
+        args.workload_manifest = output_dir / "workload_manifest.json"
+        _write_json(args.workload_manifest, manifest)
+    elif args.workload_manifest is not None:
+        manifest = _read_json(args.workload_manifest)
+        copied_manifest_path = output_dir / "workload_manifest.json"
+        _write_json(copied_manifest_path, manifest)
+        args.workload_manifest = copied_manifest_path
+    else:
+        manifest = None
     cases = _build_cases(args)
     order = _execution_order(cases, str(args.executor))
     control_environment = _control_environment(args.state_root)
@@ -1429,10 +2135,11 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
             for ordinal, (case, executor, pair_position) in enumerate(order, start=1)
         ],
         "contract": {
-            "dataset": "tbench",
-            "workflow": "retail_cancel",
-            "model_id": TEXT_MODEL_ID,
-            "model_path": str(args.text_model_path),
+            "workload_manifest": manifest,
+            "text_model_id": TEXT_MODEL_ID,
+            "text_model_path": str(args.text_model_path),
+            "vision_model_id": VISION_MODEL_ID,
+            "vision_model_path": str(args.vision_model_path),
             "inference_backend": "transformers",
             "generation_method": "manual_greedy",
             "max_tokens": 4096,
@@ -1469,6 +2176,10 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
     if not args.text_model_path.is_dir():
         raise PerformancePilotError(
             f"Qwen3-4B model path is missing: {args.text_model_path}"
+        )
+    if manifest is not None and not args.vision_model_path.is_dir():
+        raise PerformancePilotError(
+            f"Qwen2.5-VL-3B model path is missing: {args.vision_model_path}"
         )
     container_output_dir = _container_output_path(output_dir, args.state_root)
     results: list[dict[str, object]] = []
@@ -1513,6 +2224,11 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
         if not isinstance(result.get("aggregate"), Mapping)
         or result["aggregate"].get("failed") != 0  # type: ignore[index]
         or result.get("process", {}).get("exit_code") != 0  # type: ignore[union-attr]
+        or result.get("physical_hbm_recovery", {}).get("recovered") is not True  # type: ignore[union-attr]
+        or (
+            result.get("executor") == "maze"
+            and result.get("control_recovery", {}).get("recovered") is not True  # type: ignore[union-attr]
+        )
     ]
     summary = {
         **plan,
@@ -1555,12 +2271,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--arrival-window-seconds", type=float, default=130.0)
     parser.add_argument("--resource-sample-interval-seconds", type=float, default=1.0)
     parser.add_argument("--resource-baseline-seconds", type=float, default=3.0)
+    parser.add_argument("--resource-recovery-timeout-seconds", type=float, default=180.0)
+    parser.add_argument("--hbm-recovery-tolerance-mb", type=int, default=1024)
     parser.add_argument("--request-timeout-seconds", type=float, default=900.0)
     parser.add_argument("--case-timeout-seconds", type=float, default=1800.0)
     parser.add_argument("--ray-task-num-cpus", type=float, default=20.0)
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     parser.add_argument("--data-root", type=Path, default=qwen_smoke.DEFAULT_DATA_ROOT)
     parser.add_argument("--text-model-path", type=Path, default=TEXT_MODEL_PATH)
+    parser.add_argument("--vision-model-path", type=Path, default=VISION_MODEL_PATH)
+    parser.add_argument(
+        "--mixed-batch20",
+        action="store_true",
+        help="run the fixed 14-workflow mixed text/vision Batch=20 pilot",
+    )
+    parser.add_argument(
+        "--workload-manifest",
+        type=Path,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument(
@@ -1586,6 +2316,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.batch_size = [1, 2]
     if args.arrival_ratio is None:
         args.arrival_ratio = [0.25]
+    if args.mixed_batch20:
+        args.mode = ["batch"]
+        args.batch_size = [FIXED_BATCH_SIZE]
+        args.arrival_ratio = []
     if any(item < 1 for item in args.batch_size):
         parser.error("--batch-size must be positive")
     if any(item <= 0 for item in args.arrival_ratio):
@@ -1595,15 +2329,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "arrival_window_seconds",
         "resource_sample_interval_seconds",
         "resource_baseline_seconds",
+        "resource_recovery_timeout_seconds",
         "request_timeout_seconds",
         "case_timeout_seconds",
         "ray_task_num_cpus",
     ):
         if float(getattr(args, name)) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.hbm_recovery_tolerance_mb < 0:
+        parser.error("--hbm-recovery-tolerance-mb must be non-negative")
     args.state_root = args.state_root.expanduser().resolve()
     args.data_root = args.data_root.expanduser().resolve()
     args.text_model_path = args.text_model_path.expanduser().resolve()
+    args.vision_model_path = args.vision_model_path.expanduser().resolve()
+    if args.workload_manifest is not None:
+        args.workload_manifest = args.workload_manifest.expanduser().resolve()
     if args.case_file is not None:
         args.case_file = args.case_file.expanduser().resolve()
     if args.result_file is not None:

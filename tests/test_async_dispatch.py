@@ -299,3 +299,102 @@ def test_binding_generation_change_cancels_pending_startup_and_retries() -> None
         await controller.close()
 
     asyncio.run(scenario())
+
+
+def test_cancelled_submit_response_does_not_cancel_commit_transaction() -> None:
+    async def scenario() -> None:
+        store = InMemoryDataStore()
+        runtime = FakeRuntimeBackend(
+            data_store=store,
+            owner_generation=OWNER_GENERATION,
+            environment_fingerprint=ENVIRONMENT_FINGERPRINT,
+        )
+        controller = _controller(runtime, store)
+        checkpoint_entered = asyncio.Event()
+        release_checkpoint = asyncio.Event()
+
+        async def checkpoint() -> None:
+            if controller.core.run_ids() and not release_checkpoint.is_set():
+                checkpoint_entered.set()
+                await release_checkpoint.wait()
+
+        controller.core.set_checkpoint_sink(checkpoint)
+        await controller.start()
+        workflow = Workflow("cancelled-submit-response")
+        workflow.add_task(barrier)
+        client = InMemoryRuntimeClient(controller)
+        first = asyncio.create_task(
+            client.submit(
+                workflow,
+                inputs={},
+                submission_id="cancelled_submit_response",
+            )
+        )
+        await asyncio.wait_for(checkpoint_entered.wait(), 1)
+        first.cancel()
+        try:
+            await first
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("cancelled submit response unexpectedly completed")
+
+        retry = asyncio.create_task(
+            client.submit(
+                workflow,
+                inputs={},
+                submission_id="cancelled_submit_response",
+            )
+        )
+        release_checkpoint.set()
+        outcome = await asyncio.wait_for(retry, 2)
+        assert outcome.replayed
+        assert outcome.run_id is not None
+        terminal = await controller.wait_run(outcome.run_id, timeout_seconds=2)
+        assert terminal.status is RunStatus.SUCCEEDED
+        assert controller.core.running
+        assert not any(
+            event.event_type == "scheduler_interrupted"
+            for event in controller.recorder.events(outcome.run_id)
+        )
+        await controller.destroy_run(outcome.run_id)
+        await controller.close()
+
+    asyncio.run(scenario())
+
+
+def test_resource_change_wakeups_are_coalesced_without_checkpointing() -> None:
+    async def scenario() -> None:
+        store = InMemoryDataStore()
+        runtime = FakeRuntimeBackend(
+            data_store=store,
+            owner_generation=OWNER_GENERATION,
+            environment_fingerprint=ENVIRONMENT_FINGERPRINT,
+        )
+        controller = _controller(runtime, store)
+        checkpoint_count = 0
+
+        async def checkpoint() -> None:
+            nonlocal checkpoint_count
+            checkpoint_count += 1
+
+        controller.core.set_checkpoint_sink(checkpoint)
+        await controller.start()
+        for sequence in range(1_000):
+            assert controller.core.post_resource_changed(
+                f"node_observation:node_a:{sequence}"
+            )
+        assert controller.core._queue.qsize() == 1  # noqa: SLF001
+        assert controller.core._pending_resource_change_keys == {None}  # noqa: SLF001
+
+        for _ in range(1_000):
+            if not controller.core._pending_resource_change_keys:  # noqa: SLF001
+                break
+            await asyncio.sleep(0.001)
+        else:
+            raise AssertionError("coalesced resource wakeup was not processed")
+        await asyncio.sleep(0)
+        assert checkpoint_count == 0
+        await controller.close()
+
+    asyncio.run(scenario())

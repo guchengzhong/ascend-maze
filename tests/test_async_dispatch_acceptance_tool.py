@@ -106,3 +106,9 @@ def test_resource_signatures_ignore_replenished_worker_and_lease_ids() -> None:
     assert acceptance._global_lease_signature(  # noqa: SLF001
         before_cluster
     ) == acceptance._global_lease_signature(after_cluster)  # noqa: SLF001
+
+
+def test_cli_accepts_batch_larger_than_logical_node_count() -> None:
+    args = acceptance.parse_args(["--batch-size", "20"])
+
+    assert args.batch_size == [20]
