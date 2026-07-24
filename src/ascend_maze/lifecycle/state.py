@@ -25,6 +25,7 @@ class TaskStatus(str, Enum):
     PENDING = "pending"
     READY = "ready"
     QUEUED = "queued"
+    STARTING = "starting"
     RUNNING = "running"
     RETRY_WAIT = "retry_wait"
     SUCCEEDED = "succeeded"
@@ -380,6 +381,7 @@ class RunStateManager:
             )
             task.attempt_count = attempt_number
             task.attempts.append(attempt)
+            task.status = TaskStatus.STARTING
             task.pending_reason = None
             return self._attempt_snapshot(attempt, task_id)
 
@@ -402,8 +404,8 @@ class RunStateManager:
                 return TransitionResult(False)
             if record.status is not AttemptStatus.DISPATCHED:
                 return TransitionResult(False)
-            if task.status is not TaskStatus.QUEUED:
-                raise StateTransitionError("WorkerStarted requires queued task")
+            if task.status is not TaskStatus.STARTING:
+                raise StateTransitionError("WorkerStarted requires starting task")
             record.status = AttemptStatus.RUNNING
             record.worker_started_at_ms = now_ms
             task.status = TaskStatus.RUNNING

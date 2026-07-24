@@ -16,6 +16,9 @@ readonly VERIFY_SCRIPT="${REPO_ROOT}/deploy/logical_cluster/verify_node.py"
 readonly VERIFY_BINDING_SCRIPT="${REPO_ROOT}/deploy/logical_cluster/verify_device_binding.py"
 readonly PREPARE_CONTROL_SCRIPT="${REPO_ROOT}/deploy/logical_cluster/prepare_control_plane.py"
 readonly VERIFY_CONTROL_SCRIPT="${REPO_ROOT}/deploy/logical_cluster/verify_control_plane.py"
+readonly TINI_VERSION="0.19.0"
+readonly TINI_SHA256="eae1d3aa50c48fb23b8cbdf4e369d0910dfc538566bfd09df89a774aa84a48b9"
+readonly TINI_PATH="${STATE_ROOT}/bin/tini-static-arm64"
 readonly USER_ID="$(id -u)"
 readonly GROUP_ID="$(id -g)"
 
@@ -65,7 +68,13 @@ validate_node_id() {
 }
 
 ensure_prerequisites() {
-    command -v docker >/dev/null
+    local command
+    for command in docker curl sha256sum; do
+        if ! command -v "${command}" >/dev/null; then
+            echo "required host command is missing: ${command}" >&2
+            exit 1
+        fi
+    done
     for path in "${REPO_ROOT}" "${CONDA_ROOT}/envs/ascend-maze" "${MODEL_ROOT}" \
         /usr/local/Ascend /usr/local/bin/npu-smi \
         /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc \
@@ -100,6 +109,31 @@ ensure_network() {
             --label com.ascend-maze.logical-cluster=true \
             "${NETWORK_NAME}" >/dev/null
     fi
+}
+
+ensure_tini() {
+    local expected="${TINI_SHA256}  ${TINI_PATH}"
+    if [[ -x "${TINI_PATH}" ]] && printf '%s\n' "${expected}" | sha256sum --check --status; then
+        return
+    fi
+
+    local temporary="${TINI_PATH}.tmp.$$"
+    mkdir -p "$(dirname "${TINI_PATH}")"
+    rm -f "${temporary}"
+    if ! curl --fail --location --retry 3 --silent --show-error \
+        "https://github.com/krallin/tini/releases/download/v${TINI_VERSION}/tini-static-arm64" \
+        --output "${temporary}"; then
+        rm -f "${temporary}"
+        return 1
+    fi
+    if ! printf '%s  %s\n' "${TINI_SHA256}" "${temporary}" | \
+        sha256sum --check --status; then
+        echo "downloaded Tini checksum does not match the pinned digest" >&2
+        rm -f "${temporary}"
+        return 1
+    fi
+    chmod 0755 "${temporary}"
+    mv "${temporary}" "${TINI_PATH}"
 }
 
 prepare_state() {
@@ -158,6 +192,7 @@ create_node() {
         --volume "${CONDA_ROOT}:${CONDA_ROOT}:ro" \
         --volume "${MODEL_ROOT}:${MODEL_ROOT}:ro" \
         --volume "${REPO_ROOT}:${REPO_ROOT}:ro" \
+        --volume "${TINI_PATH}:/usr/local/bin/tini:ro" \
         --volume "${node_state}:/workspace/state" \
         --volume "${node_state}/logs:/ascend/log" \
         --env HOME=/workspace/state/home \
@@ -169,8 +204,9 @@ create_node() {
         --env ASCEND_DEVICE_ID=0 \
         --env "ASCEND_PHYSICAL_DEVICE_ID=${node_id}" \
         --env "ASCEND_MAZE_LOGICAL_NODE_ID=node-${node_id}" \
+        --entrypoint /usr/local/bin/tini \
         "${IMAGE}" \
-        bash -lc "source '${ENV_SCRIPT}'; exec sleep infinity" >/dev/null
+        -- bash -lc "source '${ENV_SCRIPT}'; exec sleep infinity" >/dev/null
     echo "${name}: started (NPU ${node_id}, CPUs ${CPUSETS[${node_id}]}, MEMs ${MEMSETS[${node_id}]})"
 }
 
@@ -178,6 +214,7 @@ up() {
     ensure_prerequisites
     ensure_network
     mkdir -p "${STATE_ROOT}"
+    ensure_tini
     for node_id in $(seq 0 7); do
         prepare_state "${node_id}"
         create_node "${node_id}"
@@ -291,7 +328,8 @@ control_up() {
         fi
     done
     control_prepare "${profile}"
-    if [[ ! -S "${STATE_ROOT}/node-0/control-plane/control.sock" ]]; then
+    if ! controller_is_running; then
+        rm -f "${STATE_ROOT}/node-0/control-plane/control.sock"
         docker exec --detach "$(container_name 0)" bash -lc \
             "source '${ENV_SCRIPT}'; exec python -m ascend_maze.cli.main \
             controller start \
@@ -331,14 +369,36 @@ control_up() {
 
 node_agent_is_running() {
     local node_id="$1"
-    docker exec "$(container_name "${node_id}")" python -c \
-        'import json,os,sys
-path="/workspace/state/control-plane/node-agent/node.pid"
+    docker exec "$(container_name "${node_id}")" \
+        "${CONDA_ROOT}/envs/ascend-maze/bin/python" -c \
+        'import json,os,pathlib,sys
+path=pathlib.Path(sys.argv[1])
 try:
-    pid=int(json.load(open(path, encoding="utf-8"))["pid"])
+    payload=json.loads(path.read_text(encoding="utf-8"))
+    pid=int(payload["pid"])
+    fields=pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+    if int(fields[21]) != int(payload["process_start_ticks"]):
+        sys.exit(1)
     os.kill(pid, 0)
-except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, KeyError):
-    sys.exit(1)' \
+except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, KeyError, IndexError):
+    sys.exit(1)' "/workspace/state/control-plane/node-agent/node.pid" \
+        >/dev/null 2>&1
+}
+
+controller_is_running() {
+    docker exec "$(container_name 0)" \
+        "${CONDA_ROOT}/envs/ascend-maze/bin/python" -c \
+        'import json,os,pathlib,sys
+path=pathlib.Path(sys.argv[1])
+try:
+    payload=json.loads(path.read_text(encoding="utf-8"))
+    pid=int(payload["pid"])
+    fields=pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+    if int(fields[21]) != int(payload["process_start_ticks"]):
+        sys.exit(1)
+    os.kill(pid, 0)
+except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, KeyError, IndexError):
+    sys.exit(1)' "/workspace/state/control-plane/controller.pid" \
         >/dev/null 2>&1
 }
 
@@ -359,10 +419,18 @@ control_status() {
 
 stop_node_agent() {
     local node_id="$1"
-    docker exec "$(container_name "${node_id}")" bash -lc \
-        "test ! -f /workspace/state/control-plane/node-agent/node.pid || \
-        kill -TERM \$(python -c \
-        'import json; print(json.load(open("/workspace/state/control-plane/node-agent/node.pid"))["pid"])')" \
+    docker exec "$(container_name "${node_id}")" \
+        "${CONDA_ROOT}/envs/ascend-maze/bin/python" -c \
+        'import json,os,pathlib,signal,sys
+path=pathlib.Path(sys.argv[1])
+try:
+    payload=json.loads(path.read_text(encoding="utf-8"))
+    pid=int(payload["pid"])
+    fields=pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+    if int(fields[21]) == int(payload["process_start_ticks"]):
+        os.kill(pid, signal.SIGTERM)
+except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, KeyError, IndexError):
+    pass' "/workspace/state/control-plane/node-agent/node.pid" \
         >/dev/null 2>&1 || true
 }
 
@@ -386,16 +454,35 @@ wait_for_node_agents_to_stop() {
     return 1
 }
 
+wait_for_controller_to_stop() {
+    # A performance profile may own many Standby Workers. Their bounded,
+    # sequential retirement can legitimately outlive the control RPC deadline.
+    local attempts=360
+    while (( attempts > 0 )); do
+        if ! controller_is_running; then
+            return
+        fi
+        sleep 1
+        attempts=$((attempts - 1))
+    done
+    echo "Controller did not release its PID lock before cleanup deadline" >&2
+    return 1
+}
+
 control_down() {
+    # Keep NodeAgents available while the Controller releases remote model,
+    # Worker and Placement leases. The CLI may hit its short RPC deadline while
+    # shutdown continues server-side, so the process lock is authoritative.
+    if controller_is_running && \
+        [[ -S "${STATE_ROOT}/node-0/control-plane/control.sock" ]]; then
+        docker exec "$(container_name 0)" bash -lc \
+            "source '${ENV_SCRIPT}'; python -m ascend_maze.cli.main controller stop \
+            --config /workspace/state/control-plane/controller.toml --force" || true
+        wait_for_controller_to_stop
+    fi
     for node_id in $(seq 1 7); do
         stop_node_agent "${node_id}"
     done
-    sleep 2
-    if [[ -S "${STATE_ROOT}/node-0/control-plane/control.sock" ]]; then
-        docker exec "$(container_name 0)" bash -lc \
-            "source '${ENV_SCRIPT}'; python -m ascend_maze.cli.main controller stop \
-            --socket /workspace/state/control-plane/control.sock --force" || true
-    fi
     wait_for_node_agents_to_stop
 }
 

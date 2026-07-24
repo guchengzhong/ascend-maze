@@ -1020,6 +1020,8 @@ def _run_one_sample_ray(
                         if route_payload is None
                         else route_payload["route_lease_id"]
                     ),
+                    "worker_node_id": result.get("worker_node_id"),
+                    "worker_node_ip": result.get("worker_node_ip"),
                     "dispatch_prepare_ms": dispatch_prepare_ms,
                     "ray_roundtrip_ms": ray_roundtrip_ms,
                 }

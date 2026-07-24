@@ -513,6 +513,22 @@ def _aggregate_resources(
         if isinstance(item.get("cluster_hbm_used_mb"), int)
     ]
     baseline_hbm = None
+    baseline_samples = [
+        item
+        for item in samples
+        if isinstance(item.get("timestamp_ms"), int)
+        and int(item["timestamp_ms"]) < started_at_ms
+    ]
+    baseline_cpu_values = [
+        float(item["cluster_cpu_utilization_pct"])
+        for item in baseline_samples
+        if isinstance(item.get("cluster_cpu_utilization_pct"), (int, float))
+    ]
+    baseline_npu_values = [
+        float(item["cluster_npu_utilization_pct"])
+        for item in baseline_samples
+        if isinstance(item.get("cluster_npu_utilization_pct"), (int, float))
+    ]
     for item in reversed(samples):
         if (
             isinstance(item.get("timestamp_ms"), int)
@@ -551,7 +567,19 @@ def _aggregate_resources(
         "window_started_at_ms": started_at_ms,
         "window_finished_at_ms": finished_at_ms,
         "cluster_cpu_utilization_pct": _stats(cpu_values),
+        "baseline_cluster_cpu_utilization_pct": _stats(baseline_cpu_values),
+        "incremental_cluster_cpu_utilization_pct": (
+            None
+            if not cpu_values or not baseline_cpu_values
+            else statistics.fmean(cpu_values) - statistics.fmean(baseline_cpu_values)
+        ),
         "cluster_npu_utilization_pct": _stats(npu_values),
+        "baseline_cluster_npu_utilization_pct": _stats(baseline_npu_values),
+        "incremental_cluster_npu_utilization_pct": (
+            None
+            if not npu_values or not baseline_npu_values
+            else statistics.fmean(npu_values) - statistics.fmean(baseline_npu_values)
+        ),
         "max_device_npu_utilization_pct": _stats(max_npu_values),
         "cluster_hbm_used_mb": _stats(hbm_values),
         "baseline_cluster_hbm_used_mb": baseline_hbm,
@@ -599,6 +627,97 @@ def _task_timings(
     run: Mapping[str, object], task_names: Mapping[str, str]
 ) -> list[dict[str, object]]:
     return logical_e2e._task_timings(dict(run), dict(task_names))  # noqa: SLF001
+
+
+def _dispatch_lifecycle(
+    watch_batches: Sequence[Mapping[str, object]],
+    task_names: Mapping[str, str],
+) -> list[dict[str, object]]:
+    lifecycle_types = {"task_dispatched", "dispatch_prepared", "worker_started"}
+    attempts: dict[tuple[str, int], dict[str, Mapping[str, object]]] = {}
+    for batch in watch_batches:
+        events = batch.get("events")
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            if not isinstance(event, Mapping):
+                continue
+            event_type = event.get("event_type")
+            task_id = event.get("task_id")
+            attempt = event.get("attempt")
+            if (
+                event_type not in lifecycle_types
+                or not isinstance(task_id, str)
+                or not isinstance(attempt, int)
+                or isinstance(attempt, bool)
+            ):
+                continue
+            attempts.setdefault((task_id, attempt), {})[str(event_type)] = event
+
+    def timestamp(event: Mapping[str, object] | None) -> int | None:
+        if event is None:
+            return None
+        value = event.get("monotonic_time_ms")
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    def elapsed(start: int | None, finish: int | None) -> int | None:
+        if start is None or finish is None:
+            return None
+        return max(0, finish - start)
+
+    records: list[dict[str, object]] = []
+    for (task_id, attempt), events in sorted(attempts.items()):
+        dispatched = events.get("task_dispatched")
+        prepared = events.get("dispatch_prepared")
+        running = events.get("worker_started")
+        dispatched_at = timestamp(dispatched)
+        prepared_at = timestamp(prepared)
+        running_at = timestamp(running)
+        dispatch_payload = (
+            dispatched.get("payload")
+            if isinstance(dispatched, Mapping)
+            and isinstance(dispatched.get("payload"), Mapping)
+            else {}
+        )
+        prepared_payload = (
+            prepared.get("payload")
+            if isinstance(prepared, Mapping)
+            and isinstance(prepared.get("payload"), Mapping)
+            else {}
+        )
+        running_payload = (
+            running.get("payload")
+            if isinstance(running, Mapping)
+            and isinstance(running.get("payload"), Mapping)
+            else {}
+        )
+        records.append(
+            {
+                "task_id": task_id,
+                "task_name": task_names.get(task_id, task_id),
+                "attempt": attempt,
+                "dispatch_id": dispatch_payload.get("dispatch_id"),
+                "node_id": dispatch_payload.get("node_id"),
+                "worker_pid": running_payload.get("worker_pid"),
+                "task_dispatched_sequence": (
+                    None if dispatched is None else dispatched.get("sequence")
+                ),
+                "dispatch_prepared_sequence": (
+                    None if prepared is None else prepared.get("sequence")
+                ),
+                "running_sequence": (
+                    None if running is None else running.get("sequence")
+                ),
+                "task_dispatched_at_ms": dispatched_at,
+                "dispatch_prepared_at_ms": prepared_at,
+                "running_at_ms": running_at,
+                "dispatch_prepare_ms": prepared_payload.get("dispatch_prepare_ms"),
+                "dispatch_to_prepared_ms": elapsed(dispatched_at, prepared_at),
+                "prepared_to_running_ms": elapsed(prepared_at, running_at),
+                "dispatch_to_running_ms": elapsed(dispatched_at, running_at),
+            }
+        )
+    return records
 
 
 async def _wait_maze_terminal(
@@ -667,6 +786,9 @@ async def _run_maze_request(
         )
         record["terminal_status"] = terminal.get("status")
         record["watch_batch_count"] = len(watch_batches)
+        record["dispatch_lifecycle"] = _dispatch_lifecycle(
+            watch_batches, task_names
+        )
         if terminal.get("status") != "succeeded":
             raise PerformancePilotError(f"Run terminated as {terminal.get('status')}")
         results = {}
@@ -1096,8 +1218,9 @@ def _run_container_worker(
         output_path=resource_path,
         interval_seconds=float(args.resource_sample_interval_seconds),
     )
-    started_at_ms = int(time.time() * 1_000)
     monitor.start()
+    time.sleep(float(args.resource_baseline_seconds))
+    started_at_ms = int(time.time() * 1_000)
     case_dir.mkdir(parents=True, exist_ok=True)
     with (
         (case_dir / "stdout.log").open("w", encoding="utf-8") as stdout_handle,
@@ -1177,8 +1300,8 @@ def _render_report(summary: Mapping[str, object]) -> str:
         "",
         "## 汇总",
         "",
-        "| Case | 执行器 | 成功/总数 | E2E P95 (ms) | 吞吐 (req/s) | CPU 均值 (%) | NPU 八卡均值 (%) | 单卡 NPU 峰值 (%) | HBM 增量峰值 (MB) |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Case | 执行器 | 成功/总数 | E2E P95 (ms) | 吞吐 (req/s) | CPU 均值 (%) | CPU 增量 (%) | NPU 八卡均值 (%) | 单卡 NPU 峰值 (%) | HBM 增量峰值 (MB) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     results = summary.get("results", [])
     if isinstance(results, list):
@@ -1209,6 +1332,7 @@ def _render_report(summary: Mapping[str, object]) -> str:
                         _fmt(aggregate.get("p95_e2e_ms")),
                         _fmt(aggregate.get("throughput_requests_per_second"), 4),
                         _fmt(cpu_mean),
+                        _fmt(resources.get("incremental_cluster_cpu_utilization_pct")),
                         _fmt(npu_mean),
                         _fmt(max_npu_peak),
                         _fmt(resources.get("peak_incremental_hbm_mb"), 0),
@@ -1394,6 +1518,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--average-workflow-seconds", type=float, default=30.0)
     parser.add_argument("--arrival-window-seconds", type=float, default=130.0)
     parser.add_argument("--resource-sample-interval-seconds", type=float, default=1.0)
+    parser.add_argument("--resource-baseline-seconds", type=float, default=3.0)
     parser.add_argument("--request-timeout-seconds", type=float, default=900.0)
     parser.add_argument("--case-timeout-seconds", type=float, default=1800.0)
     parser.add_argument("--ray-task-num-cpus", type=float, default=20.0)
@@ -1433,6 +1558,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "average_workflow_seconds",
         "arrival_window_seconds",
         "resource_sample_interval_seconds",
+        "resource_baseline_seconds",
         "request_timeout_seconds",
         "case_timeout_seconds",
         "ray_task_num_cpus",

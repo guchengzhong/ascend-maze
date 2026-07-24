@@ -96,6 +96,32 @@ class _EndpointFactory:
         endpoint.terminated = True
 
 
+class _GatedEndpointFactory(_EndpointFactory):
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_entered = asyncio.Event()
+        self.release_start = asyncio.Event()
+
+    async def start(
+        self,
+        *,
+        worker_id: str,
+        worker_generation: int,
+        binding: RuntimeNodeBinding,
+        config: WorkerPoolProfileConfig,
+        deadline_ms: int,
+    ) -> tuple[Any, StandbyWarmupReport]:
+        self.start_entered.set()
+        await self.release_start.wait()
+        return await super().start(
+            worker_id=worker_id,
+            worker_generation=worker_generation,
+            binding=binding,
+            config=config,
+            deadline_ms=deadline_ms,
+        )
+
+
 def _pool_config(profile: WorkerProfile, *, min_idle: int = 1) -> WorkerPoolConfig:
     resources = ReservationVector(
         cpu_num=1,
@@ -371,6 +397,125 @@ def test_cold_mode_uses_the_same_endpoint_protocol_on_the_leased_node() -> None:
         assert factory.termination_timeouts == [12_345]
         assert broker.snapshot().workers[0].state is StandbyWorkerState.DEAD
         assert placement.release_lease(result.lease.lease_id, now_ms=monotonic_time_ms())
+        await broker.close()
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_cold_acquire_reserves_max_total_before_endpoint_start() -> None:
+    async def scenario() -> None:
+        placement, registry, _, _ = _components(WorkerProfile.CPU, cpu=2)
+        profile = replace(
+            _pool_config(WorkerProfile.CPU, min_idle=0).profiles[0],
+            max_idle=0,
+            max_total=1,
+        )
+        factory = _GatedEndpointFactory()
+        broker = StandbyWorkerBroker(
+            node_registry=registry,
+            placement=placement,
+            environment_fingerprint="e" * 64,
+            config=WorkerPoolConfig(mode="cold_start", profiles=(profile,)),
+            endpoint_factory=factory,
+        )
+        first = placement.try_reserve(
+            run_id="run_1",
+            task_id="task_1",
+            attempt=1,
+            anchor=_anchor(WorkerProfile.CPU),
+            now_ms=monotonic_time_ms(),
+            dispatch_deadline_ms=monotonic_time_ms() + 1_000,
+        )
+        second = placement.try_reserve(
+            run_id="run_2",
+            task_id="task_2",
+            attempt=1,
+            anchor=_anchor(WorkerProfile.CPU),
+            now_ms=monotonic_time_ms(),
+            dispatch_deadline_ms=monotonic_time_ms() + 1_000,
+        )
+        assert first.lease is not None and second.lease is not None
+
+        first_acquire = asyncio.create_task(
+            broker.acquire(
+                placement_lease=first.lease,
+                task_kind="cpu",
+                execution_target=ExecutionTarget.LOCAL_WORKER,
+                now_ms=monotonic_time_ms(),
+            )
+        )
+        await factory.start_entered.wait()
+        assert broker.live_count() == 1
+        with pytest.raises(StateTransitionError, match="max_total"):
+            await broker.acquire(
+                placement_lease=second.lease,
+                task_kind="cpu",
+                execution_target=ExecutionTarget.LOCAL_WORKER,
+                now_ms=monotonic_time_ms(),
+            )
+
+        factory.release_start.set()
+        worker_lease = await first_acquire
+        assert broker.live_count() == 1
+        await broker.release(worker_lease.worker_lease_id, disposition="discard")
+        placement.release_lease(first.lease.lease_id, now_ms=monotonic_time_ms())
+        placement.release_lease(second.lease.lease_id, now_ms=monotonic_time_ms())
+        await broker.close()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_cold_start_releases_starting_capacity_slot() -> None:
+    async def scenario() -> None:
+        placement, registry, _, _ = _components(WorkerProfile.CPU, cpu=1)
+        profile = replace(
+            _pool_config(WorkerProfile.CPU, min_idle=0).profiles[0],
+            max_idle=0,
+            max_total=1,
+        )
+        factory = _GatedEndpointFactory()
+        broker = StandbyWorkerBroker(
+            node_registry=registry,
+            placement=placement,
+            environment_fingerprint="e" * 64,
+            config=WorkerPoolConfig(mode="cold_start", profiles=(profile,)),
+            endpoint_factory=factory,
+        )
+        result = placement.try_reserve(
+            run_id="run_cancel_start",
+            task_id="task_cancel_start",
+            attempt=1,
+            anchor=_anchor(WorkerProfile.CPU),
+            now_ms=monotonic_time_ms(),
+            dispatch_deadline_ms=monotonic_time_ms() + 1_000,
+        )
+        assert result.lease is not None
+        acquire = asyncio.create_task(
+            broker.acquire(
+                placement_lease=result.lease,
+                task_kind="cpu",
+                execution_target=ExecutionTarget.LOCAL_WORKER,
+                now_ms=monotonic_time_ms(),
+            )
+        )
+        await factory.start_entered.wait()
+        assert broker.live_count() == 1
+        acquire.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await acquire
+        assert broker.live_count() == 0
+        assert broker.snapshot().active_worker_lease_count == 0
+
+        factory.release_start.set()
+        replacement = await broker.acquire(
+            placement_lease=result.lease,
+            task_kind="cpu",
+            execution_target=ExecutionTarget.LOCAL_WORKER,
+            now_ms=monotonic_time_ms(),
+        )
+        assert broker.live_count() == 1
+        await broker.release(replacement.worker_lease_id, disposition="discard")
+        placement.release_lease(result.lease.lease_id, now_ms=monotonic_time_ms())
         await broker.close()
 
     asyncio.run(scenario())

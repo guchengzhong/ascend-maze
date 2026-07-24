@@ -162,6 +162,30 @@ class _DispatchRecord:
 
 
 @dataclass(slots=True)
+class _DispatchStartupRecord:
+    request: ExecutionRequest
+    lease: PlacementLease
+    route_lease: ModelRouteLease | None
+    generation: int
+    requested_at_ns: int
+    task: asyncio.Task[DispatchHandle | None]
+
+
+@dataclass(frozen=True, slots=True)
+class _DispatchPrepared:
+    dispatch_id: str
+    generation: int
+    handle: DispatchHandle
+
+
+@dataclass(frozen=True, slots=True)
+class _DispatchStartFailed:
+    dispatch_id: str
+    generation: int
+    error: BaseException
+
+
+@dataclass(slots=True)
 class _CommitCommand:
     run_id: str
     submission_id: str
@@ -215,6 +239,13 @@ class _ResourceChanged:
 @dataclass(frozen=True, slots=True)
 class _ModelRouteFailed:
     lease: ModelRouteLease
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeBindingInvalidated:
+    node_id: str
+    boot_id: str
     reason: str
 
 
@@ -317,6 +348,8 @@ class SchedulerCore:
         self._enqueue_sequence = 0
         self._partition_cursor = 0
         self._dispatches: dict[str, _DispatchRecord] = {}
+        self._pending_dispatches: dict[str, _DispatchStartupRecord] = {}
+        self._dispatch_startup_generation = 0
         self._attempt_routes: dict[tuple[str, str, int], ModelRouteLease] = {}
         self._recorded_inference_routes: set[str] = set()
         self._recorded_route_terminals: set[str] = set()
@@ -527,6 +560,32 @@ class SchedulerCore:
             self._loop.call_soon_threadsafe(self._queue.put_nowait, event)
         return True
 
+    def post_runtime_binding_invalidated(
+        self,
+        node_id: str,
+        boot_id: str,
+        *,
+        reason: str,
+    ) -> bool:
+        if (
+            not node_id
+            or not boot_id
+            or not reason
+            or self._loop is None
+            or not self._running
+        ):
+            return False
+        event = _RuntimeBindingInvalidated(node_id, boot_id, reason)
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is self._loop:
+            self._queue.put_nowait(event)
+        else:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, event)
+        return True
+
     async def wait_terminal(
         self,
         run_id: str,
@@ -592,13 +651,19 @@ class SchedulerCore:
         )
 
     def active_dispatch_ids(self) -> tuple[str, ...]:
-        return tuple(
-            sorted(
-                dispatch_id
-                for dispatch_id in self._dispatches
-                if not self.runtime.dispatch_invalidated(dispatch_id)
-                or not self.runtime.worker_released(dispatch_id)
-            )
+        active = set(self._pending_dispatches)
+        active.update(
+            dispatch_id
+            for dispatch_id in self._dispatches
+            if not self.runtime.dispatch_invalidated(dispatch_id)
+            or not self.runtime.worker_released(dispatch_id)
+        )
+        return tuple(sorted(active))
+
+    def pending_dispatch_count(self, run_id: str | None = None) -> int:
+        return sum(
+            run_id is None or record.request.run_id == run_id
+            for record in self._pending_dispatches.values()
         )
 
     def record_control_event(
@@ -669,12 +734,19 @@ class SchedulerCore:
         if not self._running:
             return
         self._checkpoint_sink = None
+        self._dispatch_enabled = False
         self._running = False
         runner = self._runner
         self._runner = None
         if runner is not None:
             runner.cancel()
             await asyncio.gather(runner, return_exceptions=True)
+        pending_ids = tuple(self._pending_dispatches)
+        for dispatch_id in pending_ids:
+            await self._cancel_pending_dispatch(
+                dispatch_id,
+                "controller_generation_abandoned",
+            )
         if self.inference is not None:
             await self.inference.abandon()
         await self.runtime.close()
@@ -689,6 +761,7 @@ class SchedulerCore:
                 if task.status not in {
                     TaskStatus.READY,
                     TaskStatus.QUEUED,
+                    TaskStatus.STARTING,
                     TaskStatus.RETRY_WAIT,
                 }:
                     continue
@@ -827,6 +900,12 @@ class SchedulerCore:
                     )
             elif isinstance(item, _ModelRouteFailed):
                 await self._handle_model_route_failure(item)
+            elif isinstance(item, _DispatchPrepared):
+                await self._dispatch_prepared(item)
+            elif isinstance(item, _DispatchStartFailed):
+                await self._dispatch_start_failed(item)
+            elif isinstance(item, _RuntimeBindingInvalidated):
+                await self._runtime_binding_invalidated(item)
             elif isinstance(item, _BeginDrainCommand):
                 self._dispatch_enabled = False
                 item.future.set_result(None)
@@ -1242,50 +1321,259 @@ class SchedulerCore:
                             ),
                         },
                     )
-                    try:
-                        handle = await self.runtime.dispatch(request, placement.lease)
-                    except Exception as exc:
-                        error = self._error(
-                            run_id=key.run_id,
-                            task_id=key.task_id,
-                            attempt=attempt.attempt,
-                            dispatch_id=dispatch_id,
-                            lease_id=placement.lease.lease_id,
-                            error_code="worker_start_failed",
-                            category="worker",
-                            origin="runtime",
-                            phase="dispatched",
-                            message=f"{type(exc).__name__}: {exc}",
-                        )
-                        await self._handle_attempt_failure(
-                            run_id=key.run_id,
-                            task_id=key.task_id,
-                            attempt=attempt.attempt,
-                            dispatch_id=dispatch_id,
-                            lease_id=placement.lease.lease_id,
-                            error=error,
-                            attempt_status=AttemptStatus.FAILED,
-                            dispatch_handle=None,
-                        )
-                    else:
-                        self._dispatches[dispatch_id] = _DispatchRecord(
-                            handle=handle,
-                            lease_id=placement.lease.lease_id,
-                            route_lease=route_lease,
-                        )
-                        self.deadlines.register(
-                            kind=DeadlineKind.LEASE,
-                            run_id=key.run_id,
-                            task_id=key.task_id,
-                            attempt=attempt.attempt,
-                            due_at_ms=placement.lease.dispatch_deadline_ms,
-                        )
-                        for blocked_key in blocked_before:
-                            blocked = self._blocked.get(blocked_key)
-                            if blocked is not None and blocked_key in self._queued:
-                                blocked.bypass_count += 1
+                    self.deadlines.register(
+                        kind=DeadlineKind.LEASE,
+                        run_id=key.run_id,
+                        task_id=key.task_id,
+                        attempt=attempt.attempt,
+                        due_at_ms=placement.lease.dispatch_deadline_ms,
+                    )
+                    # Persist the Attempt and Lease before starting an external Worker.
+                    await self._checkpoint()
+                    self._start_pending_dispatch(
+                        request=request,
+                        lease=placement.lease,
+                        route_lease=route_lease,
+                    )
+                    for blocked_key in blocked_before:
+                        blocked = self._blocked.get(blocked_key)
+                        if blocked is not None and blocked_key in self._queued:
+                            blocked.bypass_count += 1
                     progress = True
                     break
+
+    def _start_pending_dispatch(
+        self,
+        *,
+        request: ExecutionRequest,
+        lease: PlacementLease,
+        route_lease: ModelRouteLease | None,
+    ) -> None:
+        self._dispatch_startup_generation += 1
+        generation = self._dispatch_startup_generation
+        task = asyncio.create_task(
+            self._prepare_dispatch(request, lease, generation),
+            name=f"maze-dispatch-start:{request.dispatch_id}",
+        )
+        self._pending_dispatches[request.dispatch_id] = _DispatchStartupRecord(
+            request=request,
+            lease=lease,
+            route_lease=route_lease,
+            generation=generation,
+            requested_at_ns=perf_counter_ns(),
+            task=task,
+        )
+
+    async def _prepare_dispatch(
+        self,
+        request: ExecutionRequest,
+        lease: PlacementLease,
+        generation: int,
+    ) -> DispatchHandle | None:
+        try:
+            handle = await self.runtime.dispatch(request, lease)
+        except BaseException as exc:
+            self._queue.put_nowait(
+                _DispatchStartFailed(request.dispatch_id, generation, exc)
+            )
+            return None
+        self._queue.put_nowait(
+            _DispatchPrepared(request.dispatch_id, generation, handle)
+        )
+        return handle
+
+    async def _dispatch_prepared(self, event: _DispatchPrepared) -> None:
+        pending = self._pending_dispatches.get(event.dispatch_id)
+        if pending is None or pending.generation != event.generation:
+            await self.runtime.cancel(event.handle, "late_dispatch_prepared")
+            return
+        del self._pending_dispatches[event.dispatch_id]
+        request = pending.request
+        handle = event.handle
+        if (
+            handle.dispatch_id != request.dispatch_id
+            or handle.run_id != request.run_id
+            or handle.task_id != request.task_id
+            or handle.attempt != request.attempt
+            or handle.lease_id != pending.lease.lease_id
+            or handle.route_lease_id
+            != (
+                None
+                if pending.route_lease is None
+                else pending.route_lease.route_lease_id
+            )
+        ):
+            await self.runtime.cancel(handle, "dispatch_handle_identity_mismatch")
+            await self._fail_pending_dispatch(
+                pending,
+                RuntimeError("Runtime returned a mismatched DispatchHandle"),
+            )
+            return
+        if not self.state.matches_active_attempt(
+            run_id=request.run_id,
+            task_id=request.task_id,
+            attempt=request.attempt,
+            dispatch_id=request.dispatch_id,
+        ):
+            await self.runtime.cancel(handle, "late_dispatch_prepared")
+            self._release_attempt_lease(
+                lease_id=pending.lease.lease_id,
+                run_id=request.run_id,
+                task_id=request.task_id,
+                attempt=request.attempt,
+                reason="late_dispatch_prepared",
+            )
+            await self._release_attempt_route(
+                run_id=request.run_id,
+                task_id=request.task_id,
+                attempt=request.attempt,
+                reason="late_dispatch_prepared",
+                expected_route_lease_id=handle.route_lease_id,
+                record_inference=True,
+            )
+            return
+        self._dispatches[event.dispatch_id] = _DispatchRecord(
+            handle=handle,
+            lease_id=pending.lease.lease_id,
+            route_lease=pending.route_lease,
+        )
+        self._record(
+            request.run_id,
+            "dispatch_prepared",
+            task_id=request.task_id,
+            attempt=request.attempt,
+            lease_id=pending.lease.lease_id,
+            route_lease_id=handle.route_lease_id,
+            payload={
+                "dispatch_id": request.dispatch_id,
+                "dispatch_prepare_ms": max(
+                    0.0,
+                    (perf_counter_ns() - pending.requested_at_ns) / 1_000_000,
+                ),
+                "worker_endpoint_id": handle.worker_endpoint_id,
+            },
+        )
+
+    async def _dispatch_start_failed(self, event: _DispatchStartFailed) -> None:
+        pending = self._pending_dispatches.get(event.dispatch_id)
+        if pending is None or pending.generation != event.generation:
+            return
+        del self._pending_dispatches[event.dispatch_id]
+        if not self.state.matches_active_attempt(
+            run_id=pending.request.run_id,
+            task_id=pending.request.task_id,
+            attempt=pending.request.attempt,
+            dispatch_id=pending.request.dispatch_id,
+        ):
+            return
+        await self._fail_pending_dispatch(pending, event.error)
+
+    async def _runtime_binding_invalidated(
+        self,
+        event: _RuntimeBindingInvalidated,
+    ) -> None:
+        affected: list[tuple[str, str, int, str, str]] = []
+        for pending in tuple(self._pending_dispatches.values()):
+            if (
+                pending.lease.node_id == event.node_id
+                and pending.lease.boot_id == event.boot_id
+            ):
+                affected.append(
+                    (
+                        pending.request.run_id,
+                        pending.request.task_id,
+                        pending.request.attempt,
+                        pending.request.dispatch_id,
+                        pending.lease.lease_id,
+                    )
+                )
+        for dispatch_id, dispatch in tuple(self._dispatches.items()):
+            try:
+                lease = self.placement.lease_snapshot(dispatch.lease_id).lease
+            except KeyError:
+                continue
+            if lease.node_id != event.node_id or lease.boot_id != event.boot_id:
+                continue
+            task = self.state.snapshot(lease.run_id).task(lease.task_id)
+            attempt = next(
+                (
+                    item
+                    for item in task.attempts
+                    if item.attempt == lease.attempt
+                    and item.dispatch_id == dispatch_id
+                    and item.status is AttemptStatus.DISPATCHED
+                ),
+                None,
+            )
+            if attempt is not None:
+                affected.append(
+                    (
+                        lease.run_id,
+                        lease.task_id,
+                        lease.attempt,
+                        dispatch_id,
+                        lease.lease_id,
+                    )
+                )
+        for run_id, task_id, attempt, dispatch_id, lease_id in affected:
+            await self._fail_worker_start(
+                run_id=run_id,
+                task_id=task_id,
+                attempt=attempt,
+                dispatch_id=dispatch_id,
+                lease_id=lease_id,
+                reason=event.reason,
+            )
+
+    async def _fail_pending_dispatch(
+        self,
+        pending: _DispatchStartupRecord,
+        exc: BaseException,
+    ) -> None:
+        request = pending.request
+        self._record(
+            request.run_id,
+            "dispatch_start_failed",
+            task_id=request.task_id,
+            attempt=request.attempt,
+            lease_id=pending.lease.lease_id,
+            route_lease_id=(
+                None
+                if pending.route_lease is None
+                else pending.route_lease.route_lease_id
+            ),
+            payload={
+                "dispatch_id": request.dispatch_id,
+                "dispatch_prepare_ms": max(
+                    0.0,
+                    (perf_counter_ns() - pending.requested_at_ns) / 1_000_000,
+                ),
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+            },
+        )
+        error = self._error(
+            run_id=request.run_id,
+            task_id=request.task_id,
+            attempt=request.attempt,
+            dispatch_id=request.dispatch_id,
+            lease_id=pending.lease.lease_id,
+            error_code="worker_start_failed",
+            category="worker",
+            origin="runtime",
+            phase="dispatched",
+            message=f"{type(exc).__name__}: {exc}",
+        )
+        await self._handle_attempt_failure(
+            run_id=request.run_id,
+            task_id=request.task_id,
+            attempt=request.attempt,
+            dispatch_id=request.dispatch_id,
+            lease_id=pending.lease.lease_id,
+            error=error,
+            attempt_status=AttemptStatus.FAILED,
+            dispatch_handle=None,
+        )
 
     def _build_request(
         self,
@@ -2219,13 +2507,11 @@ class SchedulerCore:
         attempts: tuple[AttemptSnapshot, ...],
     ) -> None:
         for attempt in attempts:
-            dispatch = self._dispatches.get(attempt.dispatch_id)
             cancel_error: Exception | None = None
-            if dispatch is not None:
-                try:
-                    await self.runtime.cancel(dispatch.handle, "run_terminal")
-                except Exception as exc:
-                    cancel_error = exc
+            try:
+                await self._cancel_dispatch(attempt.dispatch_id, "run_terminal")
+            except Exception as exc:
+                cancel_error = exc
             self.deadlines.cancel(
                 kind=DeadlineKind.LEASE,
                 run_id=run_id,
@@ -2346,6 +2632,8 @@ class SchedulerCore:
             raise RuntimeError("recording is incomplete; force is required")
         if self.placement.active_lease_count(run_id) != 0:
             raise RuntimeError("run still owns placement leases")
+        if self.pending_dispatch_count(run_id) != 0:
+            raise RuntimeError("run still owns pending dispatch startups")
         if self.inference is not None:
             active_routes = [
                 route
@@ -2443,9 +2731,25 @@ class SchedulerCore:
             )
 
     async def _cancel_dispatch(self, dispatch_id: str, reason: str) -> None:
+        await self._cancel_pending_dispatch(dispatch_id, reason)
         dispatch = self._dispatches.get(dispatch_id)
         if dispatch is not None:
             await self.runtime.cancel(dispatch.handle, reason)
+
+    async def _cancel_pending_dispatch(
+        self,
+        dispatch_id: str,
+        reason: str,
+    ) -> bool:
+        pending = self._pending_dispatches.pop(dispatch_id, None)
+        if pending is None:
+            return False
+        if not pending.task.done():
+            pending.task.cancel()
+        handle = await pending.task
+        if handle is not None:
+            await self.runtime.cancel(handle, reason)
+        return True
 
     async def _fail_worker_start(
         self,

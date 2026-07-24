@@ -120,6 +120,7 @@ def test_resource_aggregate_keeps_cluster_and_per_device_metrics() -> None:
     assert aggregate["sample_count"] == 1
     assert aggregate["peak_incremental_hbm_mb"] == 1_000
     assert aggregate["cluster_cpu_utilization_pct"]["mean"] == 20.0
+    assert aggregate["incremental_cluster_cpu_utilization_pct"] == 19.0
     assert aggregate["per_device"]["0"]["utilization_pct"]["max"] == 80.0
 
 
@@ -133,6 +134,66 @@ def test_performance_profile_enables_scheduler_pool_and_replicas() -> None:
     assert "max_tasks_per_worker = 1" in controller
     assert catalog.count("max_replicas = 8") == 2
     assert catalog.count("max_parallel_starts = 8") == 2
+    assert catalog.count("scale_cooldown_ms = 0") == 2
+
+
+def test_dispatch_lifecycle_records_starting_to_running_timeline() -> None:
+    lifecycle = performance._dispatch_lifecycle(  # noqa: SLF001
+        [
+            {
+                "events": [
+                    {
+                        "event_type": "task_dispatched",
+                        "task_id": "task_1",
+                        "attempt": 1,
+                        "sequence": 10,
+                        "monotonic_time_ms": 1_000,
+                        "payload": {
+                            "dispatch_id": "dispatch_1",
+                            "node_id": "node-1",
+                        },
+                    },
+                    {
+                        "event_type": "dispatch_prepared",
+                        "task_id": "task_1",
+                        "attempt": 1,
+                        "sequence": 14,
+                        "monotonic_time_ms": 1_650,
+                        "payload": {"dispatch_prepare_ms": 649.5},
+                    },
+                    {
+                        "event_type": "worker_started",
+                        "task_id": "task_1",
+                        "attempt": 1,
+                        "sequence": 15,
+                        "monotonic_time_ms": 1_680,
+                        "payload": {"node_id": "node-1", "worker_pid": 42},
+                    },
+                ]
+            }
+        ],
+        {"task_1": "load_model"},
+    )
+    assert lifecycle == [
+        {
+            "task_id": "task_1",
+            "task_name": "load_model",
+            "attempt": 1,
+            "dispatch_id": "dispatch_1",
+            "node_id": "node-1",
+            "worker_pid": 42,
+            "task_dispatched_sequence": 10,
+            "dispatch_prepared_sequence": 14,
+            "running_sequence": 15,
+            "task_dispatched_at_ms": 1_000,
+            "dispatch_prepared_at_ms": 1_650,
+            "running_at_ms": 1_680,
+            "dispatch_prepare_ms": 649.5,
+            "dispatch_to_prepared_ms": 650,
+            "prepared_to_running_ms": 30,
+            "dispatch_to_running_ms": 680,
+        }
+    ]
 
 
 def test_report_states_pilot_boundaries() -> None:

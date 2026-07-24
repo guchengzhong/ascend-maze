@@ -135,6 +135,7 @@ class StandbyWorkerBroker:
         self._invalidated_worker_leases: set[str] = set()
         self._wake = asyncio.Event()
         self._reconciler: asyncio.Task[None] | None = None
+        self._retire_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
         self._close_complete = False
         self._standby_hits = 0
@@ -163,16 +164,36 @@ class StandbyWorkerBroker:
             self._reconciler.cancel()
             await asyncio.gather(self._reconciler, return_exceptions=True)
             self._reconciler = None
+        retire_tasks = tuple(self._retire_tasks)
+        for task in retire_tasks:
+            task.cancel()
+        if retire_tasks:
+            await asyncio.gather(*retire_tasks, return_exceptions=True)
+        self._retire_tasks.clear()
         with self._lock:
             workers = tuple(self._workers.values())
-        failures: list[str] = []
-        for worker in workers:
+
+        async def retire(worker: _PooledWorker) -> str | None:
+            timeout_ms = self._require_profile_config(
+                worker.descriptor.profile
+            ).termination_timeout_ms
             try:
-                await self._retire_worker(worker.descriptor.worker_id, "pool_closed")
-            except Exception as exc:
-                failures.append(
-                    f"{worker.descriptor.worker_id}:{type(exc).__name__}:{exc}"
+                await asyncio.wait_for(
+                    self._retire_worker(
+                        worker.descriptor.worker_id,
+                        "pool_closed",
+                    ),
+                    timeout=timeout_ms / 1_000 + 1.0,
                 )
+            except Exception as exc:
+                return (
+                    f"{worker.descriptor.worker_id}:"
+                    f"{type(exc).__name__}:{exc}"
+                )
+            return None
+
+        results = await asyncio.gather(*(retire(worker) for worker in workers))
+        failures = [item for item in results if item is not None]
         if failures:
             raise RuntimeError("Worker Pool close failed: " + "; ".join(failures))
         self._close_complete = True
@@ -233,48 +254,112 @@ class StandbyWorkerBroker:
                 self.notify_changed()
                 raise StateTransitionError("converted Standby Worker is unavailable")
         else:
-            if self._worker_count(
-                placement_lease.node_id, placement_lease.boot_id, profile
-            ) >= profile_config.max_total:
-                raise StateTransitionError("Worker Pool max_total is exhausted")
             worker_id = new_id("worker")
             generation = 1
             deadline_ms = min(
                 placement_lease.dispatch_deadline_ms,
                 now_ms + profile_config.acquire_timeout_ms,
             )
-            endpoint, report = await self.endpoint_factory.start(
+            descriptor = StandbyWorkerDescriptor(
                 worker_id=worker_id,
                 worker_generation=generation,
-                binding=binding,
-                config=profile_config,
-                deadline_ms=deadline_ms,
+                worker_endpoint_id=new_id("worker_endpoint"),
+                node_id=placement_lease.node_id,
+                boot_id=placement_lease.boot_id,
+                profile=profile,
+                state=StandbyWorkerState.STARTING,
+                standby_lease_id=None,
+                process_id=None,
+                created_at_ms=now_ms,
+                idle_since_ms=None,
+                tasks_completed=0,
+                host_warmup_ms=0,
+                config_generation=self.config.config_generation,
             )
-            worker = _PooledWorker(
-                descriptor=StandbyWorkerDescriptor(
+            worker = _PooledWorker(descriptor=descriptor, endpoint=None)
+            with self._lock:
+                live_count = sum(
+                    candidate.descriptor.state is not StandbyWorkerState.DEAD
+                    and candidate.descriptor.node_id == placement_lease.node_id
+                    and candidate.descriptor.boot_id == placement_lease.boot_id
+                    and candidate.descriptor.profile is profile
+                    for candidate in self._workers.values()
+                )
+                if live_count >= profile_config.max_total:
+                    raise StateTransitionError("Worker Pool max_total is exhausted")
+                self._workers[worker_id] = worker
+            self._emit("worker_starting", descriptor)
+            endpoint: Any | None = None
+            try:
+                endpoint, report = await self.endpoint_factory.start(
                     worker_id=worker_id,
                     worker_generation=generation,
-                    worker_endpoint_id=new_id("worker_endpoint"),
-                    node_id=placement_lease.node_id,
-                    boot_id=placement_lease.boot_id,
-                    profile=profile,
-                    state=StandbyWorkerState.ACQUIRED,
-                    standby_lease_id=None,
-                    process_id=report.worker_pid,
-                    created_at_ms=now_ms,
-                    idle_since_ms=None,
-                    tasks_completed=0,
-                    host_warmup_ms=report.host_warmup_ms,
-                    zero_hbm_verified=report.zero_hbm_verified,
-                    npu_context_device_ids=report.npu_context_device_ids,
-                    npu_used_hbm_mb=report.npu_used_hbm_mb,
-                    config_generation=self.config.config_generation,
-                ),
-                endpoint=endpoint,
-            )
-            with self._lock:
-                self._workers[worker_id] = worker
-                self._cold_starts += 1
+                    binding=binding,
+                    config=profile_config,
+                    deadline_ms=deadline_ms,
+                )
+                if monotonic_time_ms() > deadline_ms:
+                    raise TimeoutError("cold Worker became ready after acquire deadline")
+                with self._lock:
+                    current = self._workers.get(worker_id)
+                    if (
+                        current is not worker
+                        or worker.descriptor.state is not StandbyWorkerState.STARTING
+                        or worker.descriptor.config_generation
+                        != self.config.config_generation
+                        or not self._node_is_healthy(
+                            placement_lease.node_id,
+                            placement_lease.boot_id,
+                        )
+                    ):
+                        raise StateTransitionError(
+                            "cold Worker startup was fenced before ready"
+                        )
+                    worker.endpoint = endpoint
+                    worker.descriptor = replace(
+                        descriptor,
+                        state=StandbyWorkerState.ACQUIRED,
+                        process_id=report.worker_pid,
+                        host_warmup_ms=report.host_warmup_ms,
+                        zero_hbm_verified=report.zero_hbm_verified,
+                        npu_context_device_ids=report.npu_context_device_ids,
+                        npu_used_hbm_mb=report.npu_used_hbm_mb,
+                    )
+                    self._cold_starts += 1
+            except BaseException as exc:
+                termination_failed = False
+                if endpoint is not None:
+                    try:
+                        await asyncio.shield(
+                            self.endpoint_factory.terminate(
+                                endpoint,
+                                force=True,
+                                timeout_ms=profile_config.termination_timeout_ms,
+                            )
+                        )
+                    except Exception as terminate_exc:
+                        termination_failed = True
+                        self._termination_failures += 1
+                        self._emit(
+                            "worker_termination_failed",
+                            worker.descriptor,
+                            str(terminate_exc),
+                        )
+                with self._lock:
+                    current = self._workers.get(worker_id)
+                    if current is worker:
+                        worker.endpoint = endpoint if termination_failed else None
+                        worker.descriptor = replace(
+                            worker.descriptor,
+                            state=(
+                                StandbyWorkerState.RETIRING
+                                if termination_failed
+                                else StandbyWorkerState.DEAD
+                            ),
+                        )
+                self._emit("cold_start_failed", worker.descriptor, type(exc).__name__)
+                self.notify_changed()
+                raise
             self._emit("cold_start", worker.descriptor)
 
         descriptor = worker.descriptor
@@ -691,8 +776,35 @@ class StandbyWorkerBroker:
             config_generation=self.config.config_generation,
         )
         worker = _PooledWorker(descriptor=descriptor, endpoint=None)
+        registered = False
         with self._lock:
-            self._workers[worker_id] = worker
+            live_count = sum(
+                candidate.descriptor.state is not StandbyWorkerState.DEAD
+                and candidate.descriptor.node_id == binding.node_id
+                and candidate.descriptor.boot_id == binding.boot_id
+                and candidate.descriptor.profile is config.profile
+                for candidate in self._workers.values()
+            )
+            if live_count < config.max_total:
+                self._workers[worker_id] = worker
+                registered = True
+        if not registered:
+            self.placement.retire_standby(
+                worker_id,
+                now_ms=monotonic_time_ms(),
+                reason="worker_pool_max_total_race",
+            )
+            try:
+                self.placement.purge_retired_standby(worker_id)
+            except KeyError:
+                pass
+            self._emit_for_binding(
+                "replenish_capacity_exhausted",
+                binding,
+                config.profile,
+                worker_id,
+            )
+            return
         self._emit("worker_starting", descriptor)
         endpoint: Any | None = None
         try:
@@ -732,9 +844,12 @@ class StandbyWorkerBroker:
             termination_failed = False
             if endpoint is not None:
                 try:
-                    await self.endpoint_factory.terminate(
-                        endpoint,
-                        timeout_ms=config.termination_timeout_ms,
+                    await asyncio.wait_for(
+                        self.endpoint_factory.terminate(
+                            endpoint,
+                            timeout_ms=config.termination_timeout_ms,
+                        ),
+                        timeout=config.termination_timeout_ms / 1_000 + 1.0,
                     )
                 except Exception as terminate_exc:
                     termination_failed = True
@@ -794,10 +909,13 @@ class StandbyWorkerBroker:
                     worker.descriptor.profile
                 )
                 try:
-                    await self.endpoint_factory.terminate(
-                        endpoint,
-                        force=force,
-                        timeout_ms=profile_config.termination_timeout_ms,
+                    await asyncio.wait_for(
+                        self.endpoint_factory.terminate(
+                            endpoint,
+                            force=force,
+                            timeout_ms=profile_config.termination_timeout_ms,
+                        ),
+                        timeout=profile_config.termination_timeout_ms / 1_000 + 1.0,
                     )
                 except Exception as exc:
                     self._termination_failures += 1
@@ -833,6 +951,8 @@ class StandbyWorkerBroker:
         task = loop.create_task(
             self._retire_worker(worker_id, reason, force=True)
         )
+        self._retire_tasks.add(task)
+        task.add_done_callback(self._retire_tasks.discard)
         task.add_done_callback(self._consume_retire_result)
 
     @staticmethod

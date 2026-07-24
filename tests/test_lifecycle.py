@@ -65,6 +65,7 @@ def test_run_state_manager_completes_a_chain_and_ignores_duplicate_success() -> 
         now_ms=4,
     )
     assert attempt.attempt == 1
+    assert state.snapshot("run_1").task(first.task_id).status is TaskStatus.STARTING
     assert state.worker_started(
         run_id="run_1",
         task_id=first.task_id,

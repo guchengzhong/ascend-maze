@@ -338,7 +338,7 @@ class RayHostController(InMemoryController):
             registry=node_registry,
             recorder=effective_recorder,
             event_sink=runtime.post_node_event,
-            on_binding_replaced=runtime.invalidate_binding,
+            on_binding_replaced=self._binding_replaced,
             on_binding_disconnected=self._binding_disconnected,
             on_binding_registered=self._binding_registered,
             registration_validator=self._validate_node_registration,
@@ -827,6 +827,11 @@ class RayHostController(InMemoryController):
             now_ms=self.clock.monotonic_ms(),
         )
         self.core.post_resource_changed(f"node_binding_disconnected:{binding.node_id}")
+        self.core.post_runtime_binding_invalidated(
+            binding.node_id,
+            binding.boot_id,
+            reason="NodeAgent binding disconnected during Worker startup",
+        )
         if isinstance(self.worker_broker, StandbyWorkerBroker):
             self.worker_broker.notify_changed()
         if self.inference is not None:
@@ -834,6 +839,14 @@ class RayHostController(InMemoryController):
                 binding.node_id,
                 binding.boot_id,
             )
+
+    def _binding_replaced(self, binding: RuntimeNodeBinding) -> None:
+        self.ray_runtime.invalidate_binding(binding)
+        self.core.post_runtime_binding_invalidated(
+            binding.node_id,
+            binding.boot_id,
+            reason="NodeAgent generation changed during Worker startup",
+        )
 
     def _service_process_exited(self, event: ServiceProcessExit) -> None:
         if self.inference is None:

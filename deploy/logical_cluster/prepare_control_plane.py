@@ -34,6 +34,7 @@ def _controller_config(profile: str = "correctness") -> str:
     if profile not in {"correctness", "performance"}:
         raise ValueError(f"unsupported logical-cluster profile: {profile}")
     if profile == "performance":
+        recovery_name = "controller-transformers-performance-v2.sqlite3"
         scheduler_policy = "hacs_no_tp"
         anchor_strategy = "static"
         task_slots_total = 2
@@ -45,6 +46,7 @@ def _controller_config(profile: str = "correctness") -> str:
         standby_min_idle = 1
         standby_max_idle = 2
     else:
+        recovery_name = "controller-transformers-correctness.sqlite3"
         scheduler_policy = "fcfs"
         anchor_strategy = "declared_only"
         task_slots_total = 1
@@ -60,7 +62,7 @@ socket_path = "/workspace/state/control-plane/control.sock"
 runtime_directory = "/workspace/state/control-plane"
 pid_file = "/workspace/state/control-plane/controller.pid"
 cluster_token_file = "/workspace/state/control-plane/cluster.token"
-recovery_path = "/workspace/state/control-plane/controller-transformers-{profile}.sqlite3"
+recovery_path = "/workspace/state/control-plane/{recovery_name}"
 node_rpc_bind_address = "0.0.0.0:{NODE_RPC_PORT}"
 node_rpc_advertised_host = "{CONTROLLER_IP}"
 
@@ -134,8 +136,10 @@ def _model_catalog(profile: str = "correctness") -> str:
     vision_revision = _artifact_revision(VISION_MODEL_PATH)
     max_replicas = 8 if profile == "performance" else 1
     max_parallel_starts = max_replicas
+    scale_cooldown_ms = 0 if profile == "performance" else 600_000
+    catalog_profile = "performance-v2" if profile == "performance" else profile
     return f'''schema_version = 1
-catalog_revision = "logical-{profile}-{text_revision[:12]}-{vision_revision[:12]}"
+catalog_revision = "logical-{catalog_profile}-{text_revision[:12]}-{vision_revision[:12]}"
 
 [[models]]
 model_id = "qwen3-4b-e2e"
@@ -162,7 +166,7 @@ target_route_utilization = 1.0
 scale_up_pending_threshold = 1
 scale_up_sustain_ms = 0
 scale_down_idle_ms = 600000
-scale_cooldown_ms = 600000
+scale_cooldown_ms = {scale_cooldown_ms}
 max_parallel_starts = {max_parallel_starts}
 startup_timeout_ms = 600000
 drain_timeout_ms = 120000
@@ -204,7 +208,7 @@ target_route_utilization = 1.0
 scale_up_pending_threshold = 1
 scale_up_sustain_ms = 0
 scale_down_idle_ms = 600000
-scale_cooldown_ms = 600000
+scale_cooldown_ms = {scale_cooldown_ms}
 max_parallel_starts = {max_parallel_starts}
 startup_timeout_ms = 600000
 drain_timeout_ms = 120000

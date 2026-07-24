@@ -46,6 +46,23 @@ _RAY_PROCESS_PROBE: Any = ray.remote(
 )(_process_exists)
 
 
+async def _thread_call_before(
+    deadline_ms: int,
+    function: Any,
+    *args: object,
+    max_wait_seconds: float | None = None,
+) -> Any:
+    remaining = (deadline_ms - monotonic_time_ms()) / 1_000
+    if remaining <= 0:
+        raise asyncio.TimeoutError
+    if max_wait_seconds is not None:
+        remaining = min(remaining, max_wait_seconds)
+    return await asyncio.wait_for(
+        asyncio.to_thread(function, *args),
+        timeout=remaining,
+    )
+
+
 class RayWorkerEndpointFactory:
     async def start(
         self,
@@ -123,26 +140,48 @@ class RayWorkerEndpointFactory:
         if force:
             ray.kill(endpoint.actor, no_restart=True)
         else:
+            shutdown_ref: Any | None = None
             try:
-                remaining = max(0.001, (deadline - monotonic_time_ms()) / 1_000)
-                await asyncio.wait_for(
-                    asyncio.to_thread(ray.get, endpoint.actor.shutdown.remote()),
-                    timeout=min(5.0, remaining),
+                shutdown_ref = await _thread_call_before(
+                    deadline,
+                    endpoint.actor.shutdown.remote,
+                    max_wait_seconds=5.0,
+                )
+                await _thread_call_before(
+                    deadline,
+                    ray.get,
+                    shutdown_ref,
+                    max_wait_seconds=5.0,
                 )
             except asyncio.TimeoutError:
+                if shutdown_ref is not None:
+                    ray.cancel(shutdown_ref, force=True)
                 ray.kill(endpoint.actor, no_restart=True)
             except Exception:
                 # A graceful exit is reported to the caller as ActorDiedError.
                 pass
         while monotonic_time_ms() < deadline:
-            alive = await asyncio.to_thread(
-                ray.get,
-                _RAY_PROCESS_PROBE.options(
-                    scheduling_strategy=NodeAffinitySchedulingStrategy(
-                        endpoint.ray_node_id, soft=False
-                    )
-                ).remote(endpoint.worker_pid),
+            process_probe = _RAY_PROCESS_PROBE.options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    endpoint.ray_node_id, soft=False
+                )
             )
+            probe_ref: Any | None = None
+            try:
+                probe_ref = await _thread_call_before(
+                    deadline,
+                    process_probe.remote,
+                    endpoint.worker_pid,
+                )
+                alive = await _thread_call_before(
+                    deadline,
+                    ray.get,
+                    probe_ref,
+                )
+            except asyncio.TimeoutError:
+                if probe_ref is not None:
+                    ray.cancel(probe_ref, force=True)
+                break
             if not alive:
                 return
             await asyncio.sleep(0.05)
